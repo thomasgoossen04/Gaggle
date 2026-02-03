@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -19,7 +25,36 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 		users.GET("/:id", store.getUserEp)
 	}
 
-	router.Run(":" + strconv.Itoa(cfg.Port))
+	// Create HTTP server
+	srv := &http.Server{
+		Addr:    ":" + strconv.Itoa(cfg.Port),
+		Handler: router,
+	}
+
+	// Run server in a goroutine
+	go func() {
+		fmt.Printf("Server running on port %d\n", cfg.Port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
+
+	// Wait for interrupt signal (Ctrl+C)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+	fmt.Println("\nShutting down server...")
+
+	// Graceful shutdown with 5s timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+
+	// Close DB cleanly
+	store.db.Close()
+	fmt.Println("Server exited cleanly")
 }
 
 func (s *Store) getUserEp(c *gin.Context) {
