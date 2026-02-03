@@ -14,20 +14,30 @@ import (
 )
 
 func StartServer(router *gin.Engine, store *Store, cfg *Config) {
+	// Health check
 	router.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "pong",
 		})
 	})
 
-	users := router.Group("/users")
+	// Init OAuth
+	InitDiscordOAuth(cfg)
+
+	// OAuth routes
+	auth := router.Group("/auth")
 	{
-		users.GET("/:id", store.getUserEp)
+		auth.GET("/discord/login", DiscordLoginHandler)
+		auth.GET("/discord/callback", DiscordCallbackHandler(store))
 	}
 
-	InitDiscordOAuth(cfg)
-	router.GET("/auth/discord/login", DiscordLoginHandler)
-	router.GET("/auth/discord/callback", DiscordCallbackHandler(store))
+	// Protected user routes
+	users := router.Group("/users")
+	users.Use(AuthMiddleware(store))
+	{
+		users.GET("/me", MeHandler(store))
+		users.GET("/:id", store.getUserEp)
+	}
 
 	runServer(router, store, cfg)
 }
