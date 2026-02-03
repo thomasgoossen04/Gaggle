@@ -1,4 +1,4 @@
-module frontend
+module gui
 
 go 1.23
 
