@@ -7,8 +7,8 @@ import (
 )
 
 type User struct {
-	ID       string `json:id`
-	Username string `json:username`
+	ID       string `json:"id"`
+	Username string `json:"username"`
 }
 
 type Store struct {
