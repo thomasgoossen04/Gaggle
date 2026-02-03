@@ -1,0 +1,78 @@
+{
+  ".svelte-kit/generated/client-optimized/app.js": {
+    "file": "_app/immutable/entry/app.Be2BShpF.js",
+    "name": "entry/app",
+    "src": ".svelte-kit/generated/client-optimized/app.js",
+    "isEntry": true,
+    "imports": [
+      "_BOkfkSpx.js",
+      "_bvTm1Fpp.js"
+    ],
+    "dynamicImports": [
+      ".svelte-kit/generated/client-optimized/nodes/0.js",
+      ".svelte-kit/generated/client-optimized/nodes/1.js",
+      ".svelte-kit/generated/client-optimized/nodes/2.js"
+    ]
+  },
+  ".svelte-kit/generated/client-optimized/nodes/0.js": {
+    "file": "_app/immutable/nodes/0.DCsD76Is.js",
+    "name": "nodes/0",
+    "src": ".svelte-kit/generated/client-optimized/nodes/0.js",
+    "isEntry": true,
+    "isDynamicEntry": true,
+    "imports": [
+      "_BOkfkSpx.js",
+      "_bvTm1Fpp.js"
+    ]
+  },
+  ".svelte-kit/generated/client-optimized/nodes/1.js": {
+    "file": "_app/immutable/nodes/1.BzXTrDck.js",
+    "name": "nodes/1",
+    "src": ".svelte-kit/generated/client-optimized/nodes/1.js",
+    "isEntry": true,
+    "isDynamicEntry": true,
+    "imports": [
+      "_BOkfkSpx.js",
+      "_bvTm1Fpp.js",
+      "_DH-iivNG.js"
+    ]
+  },
+  ".svelte-kit/generated/client-optimized/nodes/2.js": {
+    "file": "_app/immutable/nodes/2.B6muBM1K.js",
+    "name": "nodes/2",
+    "src": ".svelte-kit/generated/client-optimized/nodes/2.js",
+    "isEntry": true,
+    "isDynamicEntry": true,
+    "imports": [
+      "_BOkfkSpx.js",
+      "_bvTm1Fpp.js"
+    ]
+  },
+  "_BOkfkSpx.js": {
+    "file": "_app/immutable/chunks/BOkfkSpx.js",
+    "name": "scheduler"
+  },
+  "_DH-iivNG.js": {
+    "file": "_app/immutable/chunks/DH-iivNG.js",
+    "name": "entry",
+    "imports": [
+      "_BOkfkSpx.js"
+    ]
+  },
+  "_bvTm1Fpp.js": {
+    "file": "_app/immutable/chunks/bvTm1Fpp.js",
+    "name": "index",
+    "imports": [
+      "_BOkfkSpx.js"
+    ]
+  },
+  "node_modules/@sveltejs/kit/src/runtime/client/entry.js": {
+    "file": "_app/immutable/entry/start.CcyJ9ooO.js",
+    "name": "entry/start",
+    "src": "node_modules/@sveltejs/kit/src/runtime/client/entry.js",
+    "isEntry": true,
+    "imports": [
+      "_DH-iivNG.js"
+    ]
+  }
+}
