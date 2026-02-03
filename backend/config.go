@@ -8,8 +8,16 @@ import (
 )
 
 type Config struct {
-	Port int    `toml:port`
-	Mode string `toml:mode`
+	Port    int           `toml:"port"`
+	Mode    string        `toml:"mode"`
+	Discord DiscordConfig `toml:"discord"`
+}
+
+type DiscordConfig struct {
+	ClientID     string   `toml:"client_id"`
+	ClientSecret string   `toml:"client_secret"`
+	RedirectURI  string   `toml:"redirect_uri"`
+	Scopes       []string `toml:"scopes"`
 }
 
 func LoadConfig() (*Config, error) {

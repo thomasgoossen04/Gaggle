@@ -13,8 +13,6 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer store.db.Close()
-	store.UpsertUser(User{ID: "TEST", Username: "TEST!"})
 
 	StartServer(router, store, cfg)
 }

@@ -25,6 +25,14 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 		users.GET("/:id", store.getUserEp)
 	}
 
+	InitDiscordOAuth(cfg)
+	router.GET("/auth/discord/login", DiscordLoginHandler)
+	router.GET("/auth/discord/callback", DiscordCallbackHandler(store))
+
+	runServer(router, store, cfg)
+}
+
+func runServer(router *gin.Engine, store *Store, cfg *Config) {
 	// Create HTTP server
 	srv := &http.Server{
 		Addr:    ":" + strconv.Itoa(cfg.Port),
