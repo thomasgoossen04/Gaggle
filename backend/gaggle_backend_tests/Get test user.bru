@@ -1,0 +1,20 @@
+meta {
+  name: Get test user
+  type: http
+  seq: 1
+}
+
+get {
+  url: http://localhost:2121/users/TEST
+  body: none
+  auth: inherit
+}
+
+params:query {
+  : 
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}
