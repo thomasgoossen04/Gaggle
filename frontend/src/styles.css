@@ -1,19 +1,25 @@
+@import "tailwindcss";
+
 @source "../index.html";
 @source "./**/*.rs";
 
 @theme {
-    --font-sans: "DIN", "DIN Alternate", ui-sans-serif, system-ui, sans-serif;
+    --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
     --color-primary: #FF9B51;
     --color-secondary: #EAEFEF;
     --color-accent: #BFC9D1;
     --color-ink: #262626;
 }
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
 @layer base {
+    @font-face {
+        font-family: "Space Grotesk";
+        src: url("/assets/fonts/Space_Grotesk/SpaceGrotesk-VariableFont_wght.ttf") format("truetype");
+        font-weight: 300 700;
+        font-style: normal;
+        font-display: swap;
+    }
+
     @font-face {
         font-family: "DIN";
         src: url("/assets/fonts/DIN/DIN Regular/DIN Regular.ttf") format("truetype");
