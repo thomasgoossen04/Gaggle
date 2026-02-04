@@ -103,7 +103,7 @@ struct ToastViewportProps {
 #[function_component(ToastViewport)]
 fn toast_viewport(props: &ToastViewportProps) -> Html {
     html! {
-        <div class="pointer-events-none fixed right-6 top-6 z-50 flex w-[min(92vw,24rem)] flex-col gap-3">
+        <div class="pointer-events-none fixed bottom-6 left-1/2 z-50 flex w-[min(92vw,24rem)] -translate-x-1/2 flex-col gap-3">
             { for props.toasts.iter().map(|toast| {
                 let on_dismiss = {
                     let on_dismiss = props.on_dismiss.clone();

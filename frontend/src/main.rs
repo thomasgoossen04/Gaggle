@@ -1,6 +1,7 @@
 mod app;
 mod auth;
 mod components;
+mod screens;
 mod toast;
 
 use app::App;

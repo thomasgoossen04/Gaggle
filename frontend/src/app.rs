@@ -1,14 +1,19 @@
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+use gloo_timers::future::IntervalStream;
+use wasm_bindgen_futures::spawn_local;
 use web_sys::{console, HtmlInputElement};
 use yew::prelude::*;
+use futures_util::stream::StreamExt;
 
 use crate::auth::{
-    clear_query_param, get_local_storage_item, get_query_param, handle_login, handle_logout,
-    remove_local_storage_item, set_local_storage_item, LOGIN_SUCCESS_KEY, SERVER_IP_KEY,
+    check_session, clear_query_param, get_local_storage_item, get_query_param, handle_login,
+    handle_logout, remove_local_storage_item, set_local_storage_item, LOGIN_SUCCESS_KEY, SERVER_IP_KEY,
     SESSION_TOKEN_KEY,
 };
 use crate::components::{Button, Card};
+use crate::screens::dashboard::Dashboard;
+use crate::screens::error::ErrorScreen;
 use crate::toast::{use_toast, ToastProvider, ToastVariant};
 
 #[wasm_bindgen]
@@ -22,6 +27,7 @@ pub struct AppState {
     pub logged_in: bool,
     pub server_ip: Option<String>,
     pub session_token: Option<String>,
+    pub auth_error: Option<String>,
 }
 
 type AppStateHandle = UseStateHandle<AppState>;
@@ -32,6 +38,7 @@ pub fn app() -> Html {
         logged_in: false,
         server_ip: None,
         session_token: None,
+        auth_error: None,
     });
 
     {
@@ -53,6 +60,7 @@ pub fn app() -> Html {
                         logged_in: token.is_some(),
                         server_ip,
                         session_token: token,
+                        auth_error: None,
                     });
                     if token_from_query.is_some() {
                         clear_query_param("token");
@@ -92,8 +100,62 @@ fn app_router() -> Html {
         );
     }
 
+    {
+        let app_state = app_state.clone();
+        use_effect_with(
+            (
+                app_state.logged_in,
+                app_state.server_ip.clone(),
+                app_state.session_token.clone(),
+                app_state.auth_error.clone(),
+            ),
+            move |_| {
+                if !app_state.logged_in
+                    || app_state.server_ip.is_none()
+                    || app_state.session_token.is_none()
+                    || app_state.auth_error.is_some()
+                {
+                    return ();
+                }
+
+                let server_ip = app_state.server_ip.clone().unwrap();
+                let token = app_state.session_token.clone().unwrap();
+                let app_state_interval = app_state.clone();
+
+                spawn_local(async move {
+                    if let Err(message) = check_session(&server_ip, &token).await {
+                        let mut next = (*app_state_interval).clone();
+                        next.auth_error = Some(message);
+                        app_state_interval.set(next);
+                        return;
+                    }
+
+                    let mut interval = IntervalStream::new(15_000);
+                    while interval.next().await.is_some() {
+                        if let Err(message) = check_session(&server_ip, &token).await {
+                            let mut next = (*app_state_interval).clone();
+                            next.auth_error = Some(message);
+                            app_state_interval.set(next);
+                            break;
+                        }
+                    }
+                });
+
+                ()
+            },
+        );
+    }
+
+    if let Some(message) = app_state.auth_error.clone() {
+        let on_logout = {
+            let app_state = app_state.clone();
+            Callback::from(move |_| handle_logout(app_state.clone()))
+        };
+        return html! { <ErrorScreen message={message} on_logout={on_logout} /> };
+    }
+
     if app_state.logged_in {
-        html! { <MainScreen /> }
+        html! { <Dashboard /> }
     } else {
         html! { <LoginScreen /> }
     }
@@ -153,42 +215,6 @@ fn login_screen() -> Html {
                 >
                     <DiscordIcon />
                     { "Log in with Discord" }
-                </Button>
-            </Card>
-        </main>
-    }
-}
-
-#[function_component(MainScreen)]
-fn main_screen() -> Html {
-    let app_state = use_context::<AppStateHandle>()
-        .expect("AppState context not found. Ensure MainScreen is under <ContextProvider>.");
-    let toast = use_toast();
-    let on_logout = {
-        let app_state = app_state.clone();
-        Callback::from(move |_| handle_logout(app_state.clone()))
-    };
-    let on_test_toast = {
-        let toast = toast.clone();
-        Callback::from(move |_| {
-            toast.toast("Test toast: everything is wired.", ToastVariant::Info, Some(3000));
-        })
-    };
-
-    html! {
-        <main class="min-h-screen text-secondary flex items-center justify-center">
-            <Card highlight={true}>
-                <h1 class="text-3xl font-bold">
-                    { "Welcome back!" }
-                </h1>
-                <p class="mt-2 text-sm text-accent">
-                    { "You're signed in." }
-                </p>
-                <Button class={Some("mt-6".to_string())} onclick={on_test_toast}>
-                    { "Show test toast" }
-                </Button>
-                <Button class={Some("mt-4".to_string())} onclick={on_logout}>
-                    { "Log out" }
                 </Button>
             </Card>
         </main>

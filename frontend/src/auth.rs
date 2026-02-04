@@ -1,5 +1,6 @@
-use wasm_bindgen::prelude::JsValue;
-use web_sys::{window, UrlSearchParams};
+use wasm_bindgen::{prelude::JsValue, JsCast};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{window, Headers, Request, RequestInit, Response, UrlSearchParams};
 use yew::UseStateHandle;
 
 use crate::app::AppState;
@@ -36,6 +37,7 @@ pub fn handle_logout(app_state: UseStateHandle<AppState>) {
         logged_in: false,
         server_ip: get_local_storage_item(SERVER_IP_KEY),
         session_token: None,
+        auth_error: None,
     });
 }
 
@@ -99,4 +101,35 @@ pub fn remove_local_storage_item(key: &str) {
     if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item(key);
     }
+}
+
+pub async fn check_session(server_ip: &str, token: &str) -> Result<(), String> {
+    let url = format!("http://{server_ip}:2121/users/me");
+    let mut opts = RequestInit::new();
+    opts.method("GET");
+
+    let headers = Headers::new().map_err(|_| "Failed to create headers.".to_string())?;
+    headers
+        .set("Authorization", &format!("Bearer {token}"))
+        .map_err(|_| "Failed to set auth header.".to_string())?;
+    opts.headers(&headers);
+
+    let request =
+        Request::new_with_str_and_init(&url, &opts).map_err(|_| "Failed to build request.".to_string())?;
+    let win = window().ok_or_else(|| "No window available.".to_string())?;
+    let resp_value = JsFuture::from(win.fetch_with_request(&request))
+        .await
+        .map_err(|_| format!("Cannot reach backend at {url}."))?;
+    let resp: Response = resp_value
+        .dyn_into()
+        .map_err(|_| "Invalid response type.".to_string())?;
+
+    if resp.status() == 401 {
+        return Err("Session expired. Please log in again.".to_string());
+    }
+    if !resp.ok() {
+        return Err(format!("Backend error (HTTP {}).", resp.status()));
+    }
+
+    Ok(())
 }
