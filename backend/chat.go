@@ -7,6 +7,7 @@ import (
 
 	"github.com/dgraph-io/badger"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 type ChatMessage struct {
@@ -15,6 +16,14 @@ type ChatMessage struct {
 	Username  string `json:"username"`
 	Message   string `json:"message"`
 	Timestamp int64  `json:"timestamp"`
+}
+
+type ChatEvent struct {
+	Type      string        `json:"type"`
+	Message   *ChatMessage  `json:"message,omitempty"`
+	Messages  []ChatMessage `json:"messages,omitempty"`
+	DeletedID string        `json:"deleted_id,omitempty"`
+	Users     []string      `json:"users,omitempty"`
 }
 
 func chatKey(ts int64, id string) []byte {
@@ -82,6 +91,84 @@ func NewChatMessage(user *User, content string) ChatMessage {
 		Username:  user.Username,
 		Message:   content,
 		Timestamp: time.Now().UnixMilli(),
+	}
+}
+
+type ChatHub struct {
+	clients    map[*websocket.Conn]*ChatClient
+	register   chan ChatClient
+	unregister chan *websocket.Conn
+	broadcast  chan ChatEvent
+}
+
+type ChatClient struct {
+	Conn     *websocket.Conn
+	UserID   string
+	Username string
+	Send     chan ChatEvent
+}
+
+func NewChatHub() *ChatHub {
+	h := &ChatHub{
+		clients:    make(map[*websocket.Conn]*ChatClient),
+		register:   make(chan ChatClient),
+		unregister: make(chan *websocket.Conn),
+		broadcast:  make(chan ChatEvent, 32),
+	}
+	go h.run()
+	return h
+}
+
+func (h *ChatHub) run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.clients[client.Conn] = &client
+			go h.writePump(&client)
+			h.broadcastPresence()
+		case conn := <-h.unregister:
+			if client, ok := h.clients[conn]; ok {
+				delete(h.clients, conn)
+				close(client.Send)
+				_ = conn.Close()
+				h.broadcastPresence()
+			}
+		case event := <-h.broadcast:
+			for _, client := range h.clients {
+				select {
+				case client.Send <- event:
+				default:
+					close(client.Send)
+					_ = client.Conn.Close()
+					delete(h.clients, client.Conn)
+				}
+			}
+		}
+	}
+}
+
+func (h *ChatHub) broadcastPresence() {
+	users := make([]string, 0, len(h.clients))
+	for _, client := range h.clients {
+		users = append(users, client.Username)
+	}
+	event := ChatEvent{Type: "presence", Users: users}
+	for _, client := range h.clients {
+		select {
+		case client.Send <- event:
+		default:
+			close(client.Send)
+			_ = client.Conn.Close()
+			delete(h.clients, client.Conn)
+		}
+	}
+}
+
+func (h *ChatHub) writePump(client *ChatClient) {
+	for event := range client.Send {
+		if err := client.Conn.WriteJSON(event); err != nil {
+			break
+		}
 	}
 }
 

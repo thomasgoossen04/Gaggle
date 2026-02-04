@@ -3,6 +3,7 @@ use yew::prelude::*;
 
 use crate::api::{get_json, send_json};
 use crate::app::AppState;
+use crate::components::Button;
 use crate::confirm::{use_confirm, ConfirmRequest};
 use crate::toast::{use_toast, ToastVariant};
 
@@ -19,6 +20,7 @@ pub fn admin_screen() -> Html {
     let clearing = use_state(|| false);
     let confirm = use_confirm();
     let toast = use_toast();
+    let reloading = use_state(|| false);
 
     {
         let sessions = sessions.clone();
@@ -86,6 +88,87 @@ pub fn admin_screen() -> Html {
         })
     };
 
+    let on_reload_config = {
+        let server_ip = server_ip.clone();
+        let token = token.clone();
+        let toast = toast.clone();
+        let reloading = reloading.clone();
+        Callback::from(move |_| {
+            if server_ip.is_empty() || token.is_empty() {
+                return;
+            }
+            reloading.set(true);
+            let server_ip = server_ip.clone();
+            let token = token.clone();
+            let toast = toast.clone();
+            let reloading = reloading.clone();
+            spawn_local(async move {
+                let url = format!("http://{server_ip}:2121/admin/reload-config");
+                match send_json("POST", &url, Some(&token), None).await {
+                    Ok(resp) if resp.ok() => {
+                        toast.toast("Config reloaded.", ToastVariant::Success, Some(2000));
+                    }
+                    Ok(resp) => {
+                        toast.toast(
+                            format!("Reload failed (HTTP {}).", resp.status()),
+                            ToastVariant::Error,
+                            Some(3000),
+                        );
+                    }
+                    Err(msg) => {
+                        toast.toast(msg, ToastVariant::Error, Some(3000));
+                    }
+                }
+                reloading.set(false);
+            });
+        })
+    };
+
+    let on_restart_backend = {
+        let server_ip = server_ip.clone();
+        let token = token.clone();
+        let toast = toast.clone();
+        let confirm = confirm.clone();
+        Callback::from(move |_| {
+            if server_ip.is_empty() || token.is_empty() {
+                return;
+            }
+            let server_ip = server_ip.clone();
+            let token = token.clone();
+            let toast = toast.clone();
+            confirm.confirm(ConfirmRequest {
+                title: "Restart backend?".to_string(),
+                message: "This will stop the backend process. Make sure it is supervised to restart automatically."
+                    .to_string(),
+                confirm_label: "Restart".to_string(),
+                cancel_label: "Cancel".to_string(),
+                on_confirm: Callback::from(move |_| {
+                    let server_ip = server_ip.clone();
+                    let token = token.clone();
+                    let toast = toast.clone();
+                    spawn_local(async move {
+                        let url = format!("http://{server_ip}:2121/admin/restart");
+                        match send_json("POST", &url, Some(&token), None).await {
+                            Ok(resp) if resp.ok() => {
+                                toast.toast("Restarting backend...", ToastVariant::Success, Some(2000));
+                            }
+                            Ok(resp) => {
+                                toast.toast(
+                                    format!("Restart failed (HTTP {}).", resp.status()),
+                                    ToastVariant::Error,
+                                    Some(3000),
+                                );
+                            }
+                            Err(msg) => {
+                                toast.toast(msg, ToastVariant::Error, Some(3000));
+                            }
+                        }
+                    });
+                }),
+            });
+        })
+    };
+
     html! {
         <div>
             <h1 class="text-2xl font-semibold">{ "Admin" }</h1>
@@ -118,14 +201,36 @@ pub fn admin_screen() -> Html {
                     <p class="text-xs uppercase tracking-wide text-accent/80">{ "Feature Flags" }</p>
                     <p class="mt-4 text-lg font-semibold">{ "Chat" }</p>
                     <p class="mt-2 text-sm text-secondary/70">{ "Controlled by backend config." }</p>
-                    <button
-                        class="mt-4 inline-flex items-center gap-2 rounded-xl border border-rose-400/60 bg-rose-500/20 px-3 py-2 text-xs font-semibold text-rose-100 transition hover:bg-rose-500/30"
-                        type="button"
+                    <Button
+                        class={Some("mt-4 border border-rose-400/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30".to_string())}
                         onclick={on_clear_chat}
                         disabled={*clearing}
                     >
                         { if *clearing { "Clearing..." } else { "Clear chat messages" } }
-                    </button>
+                    </Button>
+                </div>
+                <div class="rounded-2xl border border-ink/50 bg-inkLight p-6">
+                    <p class="text-xs uppercase tracking-wide text-accent/80">{ "Configuration" }</p>
+                    <p class="mt-4 text-lg font-semibold">{ "Reload" }</p>
+                    <p class="mt-2 text-sm text-secondary/70">{ "Apply changes from config.toml." }</p>
+                    <Button
+                        class={Some("mt-4 border border-ink/50 bg-ink/40 text-secondary hover:bg-ink/50".to_string())}
+                        onclick={on_reload_config}
+                        disabled={*reloading}
+                    >
+                        { if *reloading { "Reloading..." } else { "Reload config" } }
+                    </Button>
+                </div>
+                <div class="rounded-2xl border border-ink/50 bg-inkLight p-6">
+                    <p class="text-xs uppercase tracking-wide text-accent/80">{ "Backend" }</p>
+                    <p class="mt-4 text-lg font-semibold">{ "Restart" }</p>
+                    <p class="mt-2 text-sm text-secondary/70">{ "Restarts the server process." }</p>
+                    <Button
+                        class={Some("mt-4 border border-rose-400/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30".to_string())}
+                        onclick={on_restart_backend}
+                    >
+                        { "Restart backend" }
+                    </Button>
                 </div>
             </div>
         </div>

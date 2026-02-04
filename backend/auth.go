@@ -87,8 +87,7 @@ func DiscordCallbackHandler(store *Store, cfg *Config) gin.HandlerFunc {
 			Username: discordUser.Username,
 		})
 
-		ttl := time.Duration(cfg.Session.TTLHours) * time.Hour
-		sessionToken, err := store.CreateSession(discordUser.ID, ttl)
+		sessionToken, err := store.CreateSession(discordUser.ID, cfg.SessionTTL())
 		if err != nil {
 			c.JSON(500, gin.H{"error": "session create failed"})
 			return
@@ -129,7 +128,7 @@ func MeHandler(store *Store, cfg *Config) gin.HandlerFunc {
 			return
 		}
 
-		user.IsAdmin = isAdmin(cfg, user.ID)
+		user.IsAdmin = cfg.IsAdmin(user.ID)
 		c.JSON(200, user)
 	}
 }
@@ -166,20 +165,22 @@ func getBearerToken(c *gin.Context) (string, bool) {
 	return authHeader[len(prefix):], true
 }
 
-func isAdmin(cfg *Config, userID string) bool {
-	for _, id := range cfg.Admins {
-		if id == userID {
-			return true
-		}
-	}
-	return false
-}
-
 func AdminMiddleware(cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.MustGet("user_id").(string)
-		if !isAdmin(cfg, userID) {
+		if !cfg.IsAdmin(userID) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "admin access required"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+func ChatEnabledMiddleware(cfg *Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !cfg.ChatEnabled() {
+			c.JSON(http.StatusNotFound, gin.H{"error": "chat disabled"})
 			c.Abort()
 			return
 		}

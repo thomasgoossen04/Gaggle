@@ -1,13 +1,23 @@
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+use js_sys::{ArrayBuffer, Uint8Array};
 use wasm_bindgen_futures::spawn_local;
+use web_sys::{BinaryType, MessageEvent, WebSocket};
 use yew::prelude::*;
 
 use crate::api::{get_json, send_json};
 use crate::app::AppState;
+use crate::components::Button;
 use crate::confirm::{use_confirm, ConfirmRequest};
 use crate::toast::{use_toast, ToastVariant};
 
+#[derive(Properties, PartialEq)]
+pub struct ChatScreenProps {
+    pub active: bool,
+    pub on_unread: Callback<usize>,
+}
+
 #[function_component(ChatScreen)]
-pub fn chat_screen() -> Html {
+pub fn chat_screen(props: &ChatScreenProps) -> Html {
     let app_state = use_context::<UseStateHandle<AppState>>()
         .expect("AppState context not found. Ensure ChatScreen is under <ContextProvider>.");
     let server_ip = app_state.server_ip.clone().unwrap_or_default();
@@ -15,11 +25,22 @@ pub fn chat_screen() -> Html {
     let is_admin = app_state.user.as_ref().map(|u| u.is_admin).unwrap_or(false);
 
     let messages = use_state(Vec::<ChatMessage>::new);
+    let online_users = use_state(Vec::<String>::new);
     let input = use_state(String::new);
     let enabled = use_state(|| true);
     let error = use_state(|| None::<String>);
     let loading = use_state(|| true);
     let toast = use_toast();
+    let active_ref = use_mut_ref(|| props.active);
+
+    {
+        let active_ref = active_ref.clone();
+        let active = props.active;
+        use_effect_with(active, move |active| {
+            *active_ref.borrow_mut() = *active;
+            ()
+        });
+    }
 
     {
         let messages = messages.clone();
@@ -56,6 +77,103 @@ pub fn chat_screen() -> Html {
                 loading.set(false);
             });
             ()
+        });
+    }
+
+    {
+        let messages = messages.clone();
+        let online_users = online_users.clone();
+        let error = error.clone();
+        let enabled = enabled.clone();
+        let loading = loading.clone();
+        let server_ip = server_ip.clone();
+        let token = token.clone();
+        let active_ref = active_ref.clone();
+        let on_unread = props.on_unread.clone();
+
+        use_effect_with((server_ip.clone(), token.clone(), *enabled, *loading), move |_| {
+            if server_ip.is_empty() || token.is_empty() || *loading || !*enabled {
+                return Box::new(|| ()) as Box<dyn FnOnce()>;
+            }
+
+            let ws_url = format!("ws://{server_ip}:2121/chat/ws?token={token}");
+            let ws = match WebSocket::new(&ws_url) {
+                Ok(ws) => ws,
+                Err(_) => {
+                    error.set(Some("Failed to open chat socket.".to_string()));
+                    return Box::new(|| ()) as Box<dyn FnOnce()>;
+                }
+            };
+            ws.set_binary_type(BinaryType::Arraybuffer);
+
+            let onmessage = {
+                let messages = messages.clone();
+                let online_users = online_users.clone();
+                let error = error.clone();
+                let active_ref = active_ref.clone();
+                let on_unread = on_unread.clone();
+                Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+                    let event: ChatEvent = match parse_chat_event(event.data()) {
+                        Some(event) => event,
+                        None => {
+                            error.set(Some("Invalid chat event.".to_string()));
+                            return;
+                        }
+                    };
+                    match event.event_type.as_str() {
+                        "snapshot" => {
+                            if let Some(list) = event.messages {
+                                messages.set(list);
+                            }
+                        }
+                        "presence" => {
+                            if let Some(users) = event.users {
+                                online_users.set(users);
+                            }
+                        }
+                        "message" => {
+                            if let Some(msg) = event.message {
+                                let mut next = (*messages).clone();
+                                if !next.iter().any(|m| m.id == msg.id) {
+                                    next.push(msg);
+                                    messages.set(next);
+                                    if !*active_ref.borrow() {
+                                        on_unread.emit(1);
+                                    }
+                                }
+                            }
+                        }
+                        "delete" => {
+                            if let Some(id) = event.deleted_id {
+                                let mut next = (*messages).clone();
+                                next.retain(|m| m.id != id);
+                                messages.set(next);
+                            }
+                        }
+                        "clear" => {
+                            messages.set(Vec::new());
+                        }
+                        _ => {}
+                    }
+                }))
+            };
+
+            ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+            onmessage.forget();
+
+            let onerror = {
+                let error = error.clone();
+                Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(move |_event| {
+                    error.set(Some("Chat connection error.".to_string()));
+                }))
+            };
+            ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+            onerror.forget();
+
+            let ws_ref = ws.clone();
+            Box::new(move || {
+                let _ = ws_ref.close();
+            }) as Box<dyn FnOnce()>
         });
     }
 
@@ -173,12 +291,47 @@ pub fn chat_screen() -> Html {
             } else {
                 <div class="mt-6 h-[calc(100vh-18rem)] min-h-[18rem] overflow-hidden rounded-2xl border border-ink/50 bg-inkLight/90 p-6">
                     if messages.is_empty() {
-                        <div class="text-base text-secondary/70">
-                            { "No messages yet. Start the conversation." }
+                        <div class="flex h-full min-h-0 gap-6">
+                            <aside class="w-48 shrink-0 rounded-xl border border-ink/50 bg-ink/40 p-3">
+                                <p class="text-xs uppercase tracking-wide text-accent/80">{ "Online" }</p>
+                                <div class="mt-3 flex flex-col gap-2 text-sm text-secondary/80">
+                                    if online_users.is_empty() {
+                                        <span class="text-secondary/60">{ "No one yet" }</span>
+                                    } else {
+                                        { for online_users.iter().map(|name| html! {
+                                            <div class="flex items-center gap-2">
+                                                <span class="h-2 w-2 rounded-full bg-primary" />
+                                                <span>{ name }</span>
+                                            </div>
+                                        }) }
+                                    }
+                                </div>
+                            </aside>
+                            <div class="h-full min-h-0 flex-1 overflow-y-auto pr-2 scrollbar-thin">
+                                <div class="text-base text-secondary/70">
+                                    { "No messages yet. Start the conversation." }
+                                </div>
+                            </div>
                         </div>
                     } else {
-                        <div class="h-full min-h-0 overflow-y-auto pr-2 scrollbar-thin">
-                            <div class="flex flex-col gap-4">
+                        <div class="flex h-full min-h-0 gap-6">
+                            <aside class="w-48 shrink-0 rounded-xl border border-ink/50 bg-ink/40 p-3">
+                                <p class="text-xs uppercase tracking-wide text-accent/80">{ "Online" }</p>
+                                <div class="mt-3 flex flex-col gap-2 text-sm text-secondary/80">
+                                    if online_users.is_empty() {
+                                        <span class="text-secondary/60">{ "No one yet" }</span>
+                                    } else {
+                                        { for online_users.iter().map(|name| html! {
+                                            <div class="flex items-center gap-2">
+                                                <span class="h-2 w-2 rounded-full bg-primary" />
+                                                <span>{ name }</span>
+                                            </div>
+                                        }) }
+                                    }
+                                </div>
+                            </aside>
+                            <div class="h-full min-h-0 flex-1 overflow-y-auto pr-2 scrollbar-thin">
+                                <div class="flex flex-col gap-4">
                             { for messages.iter().map(|msg| {
                                 let on_delete = on_delete.clone();
                                 let msg_id = msg.id.clone();
@@ -192,14 +345,12 @@ pub fn chat_screen() -> Html {
                                                 { format!("{} · {}", msg.username, format_time(msg.timestamp)) }
                                             </p>
                                             if is_admin {
-                                                <button
-                                                    class="text-primary-300/80 transition hover:text-primary-200"
-                                                    type="button"
+                                                <Button
+                                                    class={Some("bg-transparent px-0 py-0 text-primary/80 hover:text-primary hover:brightness-100 shadow-none".to_string())}
                                                     onclick={on_delete_click}
-                                                    title="Delete message"
                                                 >
                                                     <TrashIcon />
-                                                </button>
+                                                </Button>
                                             }
                                         </div>
                                         <p class="mt-2 text-base text-secondary/95">
@@ -208,6 +359,7 @@ pub fn chat_screen() -> Html {
                                     </div>
                                 }
                             })}
+                                </div>
                             </div>
                         </div>
                     }
@@ -222,19 +374,31 @@ pub fn chat_screen() -> Html {
                             oninput={on_input}
                             onkeydown={on_keydown}
                         />
-                        <button
-                            class="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-3 text-sm font-semibold text-white transition hover:brightness-110 active:scale-95"
-                            type="button"
+                        <Button
+                            class={Some("rounded-xl px-4 py-3 text-sm".to_string())}
                             onclick={on_send_click}
                         >
                             <SendIcon />
                             { "Send" }
-                        </button>
+                        </Button>
                     </div>
                 </div>
             }
         </div>
     }
+}
+
+fn parse_chat_event(data: JsValue) -> Option<ChatEvent> {
+    if let Some(text) = data.as_string() {
+        return serde_json::from_str(&text).ok();
+    }
+    if let Ok(buf) = data.clone().dyn_into::<ArrayBuffer>() {
+        let bytes = Uint8Array::new(&buf).to_vec();
+        if let Ok(text) = String::from_utf8(bytes) {
+            return serde_json::from_str(&text).ok();
+        }
+    }
+    serde_wasm_bindgen::from_value(data).ok()
 }
 
 #[function_component(SendIcon)]
@@ -330,4 +494,14 @@ async fn delete_message(server_ip: &str, token: &str, id: &str) -> Result<(), St
     }
 
     Ok(())
+}
+
+#[derive(Clone, PartialEq, serde::Deserialize)]
+struct ChatEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    message: Option<ChatMessage>,
+    messages: Option<Vec<ChatMessage>>,
+    deleted_id: Option<String>,
+    users: Option<Vec<String>>,
 }

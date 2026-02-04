@@ -6,6 +6,7 @@ use web_sys::{console, HtmlInputElement};
 use yew::prelude::*;
 use futures_util::stream::StreamExt;
 
+use crate::api::send_request;
 use crate::auth::{
     check_session, clear_query_param, fetch_me, get_local_storage_item, get_query_param,
     handle_login, handle_logout, remove_local_storage_item, set_local_storage_item,
@@ -37,6 +38,16 @@ pub struct User {
     pub id: String,
     pub username: String,
     pub is_admin: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Theme {
+    pub primary: String,
+    pub secondary: String,
+    pub accent: String,
+    pub ink: String,
+    pub ink_light: String,
+    pub font: String,
 }
 
 type AppStateHandle = UseStateHandle<AppState>;
@@ -82,6 +93,23 @@ pub fn app() -> Html {
         );
     }
 
+    {
+        let server_ip = app_state.server_ip.clone();
+        use_effect_with(
+            server_ip,
+            move |server_ip| {
+                if let Some(server_ip) = server_ip.clone() {
+                    spawn_local(async move {
+                        if let Ok(theme) = fetch_theme(&server_ip).await {
+                            apply_theme(&theme);
+                        }
+                    });
+                }
+                ()
+            },
+        );
+    }
+
     html! {
         <ToastProvider>
             <ConfirmProvider>
@@ -90,6 +118,57 @@ pub fn app() -> Html {
                 </ContextProvider<AppStateHandle>>
             </ConfirmProvider>
         </ToastProvider>
+    }
+}
+
+pub async fn fetch_theme(server_ip: &str) -> Result<Theme, String> {
+    let url = format!("http://{server_ip}:2121/theme");
+    let resp = send_request("GET", &url, None, None).await?;
+    if resp.status() == 204 {
+        return Err("No theme configured.".to_string());
+    }
+    if !resp.ok() {
+        return Err(format!("Theme error (HTTP {}).", resp.status()));
+    }
+    let json = wasm_bindgen_futures::JsFuture::from(
+        resp.json()
+            .map_err(|_| "Failed to parse theme JSON.".to_string())?,
+    )
+    .await
+    .map_err(|_| "Failed to parse theme JSON.".to_string())?;
+    let theme: Theme =
+        serde_wasm_bindgen::from_value(json).map_err(|_| "Invalid theme response.".to_string())?;
+    Ok(theme)
+}
+
+pub fn apply_theme(theme: &Theme) {
+    if let Some(win) = web_sys::window() {
+        if let Some(doc) = win.document() {
+            let font_stack = format!(
+                "\"{}\", ui-sans-serif, system-ui, sans-serif",
+                theme.font
+            );
+            let style = format!(
+                "--color-primary:{};\
+                --color-secondary:{};\
+                --color-accent:{};\
+                --color-ink:{};\
+                --color-inkLight:{};\
+                --font-sans:{};",
+                theme.primary,
+                theme.secondary,
+                theme.accent,
+                theme.ink,
+                theme.ink_light,
+                font_stack
+            );
+            if let Some(root) = doc.document_element() {
+                let _ = root.set_attribute("style", &style);
+            }
+            if let Some(body) = doc.body() {
+                let _ = body.set_attribute("style", &style);
+            }
+        }
     }
 }
 
@@ -181,7 +260,29 @@ fn app_router() -> Html {
             let app_state = app_state.clone();
             Callback::from(move |_| handle_logout(app_state.clone()))
         };
-        return html! { <ErrorScreen message={message} on_logout={on_logout} /> };
+        let on_retry = {
+            let app_state = app_state.clone();
+            Callback::from(move |_| {
+                let app_state = app_state.clone();
+                let server_ip = app_state.server_ip.clone();
+                let token = app_state.session_token.clone();
+                if let (Some(server_ip), Some(token)) = (server_ip, token) {
+                    spawn_local(async move {
+                        if let Ok(user) = fetch_me(&server_ip, &token).await {
+                            let mut next = (*app_state).clone();
+                            next.user = Some(user);
+                            next.auth_error = None;
+                            app_state.set(next);
+                        } else if let Err(message) = check_session(&server_ip, &token).await {
+                            let mut next = (*app_state).clone();
+                            next.auth_error = Some(message);
+                            app_state.set(next);
+                        }
+                    });
+                }
+            })
+        };
+        return html! { <ErrorScreen message={message} on_logout={on_logout} on_retry={on_retry} /> };
     }
 
     if app_state.logged_in {

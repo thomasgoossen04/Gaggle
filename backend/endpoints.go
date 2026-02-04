@@ -8,11 +8,21 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
+
+var chatHub *ChatHub
+var httpServer *http.Server
+var shutdownOnce sync.Once
+
+var chatWsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
 
 func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 	// Health check
@@ -36,8 +46,18 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 	// Feature flags
 	router.GET("/features", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"chat_enabled": cfg.Features.ChatEnabled,
+			"chat_enabled": cfg.ChatEnabled(),
 		})
+	})
+
+	// Theme (optional)
+	router.GET("/theme", func(c *gin.Context) {
+		theme := cfg.GetTheme()
+		if theme == nil {
+			c.Status(http.StatusNoContent)
+			return
+		}
+		c.JSON(http.StatusOK, theme)
 	})
 
 	// Protected user routes
@@ -49,13 +69,24 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 	}
 
 	// Protected chat routes (optional)
-	if cfg.Features.ChatEnabled {
-		chat := router.Group("/chat")
-		chat.Use(AuthMiddleware(store))
-		{
-			chat.GET("/messages", store.getChatMessagesEp)
-			chat.POST("/messages", store.postChatMessageEp)
-		}
+	if cfg.ChatEnabled() {
+		chatHub = NewChatHub()
+	}
+	chat := router.Group("/chat")
+	chat.Use(ChatEnabledMiddleware(cfg))
+	{
+		chat.GET("/ws", func(c *gin.Context) {
+			store.chatWsEp(c, chatHub)
+		})
+	}
+
+	chatAuth := router.Group("/chat")
+	chatAuth.Use(AuthMiddleware(store), ChatEnabledMiddleware(cfg))
+	{
+		chatAuth.GET("/messages", store.getChatMessagesEp)
+		chatAuth.POST("/messages", func(c *gin.Context) {
+			store.postChatMessageEp(c, chatHub)
+		})
 	}
 
 	// Admin routes
@@ -65,6 +96,17 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 		admin.GET("/stats", store.getAdminStatsEp)
 		admin.DELETE("/chat/messages", store.clearChatMessagesEp)
 		admin.DELETE("/chat/messages/:id", store.deleteChatMessageEp)
+		admin.POST("/restart", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"status": "restarting"})
+			go gracefulShutdown(store)
+		})
+		admin.POST("/reload-config", func(c *gin.Context) {
+			if err := cfg.Reload(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "reload failed"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "reloaded"})
+		})
 	}
 
 	runServer(router, store, cfg)
@@ -76,6 +118,7 @@ func runServer(router *gin.Engine, store *Store, cfg *Config) {
 		Addr:    ":" + strconv.Itoa(cfg.Port),
 		Handler: router,
 	}
+	httpServer = srv
 
 	// Run server in a goroutine
 	go func() {
@@ -90,17 +133,27 @@ func runServer(router *gin.Engine, store *Store, cfg *Config) {
 	signal.Notify(quit, os.Interrupt)
 	<-quit
 	fmt.Println("\nShutting down server...")
+	gracefulShutdown(store)
+}
 
-	// Graceful shutdown with 5s timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
-	}
+func gracefulShutdown(store *Store) {
+	shutdownOnce.Do(func() {
+		// Graceful shutdown with 5s timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if httpServer != nil {
+			if err := httpServer.Shutdown(ctx); err != nil {
+				log.Printf("Server forced to shutdown: %v", err)
+			}
+		}
 
-	// Close DB cleanly
-	store.db.Close()
-	fmt.Println("Server exited cleanly")
+		// Close DB cleanly
+		store.db.Close()
+		log.Println("Server exited cleanly")
+
+		// Exit process (supervisor should restart)
+		os.Exit(0)
+	})
 }
 
 func (s *Store) getUserEp(c *gin.Context) {
@@ -124,7 +177,7 @@ func (s *Store) getChatMessagesEp(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"messages": messages})
 }
 
-func (s *Store) postChatMessageEp(c *gin.Context) {
+func (s *Store) postChatMessageEp(c *gin.Context, chatHub *ChatHub) {
 	userID := c.MustGet("user_id").(string)
 	user, err := s.GetUser(userID)
 	if err != nil {
@@ -146,7 +199,64 @@ func (s *Store) postChatMessageEp(c *gin.Context) {
 		return
 	}
 
+	if chatHub != nil {
+		chatHub.broadcast <- ChatEvent{Type: "message", Message: &msg}
+	}
+
 	c.JSON(http.StatusOK, msg)
+}
+
+func (s *Store) chatWsEp(c *gin.Context, chatHub *ChatHub) {
+	if chatHub == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "chat disabled"})
+		return
+	}
+
+	token := c.Query("token")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		return
+	}
+
+	userID, err := s.GetUserFromSession(token)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid session"})
+		return
+	}
+
+	conn, err := chatWsUpgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		return
+	}
+
+	user, err := s.GetUser(userID)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+
+	client := ChatClient{
+		Conn:     conn,
+		UserID:   userID,
+		Username: user.Username,
+		Send:     make(chan ChatEvent, 16),
+	}
+	chatHub.register <- client
+
+	if messages, err := s.ListChatMessages(100); err == nil {
+		client.Send <- ChatEvent{Type: "snapshot", Messages: messages}
+	}
+
+	go func() {
+		defer func() {
+			chatHub.unregister <- conn
+		}()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				break
+			}
+		}
+	}()
 }
 
 func (s *Store) getAdminStatsEp(c *gin.Context) {
@@ -167,6 +277,9 @@ func (s *Store) clearChatMessagesEp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "chat clear failed"})
 		return
 	}
+	if chatHub != nil {
+		chatHub.broadcast <- ChatEvent{Type: "clear"}
+	}
 	c.JSON(http.StatusOK, gin.H{"deleted": deleted})
 }
 
@@ -183,6 +296,9 @@ func (s *Store) deleteChatMessageEp(c *gin.Context) {
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
 		return
+	}
+	if chatHub != nil {
+		chatHub.broadcast <- ChatEvent{Type: "delete", DeletedID: id}
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }

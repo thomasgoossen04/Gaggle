@@ -6,6 +6,7 @@ use crate::components::{Button, Card};
 pub struct ErrorScreenProps {
     pub message: String,
     pub on_logout: Callback<MouseEvent>,
+    pub on_retry: Callback<MouseEvent>,
 }
 
 #[function_component(ErrorScreen)]
@@ -20,9 +21,14 @@ pub fn error_screen(props: &ErrorScreenProps) -> Html {
                 <div class="mt-4 rounded-lg border border-ink/50 bg-ink/60 p-3 text-sm text-secondary/80">
                     { props.message.clone() }
                 </div>
-                <Button class={Some("mt-6".to_string())} onclick={props.on_logout.clone()}>
-                    { "Log out" }
-                </Button>
+                <div class="mt-6 flex items-center gap-3">
+                    <Button onclick={props.on_retry.clone()}>
+                        { "Try reconnect" }
+                    </Button>
+                    <Button class={Some("bg-inkLight border border-ink/50".to_string())} onclick={props.on_logout.clone()}>
+                        { "Log out" }
+                    </Button>
+                </div>
             </Card>
         </main>
     }

@@ -1,6 +1,9 @@
+use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
+use crate::app::{apply_theme, fetch_theme};
 use crate::components::Button;
+use crate::toast::{use_toast, ToastVariant};
 
 #[derive(Properties, PartialEq)]
 pub struct SettingsScreenProps {
@@ -10,6 +13,33 @@ pub struct SettingsScreenProps {
 
 #[function_component(SettingsScreen)]
 pub fn settings_screen(props: &SettingsScreenProps) -> Html {
+    let app_state = use_context::<UseStateHandle<crate::app::AppState>>()
+        .expect("AppState context not found. Ensure SettingsScreen is under <ContextProvider>.");
+    let server_ip = app_state.server_ip.clone();
+    let toast = use_toast();
+    let on_reload_theme = {
+        let server_ip = server_ip.clone();
+        let toast = toast.clone();
+        Callback::from(move |_| {
+            let toast = toast.clone();
+            if let Some(server_ip) = server_ip.clone() {
+                spawn_local(async move {
+                    match fetch_theme(&server_ip).await {
+                        Ok(theme) => {
+                            apply_theme(&theme);
+                            toast.toast("Theme reloaded.", ToastVariant::Success, Some(2000));
+                        }
+                        Err(msg) => {
+                            toast.toast(msg, ToastVariant::Error, Some(3000));
+                        }
+                    }
+                });
+            } else {
+                toast.toast("No server IP found.", ToastVariant::Warning, Some(2500));
+            }
+        })
+    };
+
     html! {
         <div>
             <h1 class="text-2xl font-semibold">{ "Settings" }</h1>
@@ -37,6 +67,19 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
                     </div>
                     <Button onclick={props.on_logout.clone()}>
                         { "Log out" }
+                    </Button>
+                </div>
+            </div>
+            <div class="mt-6 rounded-2xl border border-ink/50 bg-inkLight p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h2 class="text-sm font-semibold">{ "Theme" }</h2>
+                        <p class="mt-2 text-sm text-secondary/70">
+                            { "Reload colors and font from the backend." }
+                        </p>
+                    </div>
+                    <Button onclick={on_reload_theme}>
+                        { "Reload theme" }
                     </Button>
                 </div>
             </div>
