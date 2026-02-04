@@ -1,8 +1,8 @@
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
-use crate::app::AppState;
 use crate::api::{get_json, send_json};
+use crate::app::AppState;
 use crate::confirm::{use_confirm, ConfirmRequest};
 use crate::toast::{use_toast, ToastVariant};
 
@@ -26,25 +26,22 @@ pub fn admin_screen() -> Html {
         let loading = loading.clone();
         let server_ip = server_ip.clone();
         let token = token.clone();
-        use_effect_with(
-            (server_ip.clone(), token.clone()),
-            move |_| {
-                if server_ip.is_empty() || token.is_empty() {
-                    loading.set(false);
-                    return ();
+        use_effect_with((server_ip.clone(), token.clone()), move |_| {
+            if server_ip.is_empty() || token.is_empty() {
+                loading.set(false);
+                return ();
+            }
+
+            spawn_local(async move {
+                match fetch_admin_stats(&server_ip, &token).await {
+                    Ok(count) => sessions.set(Some(count)),
+                    Err(msg) => error.set(Some(msg)),
                 }
+                loading.set(false);
+            });
 
-                spawn_local(async move {
-                    match fetch_admin_stats(&server_ip, &token).await {
-                        Ok(count) => sessions.set(Some(count)),
-                        Err(msg) => error.set(Some(msg)),
-                    }
-                    loading.set(false);
-                });
-
-                ()
-            },
-        );
+            ()
+        });
     }
 
     let on_clear_chat = {
@@ -65,8 +62,7 @@ pub fn admin_screen() -> Html {
             let toast = toast.clone();
             confirm.confirm(ConfirmRequest {
                 title: "Clear chat messages?".to_string(),
-                message: "This will permanently delete all chat messages for everyone."
-                    .to_string(),
+                message: "This will permanently delete all chat messages for everyone.".to_string(),
                 confirm_label: "Clear chat".to_string(),
                 cancel_label: "Cancel".to_string(),
                 on_confirm: Callback::from(move |_| {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dgraph-io/badger"
 	"github.com/gin-gonic/gin"
@@ -39,7 +40,7 @@ func DiscordLoginHandler(c *gin.Context) {
 	c.Redirect(http.StatusTemporaryRedirect, url)
 }
 
-func DiscordCallbackHandler(store *Store) gin.HandlerFunc {
+func DiscordCallbackHandler(store *Store, cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 
 		code := c.Query("code")
@@ -86,7 +87,8 @@ func DiscordCallbackHandler(store *Store) gin.HandlerFunc {
 			Username: discordUser.Username,
 		})
 
-		sessionToken, err := store.CreateSession(discordUser.ID)
+		ttl := time.Duration(cfg.Session.TTLHours) * time.Hour
+		sessionToken, err := store.CreateSession(discordUser.ID, ttl)
 		if err != nil {
 			c.JSON(500, gin.H{"error": "session create failed"})
 			return
@@ -99,21 +101,10 @@ func DiscordCallbackHandler(store *Store) gin.HandlerFunc {
 
 func AuthMiddleware(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing auth header"})
-			c.Abort()
+		token, ok := getBearerToken(c)
+		if !ok {
 			return
 		}
-
-		const prefix = "Bearer "
-		if len(authHeader) < len(prefix) || authHeader[:len(prefix)] != prefix {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid auth header"})
-			c.Abort()
-			return
-		}
-
-		token := authHeader[len(prefix):]
 
 		userID, err := store.GetUserFromSession(token)
 		if err != nil {
@@ -143,6 +134,38 @@ func MeHandler(store *Store, cfg *Config) gin.HandlerFunc {
 	}
 }
 
+func LogoutHandler(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token, ok := getBearerToken(c)
+		if !ok {
+			return
+		}
+		if err := store.DeleteSession(token); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout failed"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "logged out"})
+	}
+}
+
+func getBearerToken(c *gin.Context) (string, bool) {
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing auth header"})
+		c.Abort()
+		return "", false
+	}
+
+	const prefix = "Bearer "
+	if len(authHeader) < len(prefix) || authHeader[:len(prefix)] != prefix {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid auth header"})
+		c.Abort()
+		return "", false
+	}
+
+	return authHeader[len(prefix):], true
+}
+
 func isAdmin(cfg *Config, userID string) bool {
 	for _, id := range cfg.Admins {
 		if id == userID {
@@ -164,11 +187,15 @@ func AdminMiddleware(cfg *Config) gin.HandlerFunc {
 	}
 }
 
-func (s *Store) CreateSession(userID string) (string, error) {
+func (s *Store) CreateSession(userID string, ttl time.Duration) (string, error) {
 	token := uuid.NewString()
 
 	err := s.db.Update(func(txn *badger.Txn) error {
-		return txn.Set([]byte("session:"+token), []byte(userID))
+		entry := badger.NewEntry([]byte("session:"+token), []byte(userID))
+		if ttl > 0 {
+			entry = entry.WithTTL(ttl)
+		}
+		return txn.SetEntry(entry)
 	})
 
 	return token, err
@@ -189,4 +216,10 @@ func (s *Store) GetUserFromSession(token string) (string, error) {
 	})
 
 	return userID, err
+}
+
+func (s *Store) DeleteSession(token string) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete([]byte("session:" + token))
+	})
 }

@@ -193,7 +193,7 @@ pub fn chat_screen() -> Html {
                                             </p>
                                             if is_admin {
                                                 <button
-                                                    class="text-rose-300/80 transition hover:text-rose-200"
+                                                    class="text-primary-300/80 transition hover:text-primary-200"
                                                     type="button"
                                                     onclick={on_delete_click}
                                                     title="Delete message"

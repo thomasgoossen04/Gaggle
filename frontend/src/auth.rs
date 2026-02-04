@@ -3,7 +3,9 @@ use web_sys::{window, UrlSearchParams};
 use yew::UseStateHandle;
 
 use crate::app::{AppState, User};
-use crate::api::{get_json, send_request};
+use wasm_bindgen_futures::spawn_local;
+
+use crate::api::{get_json, send_json, send_request};
 
 pub const SERVER_IP_KEY: &str = "gaggle_server_ip";
 pub const SESSION_TOKEN_KEY: &str = "gaggle_session_token";
@@ -32,6 +34,14 @@ pub fn handle_login(server_ip: &str) {
 }
 
 pub fn handle_logout(app_state: UseStateHandle<AppState>) {
+    let server_ip = app_state.server_ip.clone();
+    let token = app_state.session_token.clone();
+    if let (Some(server_ip), Some(token)) = (server_ip, token) {
+        spawn_local(async move {
+            let url = format!("http://{server_ip}:2121/auth/logout");
+            let _ = send_json("POST", &url, Some(&token), None).await;
+        });
+    }
     remove_local_storage_item(SESSION_TOKEN_KEY);
     app_state.set(AppState {
         logged_in: false,

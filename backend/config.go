@@ -13,6 +13,7 @@ type Config struct {
 	Discord DiscordConfig `toml:"discord"`
 	Features Features     `toml:"features"`
 	Admins  []string      `toml:"admins"`
+	Session SessionConfig `toml:"session"`
 }
 
 type DiscordConfig struct {
@@ -24,6 +25,10 @@ type DiscordConfig struct {
 
 type Features struct {
 	ChatEnabled bool `toml:"chat_enabled"`
+}
+
+type SessionConfig struct {
+	TTLHours int `toml:"ttl_hours"`
 }
 
 func LoadConfig() (*Config, error) {

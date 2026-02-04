@@ -29,7 +29,8 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 	auth := router.Group("/auth")
 	{
 		auth.GET("/discord/login", DiscordLoginHandler)
-		auth.GET("/discord/callback", DiscordCallbackHandler(store))
+		auth.GET("/discord/callback", DiscordCallbackHandler(store, cfg))
+		auth.POST("/logout", LogoutHandler(store))
 	}
 
 	// Feature flags
