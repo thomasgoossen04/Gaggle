@@ -92,7 +92,7 @@ func DiscordCallbackHandler(store *Store) gin.HandlerFunc {
 			return
 		}
 
-		// Redirect browser → Wails local server
+		// Redirect browser → gui application
 		c.Redirect(302, redirect+"?token="+sessionToken)
 	}
 }
