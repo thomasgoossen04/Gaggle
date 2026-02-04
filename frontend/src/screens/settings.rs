@@ -127,7 +127,7 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
                     </Button>
                 </div>
                 <input
-                    class="mt-4 w-full rounded border border-ink/50 bg-ink/40 px-3 py-2 text-secondary placeholder:text-secondary/60 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                    class="mt-4 w-full rounded border border-ink/50 bg-ink/40 px-3 py-2 text-secondary placeholder:text-secondary/60 outline outline-1 outline-accent/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
                     type="text"
                     placeholder="Apps folder"
                     value={(*install_dir).clone()}

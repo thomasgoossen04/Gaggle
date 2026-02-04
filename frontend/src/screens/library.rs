@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+﻿use std::collections::{HashMap, HashSet};
 
 use js_sys::{Function, Reflect};
 use serde::Deserialize;
@@ -30,6 +30,8 @@ struct AppInfo {
     version: String,
     archive_size: i64,
     has_archive: bool,
+    #[serde(default)]
+    executable: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -78,6 +80,23 @@ pub fn library_screen() -> Html {
     let downloads = use_state(|| HashMap::<String, DownloadUiState>::new());
     let refresh_tick = use_state(|| 0u32);
     let installed = use_state(|| HashSet::<String>::new());
+    let search = use_state(String::new);
+    let sort = use_state(|| "downloaded".to_string());
+    let carousel_ref = use_node_ref();
+    let on_carousel_wheel = {
+        let carousel_ref = carousel_ref.clone();
+        Callback::from(move |event: WheelEvent| {
+            event.prevent_default();
+            if let Some(element) = carousel_ref.cast::<web_sys::HtmlElement>() {
+                let delta = if event.delta_y().abs() > event.delta_x().abs() {
+                    event.delta_y()
+                } else {
+                    event.delta_x()
+                };
+                let _ = element.scroll_by_with_x_and_y(delta, 0.0);
+            }
+        })
+    };
 
     {
         let install_dir = install_dir.clone();
@@ -201,6 +220,66 @@ pub fn library_screen() -> Html {
         })
     };
 
+    {
+        let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
+        let token = token.clone();
+        let refresh_tick = refresh_tick.clone();
+        use_effect_with((server_ip.clone(), server_port.clone(), token.clone()), move |_| {
+            if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
+                return ();
+            }
+            let server_ip = server_ip.clone();
+            let server_port = server_port.clone();
+            let token = token.clone();
+            let refresh_tick = refresh_tick.clone();
+            spawn_local(async move {
+                let url = build_http_url(&server_ip, &server_port, "apps/refresh");
+                if let Ok(resp) = send_json("POST", &url, Some(&token), None).await {
+                    if resp.ok() {
+                        refresh_tick.set(*refresh_tick + 1);
+                    }
+                }
+            });
+            ()
+        });
+    }
+
+    let on_search_input = {
+        let search = search.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: web_sys::HtmlInputElement = event.target_unchecked_into();
+            search.set(input.value());
+        })
+    };
+
+    let on_sort_change = {
+        let sort = sort.clone();
+        Callback::from(move |event: Event| {
+            let input: web_sys::HtmlSelectElement = event.target_unchecked_into();
+            sort.set(input.value());
+        })
+    };
+
+    let on_scroll_prev = {
+        let carousel_ref = carousel_ref.clone();
+        Callback::from(move |_| {
+            if let Some(element) = carousel_ref.cast::<web_sys::HtmlElement>() {
+                let width = element.client_width() as f64;
+                let _ = element.scroll_by_with_x_and_y(-width, 0.0);
+            }
+        })
+    };
+
+    let on_scroll_next = {
+        let carousel_ref = carousel_ref.clone();
+        Callback::from(move |_| {
+            if let Some(element) = carousel_ref.cast::<web_sys::HtmlElement>() {
+                let width = element.client_width() as f64;
+                let _ = element.scroll_by_with_x_and_y(width, 0.0);
+            }
+        })
+    };
     {
         let downloads = downloads.clone();
         let installed = installed.clone();
@@ -365,6 +444,7 @@ pub fn library_screen() -> Html {
         let install_dir = install_dir.clone();
         let installed = installed.clone();
         let downloads = downloads.clone();
+        let toast = toast.clone();
         Callback::from(move |id: String| {
             let install_dir = (*install_dir).clone();
             if install_dir.trim().is_empty() {
@@ -454,6 +534,57 @@ pub fn library_screen() -> Html {
         })
     };
 
+    let on_open_folder = {
+        let install_dir = install_dir.clone();
+        let toast = toast.clone();
+        Callback::from(move |id: String| {
+            let install_dir = (*install_dir).clone();
+            let toast = toast.clone();
+            if install_dir.trim().is_empty() {
+                toast.toast("No install folder configured.", ToastVariant::Warning, Some(2500));
+                return;
+            }
+            spawn_local(async move {
+                let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
+                    "request": {
+                        "id": id,
+                        "destDir": install_dir
+                    }
+                }))
+                .unwrap_or(JsValue::NULL);
+                let _ = invoke("open_app_folder", payload).await;
+            });
+        })
+    };
+
+    let on_run_app = {
+        let install_dir = install_dir.clone();
+        let toast = toast.clone();
+        Callback::from(move |(id, executable): (String, String)| {
+            let install_dir = (*install_dir).clone();
+            let toast = toast.clone();
+            if install_dir.trim().is_empty() {
+                toast.toast("No install folder configured.", ToastVariant::Warning, Some(2500));
+                return;
+            }
+            if executable.trim().is_empty() {
+                toast.toast("Executable not configured for this app.", ToastVariant::Warning, Some(2500));
+                return;
+            }
+            spawn_local(async move {
+                let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
+                    "request": {
+                        "id": id,
+                        "destDir": install_dir,
+                        "executable": executable
+                    }
+                }))
+                .unwrap_or(JsValue::NULL);
+                let _ = invoke("run_app_executable", payload).await;
+            });
+        })
+    };
+
     html! {
         <div>
             <div class="flex items-center justify-between gap-4">
@@ -470,6 +601,42 @@ pub fn library_screen() -> Html {
                     { "Refresh" }
                 </Button>
             </div>
+            <div class="mt-6 flex flex-wrap items-center gap-3">
+                <div class="flex-1 min-w-[220px]">
+                    <input
+                        class="w-full rounded border border-ink/50 bg-ink/50 px-4 py-2 text-secondary placeholder:text-secondary/60 outline outline-1 outline-accent/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                        type="text"
+                        placeholder="Search apps..."
+                        value={(*search).clone()}
+                        oninput={on_search_input}
+                    />
+                </div>
+                <div class="min-w-[200px]">
+                    <select
+                        class="w-full rounded border border-ink/50 bg-ink/50 px-4 py-2 text-secondary outline outline-1 outline-accent/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                        value={(*sort).clone()}
+                        onchange={on_sort_change}
+                    >
+                        <option value="downloaded">{ "Downloaded first" }</option>
+                        <option value="name">{ "Name (Aâ€“Z)" }</option>
+                        <option value="size">{ "Size (largest)" }</option>
+                    </select>
+                </div>
+                <div class="flex items-center gap-2">
+                    <Button
+                        class={Some("border border-ink/50 bg-ink/40 text-secondary hover:bg-ink/50".to_string())}
+                        onclick={on_scroll_prev}
+                    >
+                        { "Prev" }
+                    </Button>
+                    <Button
+                        class={Some("border border-ink/50 bg-ink/40 text-secondary hover:bg-ink/50".to_string())}
+                        onclick={on_scroll_next}
+                    >
+                        { "Next" }
+                    </Button>
+                </div>
+            </div>
             if *loading {
                 <div class="mt-6 rounded-2xl border border-ink/50 bg-inkLight p-6 text-sm text-secondary/70">
                     { "Loading apps..." }
@@ -479,24 +646,75 @@ pub fn library_screen() -> Html {
                     { message }
                 </div>
             } else {
-                <div class="mt-8 grid gap-6 md:grid-cols-2 xl:grid-cols-3">
-                    { for apps.iter().cloned().map(|app| {
+                <div
+                    ref={carousel_ref.clone()}
+                    onwheel={on_carousel_wheel}
+                    class="mt-8 flex gap-6 overflow-x-auto pb-4 snap-x snap-mandatory scrollbar-thin"
+                >
+                    { for {
+                        let mut items: Vec<_> = apps
+                            .iter()
+                            .cloned()
+                            .filter(|app| {
+                                let query = (*search).trim().to_lowercase();
+                                if query.is_empty() {
+                                    return true;
+                                }
+                                let hay = format!("{} {} {}", app.name, app.description, app.id).to_lowercase();
+                                hay.contains(&query)
+                            })
+                            .collect();
+                        match (*sort).as_str() {
+                            "name" => items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                            "size" => items.sort_by(|a, b| b.archive_size.cmp(&a.archive_size)),
+                            _ => items.sort_by(|a, b| {
+                                let a_installed = (*installed).contains(&a.id)
+                                    || (*downloads).get(&a.id).map(|d| d.status == "completed").unwrap_or(false);
+                                let b_installed = (*installed).contains(&b.id)
+                                    || (*downloads).get(&b.id).map(|d| d.status == "completed").unwrap_or(false);
+                                b_installed.cmp(&a_installed).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                            }),
+                        }
+                        items
+                    }.into_iter().map(|app| {
                         let status = (*downloads).get(&app.id).cloned().unwrap_or_default();
-                        let is_installed = (*installed).contains(&app.id);
+                        let is_installed = (*installed).contains(&app.id)
+                            || status.status == "completed";
                         let on_download = on_download.clone();
                         let on_pause = on_pause.clone();
                         let on_resume = on_resume.clone();
                         let on_cancel = on_cancel.clone();
                         let on_remove = on_remove.clone();
+                        let on_open_folder = on_open_folder.clone();
+                        let on_run_app = on_run_app.clone();
                         let app_id_pause = app.id.clone();
                         let app_id_resume = app.id.clone();
                         let app_id_cancel = app.id.clone();
                         let app_for_download = app.clone();
                         let app_for_remove = app.clone();
+                        let app_for_open = app.clone();
+                        let app_for_run = app.clone();
                         let is_busy = (*downloads)
                             .values()
                             .any(|d| d.status == "downloading" || d.status == "paused");
-                        let action = if status.status == "downloading" {
+                        let has_exec = app
+                            .executable
+                            .as_ref()
+                            .map(|value| !value.trim().is_empty())
+                            .unwrap_or(false);
+                        let action = if status.status == "installing" {
+                            html! {
+                                <div class="flex items-center gap-2">
+                                    <Button
+                                        class={Some("border border-ink/50 bg-ink/40 text-secondary hover:bg-ink/50".to_string())}
+                                        onclick={Callback::from(|_| {})}
+                                        disabled={true}
+                                    >
+                                        { "Installing..." }
+                                    </Button>
+                                </div>
+                            }
+                        } else if status.status == "downloading" {
                             html! {
                                 <div class="flex items-center gap-2">
                                     <Button
@@ -530,14 +748,36 @@ pub fn library_screen() -> Html {
                                     </Button>
                                 </div>
                             }
-                        } else if is_installed || status.status == "completed" {
+                        } else if is_installed {
+                            let primary = if has_exec {
+                                html! {
+                                    <Button
+                                        class={Some("border border-accent/50 bg-accent/20 text-secondary hover:bg-accent/30".to_string())}
+                                        onclick={Callback::from(move |_| on_run_app.emit((app_for_run.id.clone(), app_for_run.executable.clone().unwrap_or_default())))}
+                                    >
+                                        { "Run" }
+                                    </Button>
+                                }
+                            } else {
+                                html! {
+                                    <Button
+                                        class={Some("border border-ink/50 bg-ink/40 text-secondary hover:bg-ink/50".to_string())}
+                                        onclick={Callback::from(move |_| on_open_folder.emit(app_for_open.id.clone()))}
+                                    >
+                                        { "Open Folder" }
+                                    </Button>
+                                }
+                            };
                             html! {
-                                <Button
-                                    class={Some("border border-rose-400/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30".to_string())}
-                                    onclick={Callback::from(move |_| on_remove.emit(app_for_remove.id.clone()))}
-                                >
-                                    { "Remove" }
-                                </Button>
+                                <div class="flex items-center gap-2">
+                                    { primary }
+                                    <Button
+                                        class={Some("border border-rose-400/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30".to_string())}
+                                        onclick={Callback::from(move |_| on_remove.emit(app_for_remove.id.clone()))}
+                                    >
+                                        { "Remove" }
+                                    </Button>
+                                </div>
                             }
                         } else {
                             html! {
@@ -566,22 +806,39 @@ pub fn library_screen() -> Html {
                         } else {
                             String::new()
                         };
+                        let status_label = if status.status == "installing" {
+                            "Installing"
+                        } else if status.status == "downloading" {
+                            "Downloading"
+                        } else if status.status == "paused" {
+                            "Paused"
+                        } else {
+                            ""
+                        };
 
                         html! {
-                            <div class="rounded-3xl border-2 border-ink/40 bg-ink/30 p-1 shadow-xl">
-                                <div class="rounded-2xl border border-ink/50 bg-inkLight p-6">
+                            <div key={app.id.clone()} class="snap-start shrink-0 w-[min(92vw,28rem)] rounded-3xl border-2 border-ink/40 bg-ink/30 p-1 shadow-xl">
+                                <div class="min-h-[22rem] rounded-2xl border border-ink/50 bg-inkLight p-6 flex flex-col">
                                 <p class="text-xs uppercase tracking-wide text-accent/80">{ "App" }</p>
                                 <p class="mt-4 text-lg font-semibold">{ app.name.clone() }</p>
                                 <p class="mt-2 text-sm text-secondary/70">{ app.description.clone() }</p>
                                 <div class="mt-4 flex items-center justify-between text-xs text-secondary/60">
-                                    <span>{ format!("Version {}", if app.version.is_empty() { "—" } else { &app.version }) }</span>
+                                    <span>{ format!("Version {}", if app.version.is_empty() { "â€”" } else { &app.version }) }</span>
                                     <span>{ format_size(app.archive_size) }</span>
                                 </div>
-                                <div class="mt-4 flex items-center justify-between">
+                                <div class="mt-auto flex items-center justify-between">
                                     { action }
-                                    if !progress.is_empty() {
+                                    if !progress.is_empty() || !status_label.is_empty() {
                                         <span class="text-xs text-secondary/60">
-                                            { if speed.is_empty() { progress } else { format!("{progress} · {speed}") } }
+                                            { if status_label.is_empty() {
+                                                if speed.is_empty() { progress.clone() } else { format!("{progress} - {speed}") }
+                                            } else if progress.is_empty() {
+                                                status_label.to_string()
+                                            } else if speed.is_empty() {
+                                                format!("{status_label} - {progress}")
+                                            } else {
+                                                format!("{status_label} - {progress} - {speed}")
+                                            } }
                                         </span>
                                     }
                                 </div>
@@ -597,7 +854,7 @@ pub fn library_screen() -> Html {
 
 fn format_size(size: i64) -> String {
     if size <= 0 {
-        return "—".to_string();
+        return "â€”".to_string();
     }
     let size = size as f64;
     let units = ["B", "KB", "MB", "GB"];
@@ -612,3 +869,5 @@ fn format_size(size: i64) -> String {
     }
     format!("{:.1} {}", value, unit)
 }
+
+

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -8,12 +9,17 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use std::sync::Mutex as StdMutex;
 
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::RANGE;
+use reqwest::multipart::{Form, Part};
+use reqwest::Body;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_opener::open_path;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
+use tokio_util::io::ReaderStream;
 
 #[derive(Default)]
 struct DownloadManager {
@@ -103,6 +109,289 @@ async fn pick_install_dir() -> Result<Option<String>, String> {
         .pick_folder()
         .await;
     Ok(handle.map(|dir| dir.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+async fn pick_upload_folder() -> Result<Option<String>, String> {
+    let handle = rfd::AsyncFileDialog::new()
+        .set_title("Select App Folder to Upload")
+        .pick_folder()
+        .await;
+    Ok(handle.map(|dir| dir.path().to_string_lossy().to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadAppRequest {
+    server_ip: String,
+    server_port: String,
+    token: String,
+    id: String,
+    config_toml: String,
+    folder_path: String,
+}
+
+#[derive(Serialize, Clone)]
+struct UploadProgress {
+    id: String,
+    sent: u64,
+    total: u64,
+    pct: f64,
+}
+
+#[derive(Serialize, Clone)]
+struct UploadStage {
+    id: String,
+    stage: String,
+}
+
+#[derive(Clone)]
+struct UploadProgressState {
+    sent: u64,
+    total: u64,
+    last_emit: Instant,
+}
+
+struct CountingReader<R: Read> {
+    inner: R,
+    state: Arc<StdMutex<UploadProgressState>>,
+    app: AppHandle,
+    id: String,
+}
+
+impl<R: Read> CountingReader<R> {
+    fn new(inner: R, state: Arc<StdMutex<UploadProgressState>>, app: AppHandle, id: String) -> Self {
+        Self { inner, state, app, id }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            let mut state = self.state.lock().unwrap();
+            state.sent = state.sent.saturating_add(n as u64);
+            let total = if state.total == 0 { 1 } else { state.total };
+            if state.last_emit.elapsed() >= Duration::from_millis(150) {
+                let pct = (state.sent as f64 / total as f64) * 100.0;
+                let _ = self.app.emit(
+                    "app_upload_progress",
+                    UploadProgress {
+                        id: self.id.clone(),
+                        sent: state.sent,
+                        total,
+                        pct,
+                    },
+                );
+                state.last_emit = Instant::now();
+            }
+        }
+        Ok(n)
+    }
+}
+
+fn add_dir_to_tar(
+    builder: &mut tar::Builder<flate2::write::GzEncoder<std::fs::File>>,
+    base: &Path,
+    path: &Path,
+    progress: &Arc<StdMutex<UploadProgressState>>,
+    app: &AppHandle,
+    id: &str,
+) -> Result<(), String> {
+    let entries = fs::read_dir(path).map_err(|_| "Failed to read folder.".to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|_| "Failed to read folder.".to_string())?;
+        let entry_path = entry.path();
+        let rel = entry_path
+            .strip_prefix(base)
+            .map_err(|_| "Failed to build archive path.".to_string())?;
+        if entry_path.is_dir() {
+            builder
+                .append_dir(rel, &entry_path)
+                .map_err(|_| "Failed to add folder to archive.".to_string())?;
+            add_dir_to_tar(builder, base, &entry_path, progress, app, id)?;
+        } else {
+            let metadata = fs::metadata(&entry_path)
+                .map_err(|_| "Failed to read file for archive.".to_string())?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(metadata.len());
+            header.set_mode(0o644);
+            header.set_mtime(
+                metadata
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            header.set_cksum();
+
+            let file = fs::File::open(&entry_path)
+                .map_err(|_| "Failed to read file for archive.".to_string())?;
+            let mut reader = CountingReader::new(file, progress.clone(), app.clone(), id.to_string());
+            builder
+                .append_data(&mut header, rel, &mut reader)
+                .map_err(|_| "Failed to add file to archive.".to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn dir_total_size(path: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    let entries = fs::read_dir(path).map_err(|_| "Failed to read folder.".to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|_| "Failed to read folder.".to_string())?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            total = total.saturating_add(dir_total_size(&entry_path)?);
+        } else {
+            total = total.saturating_add(
+                fs::metadata(&entry_path)
+                    .map_err(|_| "Failed to read file size.".to_string())?
+                    .len(),
+            );
+        }
+    }
+    Ok(total)
+}
+
+#[tauri::command]
+async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), String> {
+    if request.token.trim().is_empty() {
+        return Err("Missing auth token.".to_string());
+    }
+    if request.id.trim().is_empty() {
+        return Err("Missing app id.".to_string());
+    }
+    if request.config_toml.trim().is_empty() {
+        return Err("Missing config.".to_string());
+    }
+    if request.folder_path.trim().is_empty() {
+        return Err("Missing folder.".to_string());
+    }
+
+    let folder = PathBuf::from(&request.folder_path);
+    if !folder.exists() {
+        return Err("Folder not found.".to_string());
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!("gaggle_upload_{}", request.id));
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir).ok();
+    }
+    fs::create_dir_all(&temp_dir).map_err(|_| "Failed to prepare temp folder.".to_string())?;
+    let archive_path = temp_dir.join(format!("{}.tar.gz", request.id));
+
+    let _ = app.emit(
+        "app_upload_stage",
+        UploadStage {
+            id: request.id.clone(),
+            stage: "compressing".to_string(),
+        },
+    );
+    let total_size = dir_total_size(&folder)?;
+    let progress_state = Arc::new(StdMutex::new(UploadProgressState {
+        sent: 0,
+        total: total_size,
+        last_emit: Instant::now(),
+    }));
+    {
+        let tar_file = fs::File::create(&archive_path)
+            .map_err(|_| "Failed to create archive.".to_string())?;
+        let encoder = flate2::write::GzEncoder::new(tar_file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        add_dir_to_tar(&mut builder, &folder, &folder, &progress_state, &app, &request.id)?;
+        builder
+            .finish()
+            .map_err(|_| "Failed to finalize archive.".to_string())?;
+    }
+    let total = if total_size == 0 { 1 } else { total_size };
+    let _ = app.emit(
+        "app_upload_progress",
+        UploadProgress {
+            id: request.id.clone(),
+            sent: total,
+            total,
+            pct: 100.0,
+        },
+    );
+
+    let url = format!(
+        "http://{}:{}/admin/apps/upload",
+        request.server_ip.trim(),
+        request.server_port.trim()
+    );
+
+    let mut archive_len = fs::metadata(&archive_path)
+        .map_err(|_| "Failed to read archive size.".to_string())?
+        .len();
+    let file = tokio::fs::File::open(&archive_path)
+        .await
+        .map_err(|_| "Failed to open archive.".to_string())?;
+    let mut sent: u64 = 0;
+    let upload_id = request.id.clone();
+    let app_handle = app.clone();
+    let stream = ReaderStream::new(file).map_ok(move |chunk| {
+        sent = sent.saturating_add(chunk.len() as u64);
+        let total = if archive_len == 0 { 1 } else { archive_len };
+        let pct = (sent as f64 / total as f64) * 100.0;
+        let _ = app_handle.emit(
+            "app_upload_progress",
+            UploadProgress {
+                id: upload_id.clone(),
+                sent,
+                total,
+                pct,
+            },
+        );
+        chunk
+    });
+    let body = Body::wrap_stream(stream);
+    let archive_part = Part::stream_with_length(body, archive_len)
+        .file_name(format!("{}.tar.gz", request.id))
+        .mime_str("application/gzip")
+        .map_err(|_| "Failed to set archive type.".to_string())?;
+
+    let upload_id = request.id.clone();
+    let form = Form::new()
+        .text("id", upload_id.clone())
+        .text("config", request.config_toml)
+        .part("archive", archive_part);
+
+    let client = reqwest::Client::new();
+    let _ = app.emit(
+        "app_upload_stage",
+        UploadStage {
+            id: upload_id.clone(),
+            stage: "uploading".to_string(),
+        },
+    );
+    let resp = client
+        .post(url)
+        .bearer_auth(request.token)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|_| "Upload failed.".to_string())?;
+
+    fs::remove_dir_all(&temp_dir).ok();
+
+    if !resp.status().is_success() {
+        return Err(format!("Upload failed (HTTP {}).", resp.status()));
+    }
+
+    let _ = app.emit(
+        "app_upload_progress",
+        UploadProgress {
+            id: upload_id,
+            sent: archive_len,
+            total: archive_len,
+            pct: 100.0,
+        },
+    );
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -416,6 +705,64 @@ async fn list_installed_apps(request: ListAppsRequest) -> Result<Vec<String>, St
     Ok(results)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenAppFolderRequest {
+    id: String,
+    dest_dir: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunAppExecutableRequest {
+    id: String,
+    dest_dir: String,
+    executable: String,
+}
+
+fn resolve_executable(app_dir: &Path, executable: &str) -> Result<PathBuf, String> {
+    if executable.trim().is_empty() {
+        return Err("Missing executable path.".to_string());
+    }
+    let rel = Path::new(executable);
+    if rel.is_absolute() {
+        return Err("Executable must be a relative path.".to_string());
+    }
+    let mut clean = PathBuf::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(part) => clean.push(part),
+            _ => return Err("Executable path is not safe.".to_string()),
+        }
+    }
+    let full = app_dir.join("content").join(clean);
+    if !full.exists() {
+        return Err("Executable not found.".to_string());
+    }
+    Ok(full)
+}
+
+#[tauri::command]
+fn open_app_folder(request: OpenAppFolderRequest) -> Result<(), String> {
+    let app_dir = PathBuf::from(request.dest_dir).join(request.id);
+    if !app_dir.exists() {
+        return Err("App folder not found.".to_string());
+    }
+    open_path(app_dir, Option::<&str>::None)
+        .map_err(|_| "Failed to open app folder.".to_string())
+}
+
+#[tauri::command]
+fn run_app_executable(request: RunAppExecutableRequest) -> Result<(), String> {
+    let app_dir = PathBuf::from(request.dest_dir).join(&request.id);
+    if !app_dir.exists() {
+        return Err("App folder not found.".to_string());
+    }
+    let exec_path = resolve_executable(&app_dir, &request.executable)?;
+    open_path(exec_path, Option::<&str>::None)
+        .map_err(|_| "Failed to launch executable.".to_string())
+}
+
 async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String> {
     if task.token.trim().is_empty() {
         task.in_progress.store(false, Ordering::SeqCst);
@@ -696,13 +1043,17 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_default_apps_dir,
             pick_install_dir,
+            pick_upload_folder,
             start_app_download,
             pause_download,
             resume_download,
             cancel_download,
             list_downloads,
             remove_installed_app,
-            list_installed_apps
+            list_installed_apps,
+            open_app_folder,
+            run_app_executable,
+            upload_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

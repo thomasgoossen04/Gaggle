@@ -100,7 +100,7 @@ pub fn progress_bar(props: &ProgressBarProps) -> Html {
 pub fn indeterminate_bar() -> Html {
     html! {
         <div class="h-3 w-full overflow-hidden rounded-full border border-ink/50 bg-ink/40">
-            <div class="h-full w-2/3 animate-[stripe_1.2s_linear_infinite] bg-[length:40px_40px] bg-[linear-gradient(135deg,rgba(255,255,255,0.18)_25%,rgba(255,255,255,0)_25%,rgba(255,255,255,0)_50%,rgba(255,255,255,0.18)_50%,rgba(255,255,255,0.18)_75%,rgba(255,255,255,0)_75%,rgba(255,255,255,0))]" />
+            <div class="h-full w-full animate-[stripe_1.2s_linear_infinite] bg-[length:40px_40px] bg-[linear-gradient(135deg,rgba(255,255,255,0.18)_25%,rgba(255,255,255,0)_25%,rgba(255,255,255,0)_50%,rgba(255,255,255,0.18)_50%,rgba(255,255,255,0.18)_75%,rgba(255,255,255,0)_75%,rgba(255,255,255,0))]" />
         </div>
     }
 }

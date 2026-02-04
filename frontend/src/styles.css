@@ -9,6 +9,7 @@
     --color-secondary: #EAEFEF;
     --color-accent: #BFC9D1;
     --color-ink: #262626;
+    --radius-base: 18px;
 }
 
 @layer base {
@@ -75,6 +76,16 @@
         background: rgba(255, 127, 17, 0.7);
         border-radius: 999px;
         border: 2px solid rgba(38, 38, 38, 0.2);
+    }
+}
+
+@layer utilities {
+    .rounded,
+    .rounded-lg,
+    .rounded-xl,
+    .rounded-2xl,
+    .rounded-3xl {
+        border-radius: var(--radius-base);
     }
 }
 

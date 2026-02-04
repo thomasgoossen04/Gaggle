@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ type AppConfig struct {
 	Name        string `toml:"name" json:"name"`
 	Description string `toml:"description" json:"description"`
 	Version     string `toml:"version" json:"version"`
+	Executable  string `toml:"executable" json:"executable"`
 }
 
 type AppInfo struct {
@@ -25,6 +27,7 @@ type AppInfo struct {
 	Version     string `json:"version"`
 	ArchiveSize int64  `json:"archive_size"`
 	HasArchive  bool   `json:"has_archive"`
+	Executable  string `json:"executable,omitempty"`
 }
 
 func listAppsHandler(c *gin.Context) {
@@ -121,6 +124,7 @@ func listApps() ([]AppInfo, error) {
 			Version:     cfg.Version,
 			ArchiveSize: size,
 			HasArchive:  hasArchive,
+			Executable:  cfg.Executable,
 		})
 	}
 
@@ -138,4 +142,73 @@ func isSafeAppID(id string) bool {
 		return false
 	}
 	return true
+}
+
+func uploadAppHandler(c *gin.Context) error {
+	id := strings.TrimSpace(c.PostForm("id"))
+	if !isSafeAppID(id) {
+		return fmt.Errorf("invalid app id")
+	}
+	config := c.PostForm("config")
+	if strings.TrimSpace(config) == "" {
+		return fmt.Errorf("missing config")
+	}
+
+	archiveHeader, err := c.FormFile("archive")
+	if err != nil {
+		return fmt.Errorf("missing archive")
+	}
+
+	if err := os.MkdirAll(appsDir, 0755); err != nil {
+		return fmt.Errorf("failed to prepare apps dir")
+	}
+
+	configPath := filepath.Join(appsDir, id+".toml")
+	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+		return fmt.Errorf("failed to save config")
+	}
+
+	archivePath := filepath.Join(appsDir, id+".tar.gz")
+	if err := c.SaveUploadedFile(archiveHeader, archivePath); err != nil {
+		return fmt.Errorf("failed to save archive")
+	}
+
+	return nil
+}
+
+func readAppConfig(id string) (string, error) {
+	if !isSafeAppID(id) {
+		return "", fmt.Errorf("invalid app id")
+	}
+	path := filepath.Join(appsDir, id+".toml")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("config not found")
+	}
+	return string(content), nil
+}
+
+func writeAppConfig(id string, content string) error {
+	if !isSafeAppID(id) {
+		return fmt.Errorf("invalid app id")
+	}
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("config content empty")
+	}
+	path := filepath.Join(appsDir, id+".toml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to save config")
+	}
+	return nil
+}
+
+func deleteApp(id string) error {
+	if !isSafeAppID(id) {
+		return fmt.Errorf("invalid app id")
+	}
+	tomlPath := filepath.Join(appsDir, id+".toml")
+	archivePath := filepath.Join(appsDir, id+".tar.gz")
+	_ = os.Remove(tomlPath)
+	_ = os.Remove(archivePath)
+	return nil
 }

@@ -166,6 +166,42 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 			}
 			c.JSON(http.StatusOK, gin.H{"status": "reloaded"})
 		})
+		admin.POST("/apps/upload", func(c *gin.Context) {
+			if err := uploadAppHandler(c); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "uploaded"})
+		})
+		admin.GET("/apps/:id/config", func(c *gin.Context) {
+			content, err := readAppConfig(c.Param("id"))
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"content": content})
+		})
+		admin.PUT("/apps/:id/config", func(c *gin.Context) {
+			var body struct {
+				Content string `json:"content"`
+			}
+			if err := c.ShouldBindJSON(&body); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid config payload"})
+				return
+			}
+			if err := writeAppConfig(c.Param("id"), body.Content); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "saved"})
+		})
+		admin.DELETE("/apps/:id", func(c *gin.Context) {
+			if err := deleteApp(c.Param("id")); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+		})
 	}
 
 }

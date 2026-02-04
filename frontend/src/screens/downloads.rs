@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 
 use js_sys::{Function, Reflect};
 use serde::Deserialize;
@@ -9,8 +9,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
-use crate::components::{Button, IndeterminateBar, ProgressBar};
 use crate::auth::{get_local_storage_item, INSTALL_DIR_KEY, SESSION_TOKEN_KEY};
+use crate::components::{Button, IndeterminateBar, ProgressBar};
 use crate::toast::{use_toast, ToastVariant};
 
 #[wasm_bindgen]
@@ -58,7 +58,8 @@ pub fn downloads_screen() -> Html {
         Callback::from(move |id: String| {
             let downloads = downloads.clone();
             spawn_local(async move {
-                let payload = serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
+                let payload =
+                    serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
                 let _ = invoke("pause_download", payload).await;
                 let mut next = (*downloads).clone();
                 if let Some(entry) = next.get_mut(&id) {
@@ -107,7 +108,8 @@ pub fn downloads_screen() -> Html {
         Callback::from(move |id: String| {
             let downloads = downloads.clone();
             spawn_local(async move {
-                let payload = serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
+                let payload =
+                    serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
                 let _ = invoke("cancel_download", payload).await;
                 let mut next = (*downloads).clone();
                 next.remove(&id);
@@ -127,18 +129,25 @@ pub fn downloads_screen() -> Html {
             spawn_local(async move {
                 let mut dir = (*install_dir).clone();
                 if dir.is_empty() {
-                    if let Some(path) = invoke("get_default_apps_dir", JsValue::NULL).await.as_string() {
+                    if let Some(path) = invoke("get_default_apps_dir", JsValue::NULL)
+                        .await
+                        .as_string()
+                    {
                         dir = path;
                         install_dir.set(dir.clone());
                     } else {
-                        toast.toast("Failed to load install folder.", ToastVariant::Error, Some(3000));
+                        toast.toast(
+                            "Failed to load install folder.",
+                            ToastVariant::Error,
+                            Some(3000),
+                        );
                         return;
                     }
                 }
                 let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
                     "request": { "destDir": dir }
                 }))
-                    .unwrap_or(JsValue::NULL);
+                .unwrap_or(JsValue::NULL);
                 let initial = invoke("list_downloads", payload).await;
                 if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<DownloadSnapshot>>(initial) {
                     let mut next = (*downloads).clone();
@@ -177,45 +186,52 @@ pub fn downloads_screen() -> Html {
                 let listen = listen.unwrap();
                 let listen_fn: Function = listen.dyn_into().unwrap();
 
-                let callback = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
-                    let payload = Reflect::get(&value, &JsValue::from_str("payload")).unwrap_or(JsValue::NULL);
-                    let event: Result<DownloadEvent, _> = serde_wasm_bindgen::from_value(payload);
-                    if let Ok(event) = event {
-                        let mut next = (*downloads).clone();
-                        if event.status == "cancelled" || event.status == "completed" {
-                            next.remove(&event.id);
-                            downloads.set(next);
-                            return;
-                        }
-                        let mut view = next.get(&event.id).cloned().unwrap_or_default();
-                        let now = js_sys::Date::now();
-                        let mut speed = event.speed_bps;
-                        if speed <= 0.0 {
-                            if let Some((last_time, last_bytes)) = view.last_tick {
-                                let delta_t = (now - last_time) / 1000.0;
-                                if delta_t > 0.0 {
-                                    let delta_b = event.downloaded.saturating_sub(last_bytes) as f64;
-                                    speed = delta_b / delta_t;
+                let callback =
+                    Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
+                        let payload = Reflect::get(&value, &JsValue::from_str("payload"))
+                            .unwrap_or(JsValue::NULL);
+                        let event: Result<DownloadEvent, _> =
+                            serde_wasm_bindgen::from_value(payload);
+                        if let Ok(event) = event {
+                            let mut next = (*downloads).clone();
+                            if event.status == "cancelled" || event.status == "completed" {
+                                next.remove(&event.id);
+                                downloads.set(next);
+                                return;
+                            }
+                            let mut view = next.get(&event.id).cloned().unwrap_or_default();
+                            let now = js_sys::Date::now();
+                            let mut speed = event.speed_bps;
+                            if speed <= 0.0 {
+                                if let Some((last_time, last_bytes)) = view.last_tick {
+                                    let delta_t = (now - last_time) / 1000.0;
+                                    if delta_t > 0.0 {
+                                        let delta_b =
+                                            event.downloaded.saturating_sub(last_bytes) as f64;
+                                        speed = delta_b / delta_t;
+                                    }
                                 }
                             }
-                        }
-                        if speed > 0.0 {
-                            view.speeds.push(speed);
-                            if view.speeds.len() > 60 {
-                                view.speeds.remove(0);
+                            if speed > 0.0 {
+                                view.speeds.push(speed);
+                                if view.speeds.len() > 60 {
+                                    view.speeds.remove(0);
+                                }
                             }
+                            view.last_tick = Some((now, event.downloaded));
+                            view.status = event.status;
+                            view.downloaded = event.downloaded;
+                            view.total = event.total;
+                            next.insert(event.id.clone(), view);
+                            downloads.set(next);
                         }
-                        view.last_tick = Some((now, event.downloaded));
-                        view.status = event.status;
-                        view.downloaded = event.downloaded;
-                        view.total = event.total;
-                        next.insert(event.id.clone(), view);
-                        downloads.set(next);
-                    }
-                }));
+                    }));
 
-                let _ = listen_fn
-                    .call2(&event, &JsValue::from_str("app_download_progress"), callback.as_ref().unchecked_ref());
+                let _ = listen_fn.call2(
+                    &event,
+                    &JsValue::from_str("app_download_progress"),
+                    callback.as_ref().unchecked_ref(),
+                );
                 callback.forget();
             });
             || ()
@@ -304,7 +320,7 @@ pub fn downloads_screen() -> Html {
                                             <p class="text-xs uppercase tracking-wide text-accent/80">{ "Download" }</p>
                                             <p class="mt-2 text-xl font-semibold">{ id.clone() }</p>
                                             <p class="mt-1 text-sm text-secondary/70">
-                                                { format!("{} · {}", format_size(view.downloaded as i64), format_size(total as i64)) }
+                                                { format!("{} - {}", format_size(view.downloaded as i64), format_size(total as i64)) }
                                             </p>
                                         </div>
                                         <div class="text-right">
@@ -333,7 +349,7 @@ pub fn downloads_screen() -> Html {
                                             <p class="mt-1 text-sm text-secondary/90">
                                                 { if current_speed > 0.0 {
                                                     format!("{}/s", format_size(current_speed as i64))
-                                                } else { "—".to_string() } }
+                                                } else { "-".to_string() } }
                                             </p>
                                         </div>
                                         <div class="rounded-xl border border-ink/50 bg-ink/40 px-4 py-3">
@@ -341,13 +357,13 @@ pub fn downloads_screen() -> Html {
                                             <p class="mt-1 text-sm text-secondary/90">
                                                 { if avg_speed > 0.0 {
                                                     format!("{}/s", format_size(avg_speed as i64))
-                                                } else { "—".to_string() } }
+                                                } else { "-".to_string() } }
                                             </p>
                                         </div>
                                         <div class="rounded-xl border border-ink/50 bg-ink/40 px-4 py-3">
                                             <p class="text-xs uppercase tracking-wide text-accent/70">{ "ETA" }</p>
                                             <p class="mt-1 text-sm text-secondary/90">
-                                                { eta.map(format_duration).unwrap_or_else(|| "—".to_string()) }
+                                                { eta.map(format_duration).unwrap_or_else(|| "-".to_string()) }
                                             </p>
                                         </div>
                                     </div>
@@ -366,7 +382,7 @@ pub fn downloads_screen() -> Html {
 
 fn format_size(size: i64) -> String {
     if size <= 0 {
-        return "—".to_string();
+        return "â€”".to_string();
     }
     let size = size as f64;
     let units = ["B", "KB", "MB", "GB"];
@@ -384,7 +400,7 @@ fn format_size(size: i64) -> String {
 
 fn format_duration(seconds: f64) -> String {
     if !seconds.is_finite() || seconds <= 0.0 {
-        return "—".to_string();
+        return "â€”".to_string();
     }
     let total = seconds.round() as i64;
     let hrs = total / 3600;

@@ -50,6 +50,8 @@ pub struct Theme {
     pub ink: String,
     pub ink_light: String,
     pub font: String,
+    #[serde(default)]
+    pub radius: Option<String>,
 }
 
 type AppStateHandle = UseStateHandle<AppState>;
@@ -153,13 +155,18 @@ pub fn apply_theme(theme: &Theme) {
                 --color-accent:{};\
                 --color-ink:{};\
                 --color-inkLight:{};\
-                --font-sans:{};",
+                --font-sans:{};\
+                --radius-base:{};",
                 theme.primary,
                 theme.secondary,
                 theme.accent,
                 theme.ink,
                 theme.ink_light,
-                font_stack
+                font_stack,
+                theme
+                    .radius
+                    .clone()
+                    .unwrap_or_else(|| "18px".to_string())
             );
             if let Some(root) = doc.document_element() {
                 let _ = root.set_attribute("style", &style);

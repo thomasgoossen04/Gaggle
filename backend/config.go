@@ -43,6 +43,7 @@ type ThemeConfig struct {
 	Ink       string `toml:"ink" json:"ink"`
 	InkLight  string `toml:"ink_light" json:"ink_light"`
 	Font      string `toml:"font" json:"font"`
+	Radius    string `toml:"radius" json:"radius"`
 }
 
 const configPath = "./config.toml"
