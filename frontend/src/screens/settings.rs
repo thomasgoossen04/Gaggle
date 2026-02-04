@@ -16,15 +16,17 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
     let app_state = use_context::<UseStateHandle<crate::app::AppState>>()
         .expect("AppState context not found. Ensure SettingsScreen is under <ContextProvider>.");
     let server_ip = app_state.server_ip.clone();
+    let server_port = app_state.server_port.clone();
     let toast = use_toast();
     let on_reload_theme = {
         let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
         let toast = toast.clone();
         Callback::from(move |_| {
             let toast = toast.clone();
-            if let Some(server_ip) = server_ip.clone() {
+            if let (Some(server_ip), Some(server_port)) = (server_ip.clone(), server_port.clone()) {
                 spawn_local(async move {
-                    match fetch_theme(&server_ip).await {
+                    match fetch_theme(&server_ip, &server_port).await {
                         Ok(theme) => {
                             apply_theme(&theme);
                             toast.toast("Theme reloaded.", ToastVariant::Success, Some(2000));
@@ -35,7 +37,11 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
                     }
                 });
             } else {
-                toast.toast("No server IP found.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "No server address found.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
             }
         })
     };

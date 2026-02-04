@@ -2,6 +2,7 @@ use yew::prelude::*;
 
 use crate::app::AppState;
 use crate::auth::handle_logout;
+use crate::net::build_http_url;
 use crate::components::Button;
 use wasm_bindgen_futures::spawn_local;
 use crate::api::get_json;
@@ -16,8 +17,8 @@ struct FeaturesResponse {
     chat_enabled: bool,
 }
 
-async fn fetch_features(server_ip: &str) -> Result<FeaturesResponse, String> {
-    let url = format!("http://{server_ip}:2121/features");
+async fn fetch_features(server_ip: &str, server_port: &str) -> Result<FeaturesResponse, String> {
+    let url = build_http_url(server_ip, server_port, "features");
     get_json(&url, None).await
 }
 
@@ -44,15 +45,19 @@ pub fn dashboard() -> Html {
 
     {
         let server_ip = app_state.server_ip.clone().unwrap_or_default();
+        let server_port = app_state
+            .server_port
+            .clone()
+            .unwrap_or_else(|| "2121".to_string());
         let chat_enabled = chat_enabled.clone();
-        use_effect_with(server_ip.clone(), move |_| {
-            if server_ip.is_empty() {
+        use_effect_with((server_ip.clone(), server_port.clone()), move |_| {
+            if server_ip.is_empty() || server_port.is_empty() {
                 chat_enabled.set(true);
                 return ();
             }
             let chat_enabled = chat_enabled.clone();
             spawn_local(async move {
-                if let Ok(features) = fetch_features(&server_ip).await {
+                if let Ok(features) = fetch_features(&server_ip, &server_port).await {
                     chat_enabled.set(features.chat_enabled);
                 }
             });

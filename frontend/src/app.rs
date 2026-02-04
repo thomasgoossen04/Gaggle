@@ -1,19 +1,20 @@
+use futures_util::stream::StreamExt;
+use gloo_timers::future::IntervalStream;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
-use gloo_timers::future::IntervalStream;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{console, HtmlInputElement};
 use yew::prelude::*;
-use futures_util::stream::StreamExt;
 
 use crate::api::send_request;
 use crate::auth::{
     check_session, clear_query_param, fetch_me, get_local_storage_item, get_query_param,
     handle_login, handle_logout, remove_local_storage_item, set_local_storage_item,
-    LOGIN_SUCCESS_KEY, SERVER_IP_KEY, SESSION_TOKEN_KEY,
+    LOGIN_SUCCESS_KEY, SERVER_IP_KEY, SERVER_PORT_KEY, SESSION_TOKEN_KEY,
 };
 use crate::components::{Button, Card};
 use crate::confirm::ConfirmProvider;
+use crate::net::build_http_url;
 use crate::screens::dashboard::Dashboard;
 use crate::screens::error::ErrorScreen;
 use crate::toast::{use_toast, ToastProvider, ToastVariant};
@@ -28,6 +29,7 @@ extern "C" {
 pub struct AppState {
     pub logged_in: bool,
     pub server_ip: Option<String>,
+    pub server_port: Option<String>,
     pub session_token: Option<String>,
     pub auth_error: Option<String>,
     pub user: Option<User>,
@@ -57,6 +59,7 @@ pub fn app() -> Html {
     let app_state = use_state(|| AppState {
         logged_in: false,
         server_ip: None,
+        server_port: None,
         session_token: None,
         auth_error: None,
         user: None,
@@ -64,50 +67,49 @@ pub fn app() -> Html {
 
     {
         let app_state = app_state.clone();
-        use_effect_with(
-            (),
-            move |_| {
-                let server_ip = get_local_storage_item(SERVER_IP_KEY);
-                let token_from_query = get_query_param("token");
-                if let Some(token) = token_from_query.as_deref() {
-                    set_local_storage_item(SESSION_TOKEN_KEY, token);
-                    set_local_storage_item(LOGIN_SUCCESS_KEY, "1");
-                }
-                let token =
-                    token_from_query.clone().or_else(|| get_local_storage_item(SESSION_TOKEN_KEY));
+        use_effect_with((), move |_| {
+            let server_ip = get_local_storage_item(SERVER_IP_KEY);
+            let server_port =
+                get_local_storage_item(SERVER_PORT_KEY).or_else(|| Some("2121".to_string()));
+            let token_from_query = get_query_param("token");
+            if let Some(token) = token_from_query.as_deref() {
+                set_local_storage_item(SESSION_TOKEN_KEY, token);
+                set_local_storage_item(LOGIN_SUCCESS_KEY, "1");
+            }
+            let token = token_from_query
+                .clone()
+                .or_else(|| get_local_storage_item(SESSION_TOKEN_KEY));
 
-                if token.is_some() || server_ip.is_some() {
-                    app_state.set(AppState {
-                        logged_in: token.is_some(),
-                        server_ip,
-                        session_token: token,
-                        auth_error: None,
-                        user: None,
-                    });
-                    if token_from_query.is_some() {
-                        clear_query_param("token");
-                    }
+            if token.is_some() || server_ip.is_some() {
+                app_state.set(AppState {
+                    logged_in: token.is_some(),
+                    server_ip,
+                    server_port,
+                    session_token: token,
+                    auth_error: None,
+                    user: None,
+                });
+                if token_from_query.is_some() {
+                    clear_query_param("token");
                 }
-                || ()
-            },
-        );
+            }
+            || ()
+        });
     }
 
     {
         let server_ip = app_state.server_ip.clone();
-        use_effect_with(
-            server_ip,
-            move |server_ip| {
-                if let Some(server_ip) = server_ip.clone() {
-                    spawn_local(async move {
-                        if let Ok(theme) = fetch_theme(&server_ip).await {
-                            apply_theme(&theme);
-                        }
-                    });
-                }
-                ()
-            },
-        );
+        let server_port = app_state.server_port.clone();
+        use_effect_with((server_ip, server_port), move |(server_ip, server_port)| {
+            if let (Some(server_ip), Some(server_port)) = (server_ip.clone(), server_port.clone()) {
+                spawn_local(async move {
+                    if let Ok(theme) = fetch_theme(&server_ip, &server_port).await {
+                        apply_theme(&theme);
+                    }
+                });
+            }
+            ()
+        });
     }
 
     html! {
@@ -121,8 +123,8 @@ pub fn app() -> Html {
     }
 }
 
-pub async fn fetch_theme(server_ip: &str) -> Result<Theme, String> {
-    let url = format!("http://{server_ip}:2121/theme");
+pub async fn fetch_theme(server_ip: &str, server_port: &str) -> Result<Theme, String> {
+    let url = build_http_url(server_ip, server_port, "theme");
     let resp = send_request("GET", &url, None, None).await?;
     if resp.status() == 204 {
         return Err("No theme configured.".to_string());
@@ -144,10 +146,7 @@ pub async fn fetch_theme(server_ip: &str) -> Result<Theme, String> {
 pub fn apply_theme(theme: &Theme) {
     if let Some(win) = web_sys::window() {
         if let Some(doc) = win.document() {
-            let font_stack = format!(
-                "\"{}\", ui-sans-serif, system-ui, sans-serif",
-                theme.font
-            );
+            let font_stack = format!("\"{}\", ui-sans-serif, system-ui, sans-serif", theme.font);
             let style = format!(
                 "--color-primary:{};\
                 --color-secondary:{};\
@@ -180,16 +179,13 @@ fn app_router() -> Html {
 
     {
         let toast = toast.clone();
-        use_effect_with(
-            (),
-            move |_| {
-                if get_local_storage_item(LOGIN_SUCCESS_KEY).is_some() {
-                    remove_local_storage_item(LOGIN_SUCCESS_KEY);
-                    toast.toast("Logged in successfully.", ToastVariant::Success, Some(2500));
-                }
-                || ()
-            },
-        );
+        use_effect_with((), move |_| {
+            if get_local_storage_item(LOGIN_SUCCESS_KEY).is_some() {
+                remove_local_storage_item(LOGIN_SUCCESS_KEY);
+                toast.toast("Logged in successfully.", ToastVariant::Success, Some(2500));
+            }
+            || ()
+        });
     }
 
     {
@@ -199,6 +195,7 @@ fn app_router() -> Html {
             (
                 app_state.logged_in,
                 app_state.server_ip.clone(),
+                app_state.server_port.clone(),
                 app_state.session_token.clone(),
                 app_state.auth_error.clone(),
             ),
@@ -206,6 +203,7 @@ fn app_router() -> Html {
                 *cancelled.borrow_mut() = false;
                 if !app_state.logged_in
                     || app_state.server_ip.is_none()
+                    || app_state.server_port.is_none()
                     || app_state.session_token.is_none()
                     || app_state.auth_error.is_some()
                 {
@@ -216,6 +214,7 @@ fn app_router() -> Html {
                 }
 
                 let server_ip = app_state.server_ip.clone().unwrap();
+                let server_port = app_state.server_port.clone().unwrap();
                 let token = app_state.session_token.clone().unwrap();
                 let app_state_interval = app_state.clone();
                 let cancelled_task = cancelled.clone();
@@ -226,7 +225,7 @@ fn app_router() -> Html {
                         return;
                     }
                     if app_state_interval.user.is_none() {
-                        match fetch_me(&server_ip, &token).await {
+                        match fetch_me(&server_ip, &server_port, &token).await {
                             Ok(user) => {
                                 let mut next = (*app_state_interval).clone();
                                 next.user = Some(user);
@@ -241,7 +240,7 @@ fn app_router() -> Html {
                         }
                     }
 
-                    if let Err(message) = check_session(&server_ip, &token).await {
+                    if let Err(message) = check_session(&server_ip, &server_port, &token).await {
                         let mut next = (*app_state_interval).clone();
                         next.auth_error = Some(message);
                         app_state_interval.set(next);
@@ -253,7 +252,8 @@ fn app_router() -> Html {
                         if *cancelled_task.borrow() {
                             break;
                         }
-                        if let Err(message) = check_session(&server_ip, &token).await {
+                        if let Err(message) = check_session(&server_ip, &server_port, &token).await
+                        {
                             let mut next = (*app_state_interval).clone();
                             next.auth_error = Some(message);
                             app_state_interval.set(next);
@@ -279,15 +279,20 @@ fn app_router() -> Html {
             Callback::from(move |_| {
                 let app_state = app_state.clone();
                 let server_ip = app_state.server_ip.clone();
+                let server_port = app_state.server_port.clone();
                 let token = app_state.session_token.clone();
-                if let (Some(server_ip), Some(token)) = (server_ip, token) {
+                if let (Some(server_ip), Some(server_port), Some(token)) =
+                    (server_ip, server_port, token)
+                {
                     spawn_local(async move {
-                        if let Ok(user) = fetch_me(&server_ip, &token).await {
+                        if let Ok(user) = fetch_me(&server_ip, &server_port, &token).await {
                             let mut next = (*app_state).clone();
                             next.user = Some(user);
                             next.auth_error = None;
                             app_state.set(next);
-                        } else if let Err(message) = check_session(&server_ip, &token).await {
+                        } else if let Err(message) =
+                            check_session(&server_ip, &server_port, &token).await
+                        {
                             let mut next = (*app_state).clone();
                             next.auth_error = Some(message);
                             app_state.set(next);
@@ -309,6 +314,8 @@ fn app_router() -> Html {
 #[function_component(LoginScreen)]
 fn login_screen() -> Html {
     let server_ip = use_state(|| get_local_storage_item(SERVER_IP_KEY).unwrap_or_default());
+    let server_port =
+        use_state(|| get_local_storage_item(SERVER_PORT_KEY).unwrap_or_else(|| "2121".to_string()));
     let toast = use_toast();
     let on_ip_input = {
         let server_ip = server_ip.clone();
@@ -318,12 +325,22 @@ fn login_screen() -> Html {
             console::log_1(&"login: ip input changed".into());
         })
     };
+    let on_port_input = {
+        let server_port = server_port.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            server_port.set(input.value());
+            console::log_1(&"login: port input changed".into());
+        })
+    };
     let on_login_click = {
         let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
         let toast = toast.clone();
         Callback::from(move |_| {
-            let ip = server_ip.as_str();
-            if ip.trim().is_empty() {
+            let ip = server_ip.as_str().trim().to_string();
+            let port = server_port.as_str().trim().to_string();
+            if ip.is_empty() {
                 toast.toast(
                     "Please enter your server IP before logging in.",
                     ToastVariant::Warning,
@@ -331,29 +348,68 @@ fn login_screen() -> Html {
                 );
                 return;
             }
-            handle_login(ip);
+            if port.is_empty() {
+                toast.toast(
+                    "Please enter your server port before logging in.",
+                    ToastVariant::Warning,
+                    Some(3000),
+                );
+                return;
+            }
+
+            let toast = toast.clone();
+            spawn_local(async move {
+                let ping_url = build_http_url(&ip, &port, "ping");
+                match send_request("GET", &ping_url, None, None).await {
+                    Ok(resp) if resp.ok() => handle_login(&ip, &port),
+                    Ok(resp) => {
+                        toast.toast(
+                            &format!("Backend error (HTTP {}).", resp.status()),
+                            ToastVariant::Error,
+                            Some(3000),
+                        );
+                    }
+                    Err(_) => {
+                        toast.toast(
+                            "Backend could not be reached.",
+                            ToastVariant::Error,
+                            Some(3000),
+                        );
+                    }
+                }
+            });
         })
     };
 
     html! {
         <main class="min-h-screen text-secondary flex items-center justify-center">
             <Card highlight={true}>
-                <h1 class="text-3xl font-bold">
-                    { "Tailwind v4 + Yew + Tauri" }
+                <h1 class="text-4xl font-bold">
+                    { "Gaggle launcher" }
                 </h1>
                 <p class="mt-2 text-sm text-accent">
                     { "Enter your server IP to continue." }
                 </p>
-                <label class="mt-6 block text-xs uppercase tracking-wide text-accent/80">
-                    { "Server IP" }
-                </label>
-                <input
-                    class="mt-2 w-full rounded border border-ink/50 bg-ink/50 px-3 py-2 text-secondary placeholder:text-secondary/60 focus:outline-none focus:ring-2 focus:ring-primary/40"
-                    type="text"
-                    placeholder="192.168.1.10"
-                    value={(*server_ip).clone()}
-                    oninput={on_ip_input}
-                />
+                <div class="mt-6 flex items-center justify-between text-xs uppercase tracking-wide text-accent/80">
+                    <span>{ "Server IP" }</span>
+                    <span class="w-28 text-left">{ "Port" }</span>
+                </div>
+                <div class="mt-2 flex gap-3">
+                    <input
+                        class="w-full rounded border border-ink/50 bg-ink/50 px-3 py-2 text-secondary placeholder:text-secondary/60 outline outline-1 outline-accent/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                        type="text"
+                        placeholder="192.168.1.10"
+                        value={(*server_ip).clone()}
+                        oninput={on_ip_input}
+                    />
+                    <input
+                        class="w-28 rounded border border-ink/50 bg-ink/50 px-3 py-2 text-secondary placeholder:text-secondary/60 outline outline-1 outline-accent/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                        type="text"
+                        placeholder="2121"
+                        value={(*server_port).clone()}
+                        oninput={on_port_input}
+                    />
+                </div>
                 <Button
                     class={Some("mt-6 relative z-10".to_string())}
                     onclick={on_login_click}

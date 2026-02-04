@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -10,29 +11,29 @@ import (
 )
 
 type Config struct {
-	Port    int           `toml:"port"`
-	Mode    string        `toml:"mode"`
-	Discord DiscordConfig `toml:"discord"`
-	Features Features     `toml:"features"`
-	Admins  []string      `toml:"admins"`
-	Session SessionConfig `toml:"session"`
-	Theme   *ThemeConfig  `toml:"theme"`
+	Port    int           `toml:"port" json:"port"`
+	Mode    string        `toml:"mode" json:"mode"`
+	Discord DiscordConfig `toml:"discord" json:"discord"`
+	Features Features     `toml:"features" json:"features"`
+	Admins  []string      `toml:"admins" json:"admins"`
+	Session SessionConfig `toml:"session" json:"session"`
+	Theme   *ThemeConfig  `toml:"theme" json:"theme"`
 	mu      sync.RWMutex
 }
 
 type DiscordConfig struct {
-	ClientID     string   `toml:"client_id"`
-	ClientSecret string   `toml:"client_secret"`
-	RedirectURI  string   `toml:"redirect_uri"`
-	Scopes       []string `toml:"scopes"`
+	ClientID     string   `toml:"client_id" json:"client_id"`
+	ClientSecret string   `toml:"client_secret" json:"client_secret"`
+	RedirectURI  string   `toml:"redirect_uri" json:"redirect_uri"`
+	Scopes       []string `toml:"scopes" json:"scopes"`
 }
 
 type Features struct {
-	ChatEnabled bool `toml:"chat_enabled"`
+	ChatEnabled bool `toml:"chat_enabled" json:"chat_enabled"`
 }
 
 type SessionConfig struct {
-	TTLHours int `toml:"ttl_hours"`
+	TTLHours int `toml:"ttl_hours" json:"ttl_hours"`
 }
 
 type ThemeConfig struct {
@@ -44,8 +45,9 @@ type ThemeConfig struct {
 	Font      string `toml:"font" json:"font"`
 }
 
+const configPath = "./config.toml"
+
 func LoadConfig() (*Config, error) {
-	configPath := "./config.toml"
 	var cfg Config
 	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
 		return nil, fmt.Errorf("Failed to read config file %w", err)
@@ -78,6 +80,58 @@ func (c *Config) Reload() error {
 	c.Admins = next.Admins
 	c.Session = next.Session
 	c.Theme = next.Theme
+	return nil
+}
+
+func (c *Config) Snapshot() Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	discord := c.Discord
+	discord.Scopes = append([]string{}, c.Discord.Scopes...)
+	admins := append([]string{}, c.Admins...)
+	var themeCopy *ThemeConfig
+	if c.Theme != nil {
+		tmp := *c.Theme
+		themeCopy = &tmp
+	}
+
+	return Config{
+		Port:     c.Port,
+		Mode:     c.Mode,
+		Discord:  discord,
+		Features: c.Features,
+		Admins:   admins,
+		Session:  c.Session,
+		Theme:    themeCopy,
+	}
+}
+
+func SaveConfig(cfg *Config) error {
+	tmpPath := configPath + ".tmp"
+	file, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("Failed to write config file %w", err)
+	}
+	encoder := toml.NewEncoder(file)
+	if err := encoder.Encode(cfg); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("Failed to encode config file %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("Failed to sync config file %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("Failed to close config file %w", err)
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("Failed to replace config file %w", err)
+	}
 	return nil
 }
 

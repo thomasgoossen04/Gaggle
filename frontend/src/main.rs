@@ -3,6 +3,7 @@ mod api;
 mod auth;
 mod components;
 mod confirm;
+mod net;
 mod screens;
 mod toast;
 

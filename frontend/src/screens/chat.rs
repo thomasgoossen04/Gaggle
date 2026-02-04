@@ -8,6 +8,7 @@ use crate::api::{get_json, send_json};
 use crate::app::AppState;
 use crate::components::Button;
 use crate::confirm::{use_confirm, ConfirmRequest};
+use crate::net::{build_http_url, build_ws_url};
 use crate::toast::{use_toast, ToastVariant};
 
 #[derive(Properties, PartialEq)]
@@ -21,6 +22,10 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
     let app_state = use_context::<UseStateHandle<AppState>>()
         .expect("AppState context not found. Ensure ChatScreen is under <ContextProvider>.");
     let server_ip = app_state.server_ip.clone().unwrap_or_default();
+    let server_port = app_state
+        .server_port
+        .clone()
+        .unwrap_or_else(|| "2121".to_string());
     let token = app_state.session_token.clone().unwrap_or_default();
     let is_admin = app_state.user.as_ref().map(|u| u.is_admin).unwrap_or(false);
 
@@ -48,15 +53,16 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
         let error = error.clone();
         let loading = loading.clone();
         let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
         let token = token.clone();
-        use_effect_with((server_ip.clone(), token.clone()), move |_| {
-            if server_ip.is_empty() || token.is_empty() {
+        use_effect_with((server_ip.clone(), server_port.clone(), token.clone()), move |_| {
+            if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
                 loading.set(false);
                 return ();
             }
 
             spawn_local(async move {
-                let chat_enabled = match fetch_features(&server_ip).await {
+                let chat_enabled = match fetch_features(&server_ip, &server_port).await {
                     Ok(chat_enabled) => {
                         enabled.set(chat_enabled);
                         chat_enabled
@@ -69,7 +75,7 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
                 };
 
                 if chat_enabled {
-                    match fetch_messages(&server_ip, &token).await {
+                    match fetch_messages(&server_ip, &server_port, &token).await {
                         Ok(msgs) => {
                             let mut next = (*messages).clone();
                             for msg in msgs {
@@ -96,16 +102,25 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
         let enabled = enabled.clone();
         let loading = loading.clone();
         let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
         let token = token.clone();
         let active_ref = active_ref.clone();
         let on_unread = props.on_unread.clone();
 
-        use_effect_with((server_ip.clone(), token.clone(), *enabled, *loading), move |_| {
-            if server_ip.is_empty() || token.is_empty() || *loading || !*enabled {
+        use_effect_with(
+            (server_ip.clone(), server_port.clone(), token.clone(), *enabled, *loading),
+            move |_| {
+                if server_ip.is_empty()
+                    || server_port.is_empty()
+                    || token.is_empty()
+                    || *loading
+                    || !*enabled
+                {
                 return Box::new(|| ()) as Box<dyn FnOnce()>;
             }
 
-            let ws_url = format!("ws://{server_ip}:2121/chat/ws?token={token}");
+            let ws_url =
+                build_ws_url(&server_ip, &server_port, &format!("chat/ws?token={token}"));
             let ws = match WebSocket::new(&ws_url) {
                 Ok(ws) => ws,
                 Err(_) => {
@@ -187,7 +202,8 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
             Box::new(move || {
                 let _ = ws_ref.close();
             }) as Box<dyn FnOnce()>
-        });
+            },
+        );
     }
 
     let on_input = {
@@ -202,6 +218,7 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
         let input = input.clone();
         let error = error.clone();
         let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
         let token = token.clone();
         Callback::from(move |_| {
             let text = input.trim().to_string();
@@ -211,9 +228,10 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
             input.set(String::new());
             let error = error.clone();
             let server_ip = server_ip.clone();
+            let server_port = server_port.clone();
             let token = token.clone();
             spawn_local(async move {
-                match post_message(&server_ip, &token, &text).await {
+                match post_message(&server_ip, &server_port, &token, &text).await {
                     Ok(_) => {}
                     Err(msg) => error.set(Some(msg)),
                 }
@@ -226,6 +244,7 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
         let messages = messages.clone();
         let error = error.clone();
         let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
         let token = token.clone();
         let confirm = confirm.clone();
         let toast = toast.clone();
@@ -233,6 +252,7 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
             let messages = messages.clone();
             let error = error.clone();
             let server_ip = server_ip.clone();
+            let server_port = server_port.clone();
             let token = token.clone();
             let toast = toast.clone();
             confirm.confirm(ConfirmRequest {
@@ -244,11 +264,12 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
                     let messages = messages.clone();
                     let error = error.clone();
                     let server_ip = server_ip.clone();
+                    let server_port = server_port.clone();
                     let token = token.clone();
                     let id = id.clone();
                     let toast = toast.clone();
                     spawn_local(async move {
-                        match delete_message(&server_ip, &token, &id).await {
+                        match delete_message(&server_ip, &server_port, &token, &id).await {
                             Ok(_) => {
                                 let mut next = (*messages).clone();
                                 next.retain(|msg| msg.id != id);
@@ -491,20 +512,29 @@ fn format_time(ts: i64) -> String {
     format!("{:02}:{:02}", hours, mins)
 }
 
-async fn fetch_features(server_ip: &str) -> Result<bool, String> {
-    let url = format!("http://{server_ip}:2121/features");
+async fn fetch_features(server_ip: &str, server_port: &str) -> Result<bool, String> {
+    let url = build_http_url(server_ip, server_port, "features");
     let data: FeaturesResponse = get_json(&url, None).await?;
     Ok(data.chat_enabled)
 }
 
-async fn fetch_messages(server_ip: &str, token: &str) -> Result<Vec<ChatMessage>, String> {
-    let url = format!("http://{server_ip}:2121/chat/messages");
+async fn fetch_messages(
+    server_ip: &str,
+    server_port: &str,
+    token: &str,
+) -> Result<Vec<ChatMessage>, String> {
+    let url = build_http_url(server_ip, server_port, "chat/messages");
     let data: ChatListResponse = get_json(&url, Some(token)).await?;
     Ok(data.messages)
 }
 
-async fn post_message(server_ip: &str, token: &str, message: &str) -> Result<ChatMessage, String> {
-    let url = format!("http://{server_ip}:2121/chat/messages");
+async fn post_message(
+    server_ip: &str,
+    server_port: &str,
+    token: &str,
+    message: &str,
+) -> Result<ChatMessage, String> {
+    let url = build_http_url(server_ip, server_port, "chat/messages");
     let body = serde_json::json!({ "message": message });
     let resp = send_json("POST", &url, Some(token), Some(body)).await?;
     if !resp.ok() {
@@ -522,8 +552,13 @@ async fn post_message(server_ip: &str, token: &str, message: &str) -> Result<Cha
     Ok(data)
 }
 
-async fn delete_message(server_ip: &str, token: &str, id: &str) -> Result<(), String> {
-    let url = format!("http://{server_ip}:2121/admin/chat/messages/{id}");
+async fn delete_message(
+    server_ip: &str,
+    server_port: &str,
+    token: &str,
+    id: &str,
+) -> Result<(), String> {
+    let url = build_http_url(server_ip, server_port, &format!("admin/chat/messages/{id}"));
     let resp = send_json("DELETE", &url, Some(token), None).await?;
     if !resp.ok() {
         return Err(format!("Delete error (HTTP {}).", resp.status()));

@@ -6,24 +6,32 @@ use crate::app::{AppState, User};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::api::{get_json, send_json, send_request};
+use crate::net::build_http_url;
 
 pub const SERVER_IP_KEY: &str = "gaggle_server_ip";
+pub const SERVER_PORT_KEY: &str = "gaggle_server_port";
 pub const SESSION_TOKEN_KEY: &str = "gaggle_session_token";
 pub const LOGIN_SUCCESS_KEY: &str = "gaggle_login_success";
 
-pub fn handle_login(server_ip: &str) {
+pub fn handle_login(server_ip: &str, server_port: &str) {
     let server_ip = server_ip.trim();
-    if server_ip.is_empty() {
+    let server_port = server_port.trim();
+    if server_ip.is_empty() || server_port.is_empty() {
         return;
     }
 
     set_local_storage_item(SERVER_IP_KEY, server_ip);
+    set_local_storage_item(SERVER_PORT_KEY, server_port);
 
     let redirect = current_app_url();
     let redirect = js_sys::encode_uri_component(&redirect)
         .as_string()
         .unwrap_or_default();
-    let login_url = format!("http://{server_ip}:2121/auth/discord/login?redirect={redirect}");
+    let login_url = build_http_url(
+        server_ip,
+        server_port,
+        &format!("auth/discord/login?redirect={redirect}"),
+    );
 
     if let Some(win) = window() {
         if win.location().set_href(&login_url).is_ok() {
@@ -35,10 +43,11 @@ pub fn handle_login(server_ip: &str) {
 
 pub fn handle_logout(app_state: UseStateHandle<AppState>) {
     let server_ip = app_state.server_ip.clone();
+    let server_port = app_state.server_port.clone();
     let token = app_state.session_token.clone();
-    if let (Some(server_ip), Some(token)) = (server_ip, token) {
+    if let (Some(server_ip), Some(server_port), Some(token)) = (server_ip, server_port, token) {
         spawn_local(async move {
-            let url = format!("http://{server_ip}:2121/auth/logout");
+            let url = build_http_url(&server_ip, &server_port, "auth/logout");
             let _ = send_json("POST", &url, Some(&token), None).await;
         });
     }
@@ -46,6 +55,8 @@ pub fn handle_logout(app_state: UseStateHandle<AppState>) {
     app_state.set(AppState {
         logged_in: false,
         server_ip: get_local_storage_item(SERVER_IP_KEY),
+        server_port: get_local_storage_item(SERVER_PORT_KEY)
+            .or_else(|| Some("2121".to_string())),
         session_token: None,
         auth_error: None,
         user: None,
@@ -114,8 +125,12 @@ pub fn remove_local_storage_item(key: &str) {
     }
 }
 
-pub async fn check_session(server_ip: &str, token: &str) -> Result<(), String> {
-    let url = format!("http://{server_ip}:2121/users/me");
+pub async fn check_session(
+    server_ip: &str,
+    server_port: &str,
+    token: &str,
+) -> Result<(), String> {
+    let url = build_http_url(server_ip, server_port, "users/me");
     let resp = send_request("GET", &url, Some(token), None).await?;
     if resp.status() == 401 {
         return Err("Session expired. Please log in again.".to_string());
@@ -126,7 +141,7 @@ pub async fn check_session(server_ip: &str, token: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn fetch_me(server_ip: &str, token: &str) -> Result<User, String> {
-    let url = format!("http://{server_ip}:2121/users/me");
+pub async fn fetch_me(server_ip: &str, server_port: &str, token: &str) -> Result<User, String> {
+    let url = build_http_url(server_ip, server_port, "users/me");
     get_json(&url, Some(token)).await
 }

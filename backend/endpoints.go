@@ -96,6 +96,51 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 		admin.GET("/stats", store.getAdminStatsEp)
 		admin.DELETE("/chat/messages", store.clearChatMessagesEp)
 		admin.DELETE("/chat/messages/:id", store.deleteChatMessageEp)
+		admin.GET("/config", func(c *gin.Context) {
+			c.JSON(http.StatusOK, cfg.Snapshot())
+		})
+		admin.PUT("/config", func(c *gin.Context) {
+			var next Config
+			if err := c.ShouldBindJSON(&next); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid config payload"})
+				return
+			}
+			if err := SaveConfig(&next); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "save failed"})
+				return
+			}
+			if err := cfg.Reload(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "reload failed"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "saved"})
+		})
+		admin.GET("/config/raw", func(c *gin.Context) {
+			content, err := os.ReadFile(configPath)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "read failed"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"content": string(content)})
+		})
+		admin.PUT("/config/raw", func(c *gin.Context) {
+			var body struct {
+				Content string `json:"content"`
+			}
+			if err := c.ShouldBindJSON(&body); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid config payload"})
+				return
+			}
+			if err := os.WriteFile(configPath, []byte(body.Content), 0644); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "save failed"})
+				return
+			}
+			if err := cfg.Reload(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "reload failed"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "saved"})
+		})
 		admin.POST("/restart", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"status": "restarting"})
 			go gracefulShutdown(store)
