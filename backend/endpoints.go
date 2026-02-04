@@ -200,7 +200,9 @@ func (s *Store) postChatMessageEp(c *gin.Context, chatHub *ChatHub) {
 	}
 
 	if chatHub != nil {
-		chatHub.broadcast <- ChatEvent{Type: "message", Message: &msg}
+		if messages, err := s.ListChatMessages(100); err == nil {
+			chatHub.broadcast <- ChatEvent{Type: "snapshot", Messages: messages}
+		}
 	}
 
 	c.JSON(http.StatusOK, msg)
@@ -278,7 +280,7 @@ func (s *Store) clearChatMessagesEp(c *gin.Context) {
 		return
 	}
 	if chatHub != nil {
-		chatHub.broadcast <- ChatEvent{Type: "clear"}
+		chatHub.broadcast <- ChatEvent{Type: "snapshot", Messages: []ChatMessage{}}
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": deleted})
 }
@@ -298,7 +300,9 @@ func (s *Store) deleteChatMessageEp(c *gin.Context) {
 		return
 	}
 	if chatHub != nil {
-		chatHub.broadcast <- ChatEvent{Type: "delete", DeletedID: id}
+		if messages, err := s.ListChatMessages(100); err == nil {
+			chatHub.broadcast <- ChatEvent{Type: "snapshot", Messages: messages}
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }

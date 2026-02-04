@@ -21,7 +21,7 @@ type ChatMessage struct {
 type ChatEvent struct {
 	Type      string        `json:"type"`
 	Message   *ChatMessage  `json:"message,omitempty"`
-	Messages  []ChatMessage `json:"messages,omitempty"`
+	Messages  []ChatMessage `json:"messages"`
 	DeletedID string        `json:"deleted_id,omitempty"`
 	Users     []string      `json:"users,omitempty"`
 }

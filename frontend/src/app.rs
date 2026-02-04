@@ -194,28 +194,37 @@ fn app_router() -> Html {
 
     {
         let app_state = app_state.clone();
+        let cancelled = use_mut_ref(|| false);
         use_effect_with(
             (
                 app_state.logged_in,
                 app_state.server_ip.clone(),
                 app_state.session_token.clone(),
                 app_state.auth_error.clone(),
-                app_state.user.clone(),
             ),
             move |_| {
+                *cancelled.borrow_mut() = false;
                 if !app_state.logged_in
                     || app_state.server_ip.is_none()
                     || app_state.session_token.is_none()
                     || app_state.auth_error.is_some()
                 {
-                    return ();
+                    let cancelled = cancelled.clone();
+                    return Box::new(move || {
+                        *cancelled.borrow_mut() = true;
+                    }) as Box<dyn FnOnce()>;
                 }
 
                 let server_ip = app_state.server_ip.clone().unwrap();
                 let token = app_state.session_token.clone().unwrap();
                 let app_state_interval = app_state.clone();
+                let cancelled_task = cancelled.clone();
+                let cancelled_cleanup = cancelled.clone();
 
                 spawn_local(async move {
+                    if *cancelled_task.borrow() {
+                        return;
+                    }
                     if app_state_interval.user.is_none() {
                         match fetch_me(&server_ip, &token).await {
                             Ok(user) => {
@@ -239,8 +248,11 @@ fn app_router() -> Html {
                         return;
                     }
 
-                    let mut interval = IntervalStream::new(15_000);
+                    let mut interval = IntervalStream::new(30_000);
                     while interval.next().await.is_some() {
+                        if *cancelled_task.borrow() {
+                            break;
+                        }
                         if let Err(message) = check_session(&server_ip, &token).await {
                             let mut next = (*app_state_interval).clone();
                             next.auth_error = Some(message);
@@ -250,7 +262,9 @@ fn app_router() -> Html {
                     }
                 });
 
-                ()
+                Box::new(move || {
+                    *cancelled_cleanup.borrow_mut() = true;
+                }) as Box<dyn FnOnce()>
             },
         );
     }

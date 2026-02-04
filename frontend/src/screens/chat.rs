@@ -1,7 +1,7 @@
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use js_sys::{ArrayBuffer, Uint8Array};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{BinaryType, MessageEvent, WebSocket};
+use web_sys::{BinaryType, Blob, MessageEvent, WebSocket};
 use yew::prelude::*;
 
 use crate::api::{get_json, send_json};
@@ -70,7 +70,16 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
 
                 if chat_enabled {
                     match fetch_messages(&server_ip, &token).await {
-                        Ok(msgs) => messages.set(msgs),
+                        Ok(msgs) => {
+                            let mut next = (*messages).clone();
+                            for msg in msgs {
+                                if !next.iter().any(|m| m.id == msg.id) {
+                                    next.push(msg);
+                                }
+                            }
+                            next.sort_by_key(|m| m.timestamp);
+                            messages.set(next);
+                        }
                         Err(msg) => error.set(Some(msg)),
                     }
                 }
@@ -113,55 +122,52 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
                 let active_ref = active_ref.clone();
                 let on_unread = on_unread.clone();
                 Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
-                    let event: ChatEvent = match parse_chat_event(event.data()) {
-                        Some(event) => event,
-                        None => {
-                            error.set(Some("Invalid chat event.".to_string()));
-                            return;
-                        }
-                    };
-                    match event.event_type.as_str() {
-                        "snapshot" => {
-                            if let Some(list) = event.messages {
-                                let mut next = (*messages).clone();
-                                for msg in list {
-                                    if !next.iter().any(|m| m.id == msg.id) {
-                                        next.push(msg);
-                                    }
-                                }
-                                next.sort_by_key(|m| m.timestamp);
-                                messages.set(next);
-                            }
-                        }
-                        "presence" => {
-                            if let Some(users) = event.users {
-                                online_users.set(users);
-                            }
-                        }
-                        "message" => {
-                            if let Some(msg) = event.message {
-                                let mut next = (*messages).clone();
-                                if !next.iter().any(|m| m.id == msg.id) {
-                                    next.push(msg);
-                                    messages.set(next);
-                                    if !*active_ref.borrow() {
-                                        on_unread.emit(1);
-                                    }
-                                }
-                            }
-                        }
-                        "delete" => {
-                            if let Some(id) = event.deleted_id {
-                                let mut next = (*messages).clone();
-                                next.retain(|m| m.id != id);
-                                messages.set(next);
-                            }
-                        }
-                        "clear" => {
-                            messages.set(Vec::new());
-                        }
-                        _ => {}
+                    let data = event.data();
+                    let messages = messages.clone();
+                    let online_users = online_users.clone();
+                    let active_ref = active_ref.clone();
+                    let on_unread = on_unread.clone();
+                    let error = error.clone();
+
+                    if let Some(event) = parse_chat_event(data.clone()) {
+                        let is_active = *active_ref.borrow();
+                        apply_chat_event(
+                            event,
+                            &messages,
+                            &online_users,
+                            is_active,
+                            &on_unread,
+                        );
+                        return;
                     }
+
+                    if data.is_instance_of::<Blob>() {
+                        let blob: Blob = data.unchecked_into();
+                        let messages = messages.clone();
+                        let online_users = online_users.clone();
+                        let active_ref = active_ref.clone();
+                        let on_unread = on_unread.clone();
+                        let error = error.clone();
+                        spawn_local(async move {
+                            if let Ok(buf) = wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await {
+                                if let Some(event) = parse_chat_event(buf) {
+                                    let is_active = *active_ref.borrow();
+                                    apply_chat_event(
+                                        event,
+                                        &messages,
+                                        &online_users,
+                                        is_active,
+                                        &on_unread,
+                                    );
+                                } else {
+                                    error.set(Some("Invalid chat event.".to_string()));
+                                }
+                            }
+                        });
+                        return;
+                    }
+
+                    error.set(Some("Invalid chat event.".to_string()));
                 }))
             };
 
@@ -194,7 +200,6 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
 
     let on_send = {
         let input = input.clone();
-        let messages = messages.clone();
         let error = error.clone();
         let server_ip = server_ip.clone();
         let token = token.clone();
@@ -204,17 +209,12 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
                 return;
             }
             input.set(String::new());
-            let messages = messages.clone();
             let error = error.clone();
             let server_ip = server_ip.clone();
             let token = token.clone();
             spawn_local(async move {
                 match post_message(&server_ip, &token, &text).await {
-                    Ok(msg) => {
-                        let mut next = (*messages).clone();
-                        next.push(msg);
-                        messages.set(next);
-                    }
+                    Ok(_) => {}
                     Err(msg) => error.set(Some(msg)),
                 }
             });
@@ -345,12 +345,12 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
                                 let on_delete_click = Callback::from(move |_| {
                                     on_delete.emit(msg_id.clone())
                                 });
-                                html! {
-                                    <div class="rounded-2xl border border-ink/60 bg-ink/30 p-4 shadow-lg">
-                                        <div class="flex items-start justify-between gap-3">
-                                            <p class="text-xs uppercase tracking-wide text-accent/80">
-                                                { format!("{} · {}", msg.username, format_time(msg.timestamp)) }
-                                            </p>
+                                        html! {
+                                            <div key={msg.id.clone()} class="rounded-2xl border border-ink/60 bg-ink/30 p-4 shadow-lg">
+                                                <div class="flex items-start justify-between gap-3">
+                                                    <p class="text-xs uppercase tracking-wide text-accent/80">
+                                                        { format!("{} · {}", msg.username, format_time(msg.timestamp)) }
+                                                    </p>
                                             if is_admin {
                                                 <Button
                                                     class={Some("bg-transparent px-0 py-0 text-primary/80 hover:text-primary hover:brightness-100 shadow-none".to_string())}
@@ -453,6 +453,35 @@ struct FeaturesResponse {
 #[derive(serde::Deserialize)]
 struct ChatListResponse {
     messages: Vec<ChatMessage>,
+}
+
+fn apply_chat_event(
+    event: ChatEvent,
+    messages: &UseStateHandle<Vec<ChatMessage>>,
+    online_users: &UseStateHandle<Vec<String>>,
+    is_active: bool,
+    on_unread: &Callback<usize>,
+) {
+    match event.event_type.as_str() {
+        "snapshot" => {
+            if let Some(list) = event.messages {
+                messages.set(list);
+            }
+        }
+        "presence" => {
+            if let Some(users) = event.users {
+                online_users.set(users);
+            }
+        }
+        "message" => {
+            if let Some(_) = event.message {
+                if !is_active {
+                    on_unread.emit(1);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn format_time(ts: i64) -> String {
