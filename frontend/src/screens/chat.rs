@@ -123,7 +123,14 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
                     match event.event_type.as_str() {
                         "snapshot" => {
                             if let Some(list) = event.messages {
-                                messages.set(list);
+                                let mut next = (*messages).clone();
+                                for msg in list {
+                                    if !next.iter().any(|m| m.id == msg.id) {
+                                        next.push(msg);
+                                    }
+                                }
+                                next.sort_by_key(|m| m.timestamp);
+                                messages.set(next);
                             }
                         }
                         "presence" => {
