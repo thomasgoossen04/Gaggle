@@ -1,14 +1,22 @@
-use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 use crate::app::{apply_theme, fetch_theme};
+use crate::auth::{get_local_storage_item, set_local_storage_item, INSTALL_DIR_KEY};
 use crate::components::Button;
 use crate::toast::{use_toast, ToastVariant};
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::spawn_local;
 
 #[derive(Properties, PartialEq)]
 pub struct SettingsScreenProps {
     pub on_logout: Callback<MouseEvent>,
     pub user: Option<crate::app::User>,
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
+    async fn invoke(cmd: &str, args: JsValue) -> JsValue;
 }
 
 #[function_component(SettingsScreen)]
@@ -18,6 +26,27 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
     let server_ip = app_state.server_ip.clone();
     let server_port = app_state.server_port.clone();
     let toast = use_toast();
+    let install_dir = use_state(|| get_local_storage_item(INSTALL_DIR_KEY).unwrap_or_default());
+
+    {
+        let install_dir = install_dir.clone();
+        let toast = toast.clone();
+        use_effect_with((), move |_| {
+            if !install_dir.is_empty() {
+                return ();
+            }
+            spawn_local(async move {
+                match invoke("get_default_apps_dir", JsValue::NULL).await.as_string() {
+                    Some(path) => {
+                        set_local_storage_item(INSTALL_DIR_KEY, &path);
+                        install_dir.set(path);
+                    }
+                    None => toast.toast("Failed to load default install folder.", ToastVariant::Error, Some(3000)),
+                }
+            });
+            ()
+        });
+    }
     let on_reload_theme = {
         let server_ip = server_ip.clone();
         let server_port = server_port.clone();
@@ -46,12 +75,65 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
         })
     };
 
+    let on_install_dir_input = {
+        let install_dir = install_dir.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: web_sys::HtmlInputElement = event.target_unchecked_into();
+            let value = input.value();
+            set_local_storage_item(INSTALL_DIR_KEY, &value);
+            install_dir.set(value);
+        })
+    };
+
+    let on_browse = {
+        let install_dir = install_dir.clone();
+        let toast = toast.clone();
+        Callback::from(move |_| {
+            let install_dir = install_dir.clone();
+            let toast = toast.clone();
+            spawn_local(async move {
+                let result = invoke("pick_install_dir", JsValue::NULL).await;
+                if let Some(path) = result.as_string() {
+                    if !path.is_empty() {
+                        set_local_storage_item(INSTALL_DIR_KEY, &path);
+                        install_dir.set(path);
+                        return;
+                    }
+                }
+                toast.toast("No folder selected.", ToastVariant::Warning, Some(2000));
+            });
+        })
+    };
+
     html! {
         <div>
             <h1 class="text-2xl font-semibold">{ "Settings" }</h1>
             <p class="mt-2 text-sm text-accent">
                 { "Manage preferences, accounts, and access." }
             </p>
+            <div class="mt-6 rounded-2xl border border-ink/50 bg-inkLight p-6">
+                <div class="flex items-center justify-between gap-4">
+                    <div>
+                        <h2 class="text-sm font-semibold">{ "Install Folder" }</h2>
+                        <p class="mt-2 text-sm text-secondary/70">
+                            { "Where downloaded apps are stored." }
+                        </p>
+                    </div>
+                    <Button
+                        class={Some("border border-accent/50 bg-accent/20 text-secondary hover:bg-accent/30".to_string())}
+                        onclick={on_browse}
+                    >
+                        { "Browse" }
+                    </Button>
+                </div>
+                <input
+                    class="mt-4 w-full rounded border border-ink/50 bg-ink/40 px-3 py-2 text-secondary placeholder:text-secondary/60 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                    type="text"
+                    placeholder="Apps folder"
+                    value={(*install_dir).clone()}
+                    oninput={on_install_dir_input}
+                />
+            </div>
             <div class="mt-8 rounded-2xl border border-ink/50 bg-inkLight p-6">
                 <div class="flex items-center justify-between">
                     <div>

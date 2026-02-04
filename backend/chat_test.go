@@ -2,33 +2,11 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/dgraph-io/badger"
 )
-
-func newTestStore(t *testing.T) *Store {
-	t.Helper()
-
-	dir, err := os.MkdirTemp("", "gaggle-badger-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	opts := badger.DefaultOptions(dir).WithLogger(nil)
-	opts.ValueDir = dir
-	db, err := badger.Open(opts)
-	if err != nil {
-		t.Fatalf("failed to open badger: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = os.RemoveAll(dir)
-	})
-
-	return &Store{db: db}
-}
 
 func TestChatAddListOrder(t *testing.T) {
 	store := newTestStore(t)

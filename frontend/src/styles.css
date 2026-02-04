@@ -88,3 +88,12 @@
         transform: translateY(0) scale(1);
     }
 }
+
+@keyframes stripe {
+    from {
+        background-position: 0 0;
+    }
+    to {
+        background-position: 40px 0;
+    }
+}

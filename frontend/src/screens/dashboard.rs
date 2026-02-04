@@ -7,7 +7,8 @@ use crate::components::Button;
 use wasm_bindgen_futures::spawn_local;
 use crate::api::get_json;
 use crate::screens::{
-    admin::AdminScreen, chat::ChatScreen, library::LibraryScreen, settings::SettingsScreen,
+    admin::AdminScreen, chat::ChatScreen, downloads::DownloadsScreen, library::LibraryScreen,
+    settings::SettingsScreen,
 };
 
 type AppStateHandle = UseStateHandle<AppState>;
@@ -25,6 +26,7 @@ async fn fetch_features(server_ip: &str, server_port: &str) -> Result<FeaturesRe
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Library,
+    Downloads,
     Chat,
     Settings,
     Admin,
@@ -106,6 +108,9 @@ pub fn dashboard() -> Html {
             { chat_badge }
         </span>
     };
+    let downloads_label = html! {
+        <span>{ "Downloads" }</span>
+    };
 
     let on_unread = {
         let unread_chat = unread_chat.clone();
@@ -122,6 +127,7 @@ pub fn dashboard() -> Html {
                     <h2 class="text-6xl font-semibold">{ "Gaggle" }</h2>
                     <nav class="mt-8 flex flex-col gap-2 text-sm">
                         { tab_button(html! { "Library" }, Tab::Library) }
+                        { tab_button(downloads_label, Tab::Downloads) }
                         if *chat_enabled {
                             { tab_button(chat_label, Tab::Chat) }
                         }
@@ -135,6 +141,9 @@ pub fn dashboard() -> Html {
                     <div class="h-full min-h-0 rounded-3xl border border-ink/40 bg-ink/40 p-8 shadow-2xl backdrop-blur flex flex-col">
                         <div class={if *active_tab == Tab::Library { "" } else { "hidden" }}>
                             <LibraryScreen />
+                        </div>
+                        <div class={if *active_tab == Tab::Downloads { "" } else { "hidden" }}>
+                            <DownloadsScreen />
                         </div>
                         <div class={if *active_tab == Tab::Chat { "" } else { "hidden" }}>
                             <ChatScreen active={*active_tab == Tab::Chat} on_unread={on_unread} />

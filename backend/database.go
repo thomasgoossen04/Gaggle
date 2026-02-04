@@ -25,6 +25,10 @@ func InitDb(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+func (s *Store) Close() error {
+	return s.db.Close()
+}
+
 func userKey(id string) []byte {
 	return []byte("user:" + id)
 }

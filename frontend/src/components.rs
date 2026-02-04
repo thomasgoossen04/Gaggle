@@ -76,3 +76,31 @@ pub fn button(props: &ButtonProps) -> Html {
         </button>
     }
 }
+
+#[derive(Properties, PartialEq)]
+pub struct ProgressBarProps {
+    pub value: f64,
+}
+
+#[function_component(ProgressBar)]
+pub fn progress_bar(props: &ProgressBarProps) -> Html {
+    let clamped = props.value.max(0.0).min(100.0);
+    let width = format!("{:.1}%", clamped);
+    html! {
+        <div class="h-3 w-full rounded-full border border-ink/50 bg-ink/40">
+            <div
+                class="h-full rounded-full bg-primary/70 transition-[width] duration-200"
+                style={format!("width: {width};")}
+            />
+        </div>
+    }
+}
+
+#[function_component(IndeterminateBar)]
+pub fn indeterminate_bar() -> Html {
+    html! {
+        <div class="h-3 w-full overflow-hidden rounded-full border border-ink/50 bg-ink/40">
+            <div class="h-full w-2/3 animate-[stripe_1.2s_linear_infinite] bg-[length:40px_40px] bg-[linear-gradient(135deg,rgba(255,255,255,0.18)_25%,rgba(255,255,255,0)_25%,rgba(255,255,255,0)_50%,rgba(255,255,255,0.18)_50%,rgba(255,255,255,0.18)_75%,rgba(255,255,255,0)_75%,rgba(255,255,255,0))]" />
+        </div>
+    }
+}

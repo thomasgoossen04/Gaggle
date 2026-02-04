@@ -12,6 +12,7 @@ pub const SERVER_IP_KEY: &str = "gaggle_server_ip";
 pub const SERVER_PORT_KEY: &str = "gaggle_server_port";
 pub const SESSION_TOKEN_KEY: &str = "gaggle_session_token";
 pub const LOGIN_SUCCESS_KEY: &str = "gaggle_login_success";
+pub const INSTALL_DIR_KEY: &str = "gaggle_install_dir";
 
 pub fn handle_login(server_ip: &str, server_port: &str) {
     let server_ip = server_ip.trim();

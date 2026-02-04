@@ -24,7 +24,7 @@ var chatWsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-func StartServer(router *gin.Engine, store *Store, cfg *Config) {
+func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 	// Health check
 	router.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -59,6 +59,20 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 		}
 		c.JSON(http.StatusOK, theme)
 	})
+
+	// App library
+	apps := router.Group("/apps")
+	apps.Use(AuthMiddleware(store))
+	{
+		apps.GET("", listAppsHandler)
+		apps.GET("/:id/config", getAppConfigHandler)
+		apps.GET("/:id/archive", getAppArchiveHandler)
+		apps.POST("/refresh", func(c *gin.Context) {
+		// Ensure apps directory exists; listing always reads from disk.
+		_ = os.MkdirAll(appsDir, 0755)
+		c.JSON(http.StatusOK, gin.H{"status": "refreshed"})
+		})
+	}
 
 	// Protected user routes
 	users := router.Group("/users")
@@ -154,6 +168,10 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 		})
 	}
 
+}
+
+func StartServer(router *gin.Engine, store *Store, cfg *Config) {
+	RegisterRoutes(router, store, cfg)
 	runServer(router, store, cfg)
 }
 
