@@ -3,6 +3,8 @@ use yew::prelude::*;
 
 use crate::app::AppState;
 use crate::api::{get_json, send_json};
+use crate::confirm::{use_confirm, ConfirmRequest};
+use crate::toast::{use_toast, ToastVariant};
 
 #[function_component(AdminScreen)]
 pub fn admin_screen() -> Html {
@@ -15,6 +17,8 @@ pub fn admin_screen() -> Html {
     let error = use_state(|| None::<String>);
     let loading = use_state(|| true);
     let clearing = use_state(|| false);
+    let confirm = use_confirm();
+    let toast = use_toast();
 
     {
         let sessions = sessions.clone();
@@ -48,20 +52,40 @@ pub fn admin_screen() -> Html {
         let error = error.clone();
         let server_ip = server_ip.clone();
         let token = token.clone();
+        let confirm = confirm.clone();
+        let toast = toast.clone();
         Callback::from(move |_| {
             if server_ip.is_empty() || token.is_empty() {
                 return;
             }
-            clearing.set(true);
             let clearing = clearing.clone();
             let error = error.clone();
             let server_ip = server_ip.clone();
             let token = token.clone();
-            spawn_local(async move {
-                if let Err(msg) = clear_chat(&server_ip, &token).await {
-                    error.set(Some(msg));
-                }
-                clearing.set(false);
+            let toast = toast.clone();
+            confirm.confirm(ConfirmRequest {
+                title: "Clear chat messages?".to_string(),
+                message: "This will permanently delete all chat messages for everyone."
+                    .to_string(),
+                confirm_label: "Clear chat".to_string(),
+                cancel_label: "Cancel".to_string(),
+                on_confirm: Callback::from(move |_| {
+                    clearing.set(true);
+                    let clearing = clearing.clone();
+                    let error = error.clone();
+                    let server_ip = server_ip.clone();
+                    let token = token.clone();
+                    let toast = toast.clone();
+                    spawn_local(async move {
+                        if let Err(msg) = clear_chat(&server_ip, &token).await {
+                            error.set(Some(msg.clone()));
+                            toast.toast(msg, ToastVariant::Error, Some(3500));
+                        } else {
+                            toast.toast("Chat cleared.", ToastVariant::Success, Some(2500));
+                        }
+                        clearing.set(false);
+                    });
+                }),
             });
         })
     };

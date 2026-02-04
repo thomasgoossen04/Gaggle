@@ -12,6 +12,7 @@ use crate::auth::{
     LOGIN_SUCCESS_KEY, SERVER_IP_KEY, SESSION_TOKEN_KEY,
 };
 use crate::components::{Button, Card};
+use crate::confirm::ConfirmProvider;
 use crate::screens::dashboard::Dashboard;
 use crate::screens::error::ErrorScreen;
 use crate::toast::{use_toast, ToastProvider, ToastVariant};
@@ -83,9 +84,11 @@ pub fn app() -> Html {
 
     html! {
         <ToastProvider>
-            <ContextProvider<AppStateHandle> context={app_state}>
-                <AppRouter />
-            </ContextProvider<AppStateHandle>>
+            <ConfirmProvider>
+                <ContextProvider<AppStateHandle> context={app_state}>
+                    <AppRouter />
+                </ContextProvider<AppStateHandle>>
+            </ConfirmProvider>
         </ToastProvider>
     }
 }

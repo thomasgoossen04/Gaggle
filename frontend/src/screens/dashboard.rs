@@ -5,7 +5,6 @@ use crate::auth::handle_logout;
 use crate::screens::{
     admin::AdminScreen, chat::ChatScreen, library::LibraryScreen, settings::SettingsScreen,
 };
-use crate::toast::{use_toast, ToastVariant};
 
 type AppStateHandle = UseStateHandle<AppState>;
 

@@ -1,8 +1,10 @@
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
-use crate::app::AppState;
 use crate::api::{get_json, send_json};
+use crate::app::AppState;
+use crate::confirm::{use_confirm, ConfirmRequest};
+use crate::toast::{use_toast, ToastVariant};
 
 #[function_component(ChatScreen)]
 pub fn chat_screen() -> Html {
@@ -17,6 +19,7 @@ pub fn chat_screen() -> Html {
     let enabled = use_state(|| true);
     let error = use_state(|| None::<String>);
     let loading = use_state(|| true);
+    let toast = use_toast();
 
     {
         let messages = messages.clone();
@@ -93,25 +96,44 @@ pub fn chat_screen() -> Html {
         })
     };
 
+    let confirm = use_confirm();
     let on_delete = {
         let messages = messages.clone();
         let error = error.clone();
         let server_ip = server_ip.clone();
         let token = token.clone();
+        let confirm = confirm.clone();
+        let toast = toast.clone();
         Callback::from(move |id: String| {
             let messages = messages.clone();
             let error = error.clone();
             let server_ip = server_ip.clone();
             let token = token.clone();
-            spawn_local(async move {
-                match delete_message(&server_ip, &token, &id).await {
-                    Ok(_) => {
-                        let mut next = (*messages).clone();
-                        next.retain(|msg| msg.id != id);
-                        messages.set(next);
-                    }
-                    Err(msg) => error.set(Some(msg)),
-                }
+            let toast = toast.clone();
+            confirm.confirm(ConfirmRequest {
+                title: "Delete message?".to_string(),
+                message: "This will permanently remove the message.".to_string(),
+                confirm_label: "Delete".to_string(),
+                cancel_label: "Cancel".to_string(),
+                on_confirm: Callback::from(move |_| {
+                    let messages = messages.clone();
+                    let error = error.clone();
+                    let server_ip = server_ip.clone();
+                    let token = token.clone();
+                    let id = id.clone();
+                    let toast = toast.clone();
+                    spawn_local(async move {
+                        match delete_message(&server_ip, &token, &id).await {
+                            Ok(_) => {
+                                let mut next = (*messages).clone();
+                                next.retain(|msg| msg.id != id);
+                                messages.set(next);
+                                toast.toast("Message deleted.", ToastVariant::Success, Some(2000));
+                            }
+                            Err(msg) => error.set(Some(msg)),
+                        }
+                    });
+                }),
             });
         })
     };
@@ -193,7 +215,7 @@ pub fn chat_screen() -> Html {
                 <div class="mt-4 rounded-2xl border border-ink/50 bg-inkLight/90 p-4">
                     <div class="flex items-center gap-3">
                         <input
-                            class="w-full rounded-xl border border-ink/50 bg-ink/40 px-4 py-3 text-base text-secondary placeholder:text-secondary/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                            class="w-full rounded-xl border border-accent/60 bg-ink/40 px-4 py-3 text-base text-secondary placeholder:text-secondary/50 focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/40"
                             type="text"
                             placeholder="Type a message..."
                             value={(*input).clone()}
