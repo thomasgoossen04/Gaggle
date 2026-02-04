@@ -5,6 +5,14 @@ module.exports = {
         "./src/**/*.rs",
     ],
     theme: {
-        extend: {},
+        extend: {
+            colors: {
+                primary: "#FF7F11",
+                secondary: "#ACBFA4",
+                accent: "#E2E8CE",
+                ink: "#262626",
+            },
+        },
     },
+    safelist: ["bg-slate-700", "text-3xl", "font-bold"],
 };
