@@ -1,7 +1,7 @@
 use gloo_timers::future::TimeoutFuture;
 use wasm_bindgen_futures::spawn_local;
-use yew::prelude::*;
 use yew::hook;
+use yew::prelude::*;
 
 #[derive(Clone, PartialEq)]
 pub enum ToastVariant {
@@ -24,7 +24,12 @@ pub struct ToastContext {
 }
 
 impl ToastContext {
-    pub fn toast(&self, message: impl Into<String>, variant: ToastVariant, timeout_ms: Option<u32>) {
+    pub fn toast(
+        &self,
+        message: impl Into<String>,
+        variant: ToastVariant,
+        timeout_ms: Option<u32>,
+    ) {
         self.push.emit(ToastRequest {
             message: message.into(),
             variant,

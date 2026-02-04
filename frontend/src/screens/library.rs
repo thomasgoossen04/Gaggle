@@ -48,7 +48,7 @@ struct PlaytimeEntry {
 #[serde(rename_all = "camelCase")]
 struct RunAppResult {
     duration_seconds: u64,
-    exit_code: Option<i32>,
+    _exit_code: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -66,7 +66,7 @@ struct DownloadEvent {
     downloaded: u64,
     total: Option<u64>,
     status: String,
-    speed_bps: f64,
+    _speed_bps: f64,
 }
 
 #[derive(serde::Serialize)]
@@ -191,7 +191,9 @@ pub fn library_screen() -> Html {
                         }
                     }
                     let playtime_url = build_http_url(&server_ip, &server_port, "apps/playtime");
-                    if let Ok(list) = get_json::<Vec<PlaytimeEntry>>(&playtime_url, Some(&token)).await {
+                    if let Ok(list) =
+                        get_json::<Vec<PlaytimeEntry>>(&playtime_url, Some(&token)).await
+                    {
                         let mut next = HashMap::new();
                         for entry in list {
                             next.insert(entry.app_id.clone(), entry);
@@ -670,11 +672,8 @@ pub fn library_screen() -> Html {
                     && !server_port.trim().is_empty()
                     && !token.trim().is_empty()
                 {
-                    let status_url = build_http_url(
-                        server_ip.trim(),
-                        server_port.trim(),
-                        "social/status",
-                    );
+                    let status_url =
+                        build_http_url(server_ip.trim(), server_port.trim(), "social/status");
                     let body = serde_json::json!({
                         "status": "playing",
                         "app_id": app_id,
@@ -707,8 +706,8 @@ pub fn library_screen() -> Html {
                                 "social/status",
                             );
                             let body = serde_json::json!({ "status": "online" });
-                            let _ =
-                                send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
+                            let _ = send_json("POST", &status_url, Some(token.trim()), Some(body))
+                                .await;
                         }
                         return;
                     }
@@ -716,7 +715,11 @@ pub fn library_screen() -> Html {
                 let run: RunAppResult = match serde_wasm_bindgen::from_value(result) {
                     Ok(value) => value,
                     Err(_) => {
-                        toast.toast("Failed to read play session.", ToastVariant::Error, Some(3000));
+                        toast.toast(
+                            "Failed to read play session.",
+                            ToastVariant::Error,
+                            Some(3000),
+                        );
                         if !server_ip.trim().is_empty()
                             && !server_port.trim().is_empty()
                             && !token.trim().is_empty()
@@ -727,8 +730,8 @@ pub fn library_screen() -> Html {
                                 "social/status",
                             );
                             let body = serde_json::json!({ "status": "online" });
-                            let _ =
-                                send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
+                            let _ = send_json("POST", &status_url, Some(token.trim()), Some(body))
+                                .await;
                         }
                         return;
                     }
@@ -739,11 +742,8 @@ pub fn library_screen() -> Html {
                         && !server_port.trim().is_empty()
                         && !token.trim().is_empty()
                     {
-                        let status_url = build_http_url(
-                            server_ip.trim(),
-                            server_port.trim(),
-                            "social/status",
-                        );
+                        let status_url =
+                            build_http_url(server_ip.trim(), server_port.trim(), "social/status");
                         let body = serde_json::json!({ "status": "online" });
                         let _ =
                             send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
@@ -779,7 +779,8 @@ pub fn library_screen() -> Html {
                         toast.toast("Playtime upload failed.", ToastVariant::Warning, Some(2500));
                     }
                 }
-                let status_url = build_http_url(server_ip.trim(), server_port.trim(), "social/status");
+                let status_url =
+                    build_http_url(server_ip.trim(), server_port.trim(), "social/status");
                 let body = serde_json::json!({ "status": "online" });
                 let _ = send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
             });

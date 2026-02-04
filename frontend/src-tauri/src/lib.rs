@@ -1,3 +1,4 @@
+use std::sync::Mutex as StdMutex;
 use std::{
     collections::HashMap,
     fs,
@@ -9,7 +10,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use std::sync::Mutex as StdMutex;
 
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::RANGE;
@@ -160,8 +160,18 @@ struct CountingReader<R: Read> {
 }
 
 impl<R: Read> CountingReader<R> {
-    fn new(inner: R, state: Arc<StdMutex<UploadProgressState>>, app: AppHandle, id: String) -> Self {
-        Self { inner, state, app, id }
+    fn new(
+        inner: R,
+        state: Arc<StdMutex<UploadProgressState>>,
+        app: AppHandle,
+        id: String,
+    ) -> Self {
+        Self {
+            inner,
+            state,
+            app,
+            id,
+        }
     }
 }
 
@@ -228,7 +238,8 @@ fn add_dir_to_tar(
 
             let file = fs::File::open(&entry_path)
                 .map_err(|_| "Failed to read file for archive.".to_string())?;
-            let mut reader = CountingReader::new(file, progress.clone(), app.clone(), id.to_string());
+            let mut reader =
+                CountingReader::new(file, progress.clone(), app.clone(), id.to_string());
             builder
                 .append_data(&mut header, rel, &mut reader)
                 .map_err(|_| "Failed to add file to archive.".to_string())?;
@@ -297,11 +308,18 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
         last_emit: Instant::now(),
     }));
     {
-        let tar_file = fs::File::create(&archive_path)
-            .map_err(|_| "Failed to create archive.".to_string())?;
+        let tar_file =
+            fs::File::create(&archive_path).map_err(|_| "Failed to create archive.".to_string())?;
         let encoder = flate2::write::GzEncoder::new(tar_file, flate2::Compression::fast());
         let mut builder = tar::Builder::new(encoder);
-        add_dir_to_tar(&mut builder, &folder, &folder, &progress_state, &app, &request.id)?;
+        add_dir_to_tar(
+            &mut builder,
+            &folder,
+            &folder,
+            &progress_state,
+            &app,
+            &request.id,
+        )?;
         builder
             .finish()
             .map_err(|_| "Failed to finalize archive.".to_string())?;
@@ -323,7 +341,7 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
         request.server_port.trim()
     );
 
-    let mut archive_len = fs::metadata(&archive_path)
+    let archive_len = fs::metadata(&archive_path)
         .map_err(|_| "Failed to read archive size.".to_string())?
         .len();
     let file = tokio::fs::File::open(&archive_path)
@@ -755,8 +773,7 @@ fn open_app_folder(request: OpenAppFolderRequest) -> Result<(), String> {
     if !app_dir.exists() {
         return Err("App folder not found.".to_string());
     }
-    open_path(app_dir, Option::<&str>::None)
-        .map_err(|_| "Failed to open app folder.".to_string())
+    open_path(app_dir, Option::<&str>::None).map_err(|_| "Failed to open app folder.".to_string())
 }
 
 #[tauri::command]
@@ -875,9 +892,13 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
         tokio::fs::remove_file(&task.archive_path).await.ok();
     }
 
-    let mut total = response
-        .content_length()
-        .map(|len| if downloaded > 0 { len + downloaded } else { len });
+    let total = response.content_length().map(|len| {
+        if downloaded > 0 {
+            len + downloaded
+        } else {
+            len
+        }
+    });
     let _ = write_download_meta(&task, total).await;
 
     let mut file = OpenOptions::new()
@@ -1040,7 +1061,8 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
 
 fn extracted_archive(archive_path: &Path, app_dir: &Path) -> Result<(), String> {
     let content_dir = app_dir.join("content");
-    fs::create_dir_all(&content_dir).map_err(|_| "Failed to create content directory.".to_string())?;
+    fs::create_dir_all(&content_dir)
+        .map_err(|_| "Failed to create content directory.".to_string())?;
     let file = fs::File::open(archive_path).map_err(|_| "Failed to open archive.".to_string())?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
@@ -1068,8 +1090,8 @@ async fn write_download_meta(task: &DownloadTask, total: Option<u64>) -> Result<
         total,
     };
     let path = task.app_dir.join("download.json");
-    let data =
-        serde_json::to_vec_pretty(&meta).map_err(|_| "Failed to encode download meta.".to_string())?;
+    let data = serde_json::to_vec_pretty(&meta)
+        .map_err(|_| "Failed to encode download meta.".to_string())?;
     tokio::fs::write(path, data)
         .await
         .map_err(|_| "Failed to write download meta.".to_string())?;
