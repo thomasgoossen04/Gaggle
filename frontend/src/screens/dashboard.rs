@@ -8,7 +8,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::api::get_json;
 use crate::screens::{
     admin::AdminScreen, chat::ChatScreen, downloads::DownloadsScreen, library::LibraryScreen,
-    settings::SettingsScreen,
+    social::SocialScreen, settings::SettingsScreen,
 };
 
 type AppStateHandle = UseStateHandle<AppState>;
@@ -28,6 +28,7 @@ enum Tab {
     Library,
     Downloads,
     Chat,
+    Social,
     Settings,
     Admin,
 }
@@ -108,6 +109,9 @@ pub fn dashboard() -> Html {
             { chat_badge }
         </span>
     };
+    let social_label = html! {
+        <span>{ "Social" }</span>
+    };
     let downloads_label = html! {
         <span>{ "Downloads" }</span>
     };
@@ -131,6 +135,7 @@ pub fn dashboard() -> Html {
                         if *chat_enabled {
                             { tab_button(chat_label, Tab::Chat) }
                         }
+                        { tab_button(social_label, Tab::Social) }
                         { tab_button(html! { "Settings" }, Tab::Settings) }
                         if app_state.user.as_ref().map(|u| u.is_admin).unwrap_or(false) {
                             { tab_button(html! { "Admin" }, Tab::Admin) }
@@ -147,6 +152,9 @@ pub fn dashboard() -> Html {
                         </div>
                         <div class={if *active_tab == Tab::Chat { "" } else { "hidden" }}>
                             <ChatScreen active={*active_tab == Tab::Chat} on_unread={on_unread} />
+                        </div>
+                        <div class={if *active_tab == Tab::Social { "flex-1 min-h-0 flex flex-col" } else { "hidden" }}>
+                            <SocialScreen />
                         </div>
                         <div class={if *active_tab == Tab::Settings { "" } else { "hidden" }}>
                             <SettingsScreen on_logout={on_logout.clone()} user={app_state.user.clone()} />

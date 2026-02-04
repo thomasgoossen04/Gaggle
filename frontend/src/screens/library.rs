@@ -6,7 +6,7 @@ use serde_json;
 use serde_wasm_bindgen;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use yew::prelude::*;
 
 use crate::api::{get_json, send_json};
@@ -20,6 +20,9 @@ use crate::toast::{use_toast, ToastVariant};
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
     async fn invoke(cmd: &str, args: JsValue) -> JsValue;
+
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke, catch)]
+    async fn invoke_safe(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
 }
 
 #[derive(Clone, PartialEq, Deserialize)]
@@ -32,6 +35,20 @@ struct AppInfo {
     has_archive: bool,
     #[serde(default)]
     executable: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
+struct PlaytimeEntry {
+    app_id: String,
+    total_seconds: i64,
+    last_played: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunAppResult {
+    duration_seconds: u64,
+    exit_code: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -80,6 +97,7 @@ pub fn library_screen() -> Html {
     let downloads = use_state(|| HashMap::<String, DownloadUiState>::new());
     let refresh_tick = use_state(|| 0u32);
     let installed = use_state(|| HashSet::<String>::new());
+    let playtime = use_state(|| HashMap::<String, PlaytimeEntry>::new());
     let search = use_state(String::new);
     let sort = use_state(|| "downloaded".to_string());
     let carousel_ref = use_node_ref();
@@ -107,12 +125,19 @@ pub fn library_screen() -> Html {
                     install_dir.set(saved);
                     return;
                 }
-                match invoke("get_default_apps_dir", JsValue::NULL).await.as_string() {
+                match invoke("get_default_apps_dir", JsValue::NULL)
+                    .await
+                    .as_string()
+                {
                     Some(path) => {
                         install_dir.set(path.clone());
                         set_local_storage_item(INSTALL_DIR_KEY, &path);
                     }
-                    None => toast.toast("Failed to load default install folder.", ToastVariant::Error, Some(3000)),
+                    None => toast.toast(
+                        "Failed to load default install folder.",
+                        ToastVariant::Error,
+                        Some(3000),
+                    ),
                 }
             });
             || ()
@@ -128,6 +153,7 @@ pub fn library_screen() -> Html {
         let refresh_tick = refresh_tick.clone();
         let install_dir = install_dir.clone();
         let installed = installed.clone();
+        let playtime = playtime.clone();
         let token = token.clone();
         use_effect_with(
             (
@@ -138,48 +164,57 @@ pub fn library_screen() -> Html {
                 (*install_dir).clone(),
             ),
             move |_| {
-            if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                loading.set(false);
-                if token.is_empty() {
-                    error.set(Some("Missing session token.".to_string()));
-                }
-                return ();
-            }
-            loading.set(true);
-            let apps = apps.clone();
-            let loading = loading.clone();
-            let error = error.clone();
-            let install_dir = install_dir.clone();
-            let installed = installed.clone();
-            let token = token.clone();
-            spawn_local(async move {
-                let url = build_http_url(&server_ip, &server_port, "apps");
-                match get_json::<Vec<AppInfo>>(&url, Some(&token)).await {
-                    Ok(list) => {
-                        apps.set(list);
-                        error.set(None);
+                if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
+                    loading.set(false);
+                    if token.is_empty() {
+                        error.set(Some("Missing session token.".to_string()));
                     }
-                    Err(msg) => {
-                        error.set(Some(msg));
-                    }
+                    return ();
                 }
-                if !install_dir.is_empty() {
-                    let dest_dir: String = install_dir.as_str().to_string();
-                    let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
-                        "request": {
-                            "destDir": dest_dir
+                loading.set(true);
+                let apps = apps.clone();
+                let loading = loading.clone();
+                let error = error.clone();
+                let install_dir = install_dir.clone();
+                let installed = installed.clone();
+                let playtime = playtime.clone();
+                let token = token.clone();
+                spawn_local(async move {
+                    let url = build_http_url(&server_ip, &server_port, "apps");
+                    match get_json::<Vec<AppInfo>>(&url, Some(&token)).await {
+                        Ok(list) => {
+                            apps.set(list);
+                            error.set(None);
                         }
-                    }))
-                    .unwrap_or(JsValue::NULL);
-                    let result = invoke("list_installed_apps", payload).await;
-                    if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<String>>(result) {
-                        installed.set(list.into_iter().collect());
+                        Err(msg) => {
+                            error.set(Some(msg));
+                        }
                     }
-                }
-                loading.set(false);
-            });
-            ()
-        },
+                    let playtime_url = build_http_url(&server_ip, &server_port, "apps/playtime");
+                    if let Ok(list) = get_json::<Vec<PlaytimeEntry>>(&playtime_url, Some(&token)).await {
+                        let mut next = HashMap::new();
+                        for entry in list {
+                            next.insert(entry.app_id.clone(), entry);
+                        }
+                        playtime.set(next);
+                    }
+                    if !install_dir.is_empty() {
+                        let dest_dir: String = install_dir.as_str().to_string();
+                        let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
+                            "request": {
+                                "destDir": dest_dir
+                            }
+                        }))
+                        .unwrap_or(JsValue::NULL);
+                        let result = invoke("list_installed_apps", payload).await;
+                        if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<String>>(result) {
+                            installed.set(list.into_iter().collect());
+                        }
+                    }
+                    loading.set(false);
+                });
+                ()
+            },
         );
     }
 
@@ -191,7 +226,11 @@ pub fn library_screen() -> Html {
         let refresh_tick = refresh_tick.clone();
         Callback::from(move |_| {
             if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                toast.toast("Missing server address or token.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Missing server address or token.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             let server_ip = server_ip.clone();
@@ -225,24 +264,27 @@ pub fn library_screen() -> Html {
         let server_port = server_port.clone();
         let token = token.clone();
         let refresh_tick = refresh_tick.clone();
-        use_effect_with((server_ip.clone(), server_port.clone(), token.clone()), move |_| {
-            if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                return ();
-            }
-            let server_ip = server_ip.clone();
-            let server_port = server_port.clone();
-            let token = token.clone();
-            let refresh_tick = refresh_tick.clone();
-            spawn_local(async move {
-                let url = build_http_url(&server_ip, &server_port, "apps/refresh");
-                if let Ok(resp) = send_json("POST", &url, Some(&token), None).await {
-                    if resp.ok() {
-                        refresh_tick.set(*refresh_tick + 1);
-                    }
+        use_effect_with(
+            (server_ip.clone(), server_port.clone(), token.clone()),
+            move |_| {
+                if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
+                    return ();
                 }
-            });
-            ()
-        });
+                let server_ip = server_ip.clone();
+                let server_port = server_port.clone();
+                let token = token.clone();
+                let refresh_tick = refresh_tick.clone();
+                spawn_local(async move {
+                    let url = build_http_url(&server_ip, &server_port, "apps/refresh");
+                    if let Ok(resp) = send_json("POST", &url, Some(&token), None).await {
+                        if resp.ok() {
+                            refresh_tick.set(*refresh_tick + 1);
+                        }
+                    }
+                });
+                ()
+            },
+        );
     }
 
     let on_search_input = {
@@ -298,7 +340,8 @@ pub fn library_screen() -> Html {
                     }))
                     .unwrap_or(JsValue::NULL);
                     let initial = invoke("list_downloads", payload).await;
-                    if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<DownloadEvent>>(initial) {
+                    if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<DownloadEvent>>(initial)
+                    {
                         let mut next = (*downloads).clone();
                         for item in list {
                             next.insert(
@@ -333,38 +376,45 @@ pub fn library_screen() -> Html {
                 let listen = listen.unwrap();
                 let listen_fn: Function = listen.dyn_into().unwrap();
 
-                let callback = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
-                    let payload = Reflect::get(&value, &JsValue::from_str("payload")).unwrap_or(JsValue::NULL);
-                    let event: Result<DownloadEvent, _> = serde_wasm_bindgen::from_value(payload);
-                    if let Ok(event) = event {
-                        let mut next = (*downloads).clone();
-                        let status = event.status.clone();
-                        let mut entry = next.get(&event.id).cloned().unwrap_or_default();
-                        let now = js_sys::Date::now();
-                        if let Some((last_time, last_bytes)) = entry.last_tick {
-                            let delta_t = (now - last_time) / 1000.0;
-                            if delta_t > 0.0 {
-                                let delta_b = event.downloaded.saturating_sub(last_bytes) as f64;
-                                entry.speed_bps = delta_b / delta_t;
+                let callback =
+                    Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
+                        let payload = Reflect::get(&value, &JsValue::from_str("payload"))
+                            .unwrap_or(JsValue::NULL);
+                        let event: Result<DownloadEvent, _> =
+                            serde_wasm_bindgen::from_value(payload);
+                        if let Ok(event) = event {
+                            let mut next = (*downloads).clone();
+                            let status = event.status.clone();
+                            let mut entry = next.get(&event.id).cloned().unwrap_or_default();
+                            let now = js_sys::Date::now();
+                            if let Some((last_time, last_bytes)) = entry.last_tick {
+                                let delta_t = (now - last_time) / 1000.0;
+                                if delta_t > 0.0 {
+                                    let delta_b =
+                                        event.downloaded.saturating_sub(last_bytes) as f64;
+                                    entry.speed_bps = delta_b / delta_t;
+                                }
+                            }
+                            entry.last_tick = Some((now, event.downloaded));
+                            entry.status = status.clone();
+                            entry.downloaded = event.downloaded;
+                            entry.total = event.total;
+                            next.insert(event.id.clone(), entry);
+                            downloads.set(next);
+                            if status == "completed" {
+                                let mut installed_next = (*installed).clone();
+                                installed_next.insert(event.id.clone());
+                                installed.set(installed_next);
+                                refresh_tick.set(*refresh_tick + 1);
                             }
                         }
-                        entry.last_tick = Some((now, event.downloaded));
-                        entry.status = status.clone();
-                        entry.downloaded = event.downloaded;
-                        entry.total = event.total;
-                        next.insert(event.id.clone(), entry);
-                        downloads.set(next);
-                        if status == "completed" {
-                            let mut installed_next = (*installed).clone();
-                            installed_next.insert(event.id.clone());
-                            installed.set(installed_next);
-                            refresh_tick.set(*refresh_tick + 1);
-                        }
-                    }
-                }));
+                    }));
 
-                let _ = listen_fn
-                    .call2(&event, &JsValue::from_str("app_download_progress"), callback.as_ref().unchecked_ref());
+                let _ = listen_fn.call2(
+                    &event,
+                    &JsValue::from_str("app_download_progress"),
+                    callback.as_ref().unchecked_ref(),
+                );
                 callback.forget();
             });
             || ()
@@ -380,15 +430,26 @@ pub fn library_screen() -> Html {
         let toast = toast.clone();
         Callback::from(move |app: AppInfo| {
             if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                toast.toast("Missing server address or token.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Missing server address or token.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             let dest_dir = (*install_dir).clone();
             if dest_dir.trim().is_empty() {
-                toast.toast("Choose an install folder first.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Choose an install folder first.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
-            if (*downloads).values().any(|d| d.status == "downloading" || d.status == "paused") {
+            if (*downloads)
+                .values()
+                .any(|d| d.status == "downloading" || d.status == "paused")
+            {
                 toast.toast(
                     "Finish or cancel the current download before starting another.",
                     ToastVariant::Warning,
@@ -397,8 +458,13 @@ pub fn library_screen() -> Html {
                 return;
             }
 
-            let archive_url = build_http_url(&server_ip, &server_port, &format!("apps/{}/archive", app.id));
-            let config_url = build_http_url(&server_ip, &server_port, &format!("apps/{}/config", app.id));
+            let archive_url = build_http_url(
+                &server_ip,
+                &server_port,
+                &format!("apps/{}/archive", app.id),
+            );
+            let config_url =
+                build_http_url(&server_ip, &server_port, &format!("apps/{}/config", app.id));
             let args = StartDownloadArgs {
                 id: app.id.clone(),
                 archive_url,
@@ -418,7 +484,7 @@ pub fn library_screen() -> Html {
                         "token": args.token
                     }
                 }))
-                    .unwrap_or(JsValue::NULL);
+                .unwrap_or(JsValue::NULL);
                 let result = invoke("start_app_download", payload).await;
                 if result.is_null() {
                     toast.toast("Failed to start download.", ToastVariant::Error, Some(3000));
@@ -448,7 +514,11 @@ pub fn library_screen() -> Html {
         Callback::from(move |id: String| {
             let install_dir = (*install_dir).clone();
             if install_dir.trim().is_empty() {
-                toast.toast("No install folder configured.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "No install folder configured.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             let installed = installed.clone();
@@ -477,7 +547,8 @@ pub fn library_screen() -> Html {
         Callback::from(move |id: String| {
             let downloads = downloads.clone();
             spawn_local(async move {
-                let payload = serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
+                let payload =
+                    serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
                 let _ = invoke("pause_download", payload).await;
                 let mut next = (*downloads).clone();
                 if let Some(entry) = next.get_mut(&id) {
@@ -522,7 +593,8 @@ pub fn library_screen() -> Html {
             let downloads = downloads.clone();
             let installed = installed.clone();
             spawn_local(async move {
-                let payload = serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
+                let payload =
+                    serde_wasm_bindgen::to_value(&serde_json::json!({ "id": id })).unwrap();
                 let _ = invoke("cancel_download", payload).await;
                 let mut next = (*downloads).clone();
                 next.remove(&id);
@@ -541,7 +613,11 @@ pub fn library_screen() -> Html {
             let install_dir = (*install_dir).clone();
             let toast = toast.clone();
             if install_dir.trim().is_empty() {
-                toast.toast("No install folder configured.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "No install folder configured.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             spawn_local(async move {
@@ -560,18 +636,52 @@ pub fn library_screen() -> Html {
     let on_run_app = {
         let install_dir = install_dir.clone();
         let toast = toast.clone();
-        Callback::from(move |(id, executable): (String, String)| {
+        let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
+        let token = token.clone();
+        let playtime = playtime.clone();
+        Callback::from(move |(id, executable, name): (String, String, String)| {
             let install_dir = (*install_dir).clone();
             let toast = toast.clone();
+            let server_ip = server_ip.clone();
+            let server_port = server_port.clone();
+            let token = token.clone();
+            let playtime = playtime.clone();
+            let app_name = name.clone();
             if install_dir.trim().is_empty() {
-                toast.toast("No install folder configured.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "No install folder configured.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             if executable.trim().is_empty() {
-                toast.toast("Executable not configured for this app.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Executable not configured for this app.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             spawn_local(async move {
+                let app_id = id.clone();
+                if !server_ip.trim().is_empty()
+                    && !server_port.trim().is_empty()
+                    && !token.trim().is_empty()
+                {
+                    let status_url = build_http_url(
+                        server_ip.trim(),
+                        server_port.trim(),
+                        "social/status",
+                    );
+                    let body = serde_json::json!({
+                        "status": "playing",
+                        "app_id": app_id,
+                        "app_name": app_name
+                    });
+                    let _ = send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
+                }
                 let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
                     "request": {
                         "id": id,
@@ -580,7 +690,98 @@ pub fn library_screen() -> Html {
                     }
                 }))
                 .unwrap_or(JsValue::NULL);
-                let _ = invoke("run_app_executable", payload).await;
+                let result = match invoke_safe("run_app_executable_tracked", payload).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let message = err
+                            .as_string()
+                            .unwrap_or_else(|| "Failed to launch executable.".to_string());
+                        toast.toast(&message, ToastVariant::Error, Some(3000));
+                        if !server_ip.trim().is_empty()
+                            && !server_port.trim().is_empty()
+                            && !token.trim().is_empty()
+                        {
+                            let status_url = build_http_url(
+                                server_ip.trim(),
+                                server_port.trim(),
+                                "social/status",
+                            );
+                            let body = serde_json::json!({ "status": "online" });
+                            let _ =
+                                send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
+                        }
+                        return;
+                    }
+                };
+                let run: RunAppResult = match serde_wasm_bindgen::from_value(result) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        toast.toast("Failed to read play session.", ToastVariant::Error, Some(3000));
+                        if !server_ip.trim().is_empty()
+                            && !server_port.trim().is_empty()
+                            && !token.trim().is_empty()
+                        {
+                            let status_url = build_http_url(
+                                server_ip.trim(),
+                                server_port.trim(),
+                                "social/status",
+                            );
+                            let body = serde_json::json!({ "status": "online" });
+                            let _ =
+                                send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
+                        }
+                        return;
+                    }
+                };
+                let seconds = run.duration_seconds as i64;
+                if seconds <= 0 {
+                    if !server_ip.trim().is_empty()
+                        && !server_port.trim().is_empty()
+                        && !token.trim().is_empty()
+                    {
+                        let status_url = build_http_url(
+                            server_ip.trim(),
+                            server_port.trim(),
+                            "social/status",
+                        );
+                        let body = serde_json::json!({ "status": "online" });
+                        let _ =
+                            send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
+                    }
+                    return;
+                }
+                if server_ip.trim().is_empty()
+                    || server_port.trim().is_empty()
+                    || token.trim().is_empty()
+                {
+                    return;
+                }
+                let url = build_http_url(
+                    server_ip.trim(),
+                    server_port.trim(),
+                    &format!("apps/{}/playtime", id),
+                );
+                let body = serde_json::json!({ "seconds": seconds });
+                if let Ok(resp) = send_json("POST", &url, Some(token.trim()), Some(body)).await {
+                    if resp.ok() {
+                        if let Ok(promise) = resp.json() {
+                            if let Ok(json) = JsFuture::from(promise).await {
+                                if let Ok(entry) =
+                                    serde_wasm_bindgen::from_value::<PlaytimeEntry>(json)
+                                {
+                                    let mut next = (*playtime).clone();
+                                    next.insert(entry.app_id.clone(), entry);
+                                    playtime.set(next);
+                                }
+                            }
+                        }
+                    } else {
+                        toast.toast("Playtime upload failed.", ToastVariant::Warning, Some(2500));
+                    }
+                }
+                let status_url = build_http_url(server_ip.trim(), server_port.trim(), "social/status");
+                let body = serde_json::json!({ "status": "online" });
+                let _ = send_json("POST", &status_url, Some(token.trim()), Some(body)).await;
             });
         })
     };
@@ -618,7 +819,7 @@ pub fn library_screen() -> Html {
                         onchange={on_sort_change}
                     >
                         <option value="downloaded">{ "Downloaded first" }</option>
-                        <option value="name">{ "Name (Aâ€“Z)" }</option>
+                        <option value="name">{ "Name (A-Z)" }</option>
                         <option value="size">{ "Size (largest)" }</option>
                     </select>
                 </div>
@@ -694,6 +895,10 @@ pub fn library_screen() -> Html {
                         let app_for_remove = app.clone();
                         let app_for_open = app.clone();
                         let app_for_run = app.clone();
+                        let playtime_label = (*playtime)
+                            .get(&app.id)
+                            .map(|entry| format_playtime(entry.total_seconds))
+                            .unwrap_or_else(|| "Not played yet".to_string());
                         let is_busy = (*downloads)
                             .values()
                             .any(|d| d.status == "downloading" || d.status == "paused");
@@ -753,7 +958,7 @@ pub fn library_screen() -> Html {
                                 html! {
                                     <Button
                                         class={Some("border border-accent/50 bg-accent/20 text-secondary hover:bg-accent/30".to_string())}
-                                        onclick={Callback::from(move |_| on_run_app.emit((app_for_run.id.clone(), app_for_run.executable.clone().unwrap_or_default())))}
+                                        onclick={Callback::from(move |_| on_run_app.emit((app_for_run.id.clone(), app_for_run.executable.clone().unwrap_or_default(), app_for_run.name.clone())))}
                                     >
                                         { "Run" }
                                     </Button>
@@ -826,6 +1031,9 @@ pub fn library_screen() -> Html {
                                     <span>{ format!("Version {}", if app.version.is_empty() { "â€”" } else { &app.version }) }</span>
                                     <span>{ format_size(app.archive_size) }</span>
                                 </div>
+                                <div class="mt-2 text-xs text-secondary/60">
+                                    { format!("Playtime: {}", playtime_label) }
+                                </div>
                                 <div class="mt-auto flex items-center justify-between">
                                     { action }
                                     if !progress.is_empty() || !status_label.is_empty() {
@@ -870,4 +1078,18 @@ fn format_size(size: i64) -> String {
     format!("{:.1} {}", value, unit)
 }
 
-
+fn format_playtime(total_seconds: i64) -> String {
+    if total_seconds <= 0 {
+        return "Not played yet".to_string();
+    }
+    let minutes = total_seconds / 60;
+    if minutes < 60 {
+        return format!("{}m", minutes);
+    }
+    let hours = minutes / 60;
+    let rem_minutes = minutes % 60;
+    if hours < 100 {
+        return format!("{}h {}m", hours, rem_minutes);
+    }
+    format!("{}h", hours)
+}

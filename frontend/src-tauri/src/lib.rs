@@ -720,6 +720,13 @@ struct RunAppExecutableRequest {
     executable: String,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RunAppResult {
+    duration_seconds: u64,
+    exit_code: Option<i32>,
+}
+
 fn resolve_executable(app_dir: &Path, executable: &str) -> Result<PathBuf, String> {
     if executable.trim().is_empty() {
         return Err("Missing executable path.".to_string());
@@ -761,6 +768,40 @@ fn run_app_executable(request: RunAppExecutableRequest) -> Result<(), String> {
     let exec_path = resolve_executable(&app_dir, &request.executable)?;
     open_path(exec_path, Option::<&str>::None)
         .map_err(|_| "Failed to launch executable.".to_string())
+}
+
+#[tauri::command]
+fn run_app_executable_tracked(request: RunAppExecutableRequest) -> Result<RunAppResult, String> {
+    let app_dir = PathBuf::from(request.dest_dir).join(&request.id);
+    if !app_dir.exists() {
+        return Err("App folder not found.".to_string());
+    }
+    let exec_path = resolve_executable(&app_dir, &request.executable)?;
+    let content_dir = app_dir.join("content");
+
+    let start = Instant::now();
+    let status = std::process::Command::new(&exec_path)
+        .current_dir(&content_dir)
+        .spawn()
+        .and_then(|mut child| child.wait());
+
+    let status = match status {
+        Ok(status) => status,
+        Err(_) => {
+            // Fall back to default OS handler (e.g., README.txt).
+            open_path(exec_path, Option::<&str>::None)
+                .map_err(|_| "Failed to launch executable.".to_string())?;
+            return Ok(RunAppResult {
+                duration_seconds: 0,
+                exit_code: None,
+            });
+        }
+    };
+
+    Ok(RunAppResult {
+        duration_seconds: start.elapsed().as_secs(),
+        exit_code: status.code(),
+    })
 }
 
 async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String> {
@@ -1053,6 +1094,7 @@ pub fn run() {
             list_installed_apps,
             open_app_folder,
             run_app_executable,
+            run_app_executable_tracked,
             upload_app
         ])
         .run(tauri::generate_context!())

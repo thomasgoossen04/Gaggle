@@ -4,4 +4,5 @@ pub mod dashboard;
 pub mod downloads;
 pub mod error;
 pub mod library;
+pub mod social;
 pub mod settings;

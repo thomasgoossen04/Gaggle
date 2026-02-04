@@ -17,6 +17,7 @@ import (
 )
 
 var chatHub *ChatHub
+var socialHub *SocialHub
 var httpServer *http.Server
 var shutdownOnce sync.Once
 
@@ -65,6 +66,8 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 	apps.Use(AuthMiddleware(store))
 	{
 		apps.GET("", listAppsHandler)
+		apps.GET("/playtime", store.getPlaytimeEp)
+		apps.POST("/:id/playtime", store.postPlaytimeEp)
 		apps.GET("/:id/config", getAppConfigHandler)
 		apps.GET("/:id/archive", getAppArchiveHandler)
 		apps.POST("/refresh", func(c *gin.Context) {
@@ -86,6 +89,10 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 	if cfg.ChatEnabled() {
 		chatHub = NewChatHub()
 	}
+	// Social presence (always on)
+	if socialHub == nil {
+		socialHub = NewSocialHub()
+	}
 	chat := router.Group("/chat")
 	chat.Use(ChatEnabledMiddleware(cfg))
 	{
@@ -100,6 +107,20 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 		chatAuth.GET("/messages", store.getChatMessagesEp)
 		chatAuth.POST("/messages", func(c *gin.Context) {
 			store.postChatMessageEp(c, chatHub)
+		})
+	}
+
+	socialWs := router.Group("/social")
+	{
+		socialWs.GET("/ws", func(c *gin.Context) {
+			store.socialWsEp(c, socialHub)
+		})
+	}
+	social := router.Group("/social")
+	social.Use(AuthMiddleware(store))
+	{
+		social.POST("/status", func(c *gin.Context) {
+			store.postSocialStatusEp(c, socialHub)
 		})
 	}
 

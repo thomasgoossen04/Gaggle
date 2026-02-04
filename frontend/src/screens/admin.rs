@@ -408,7 +408,7 @@ pub fn admin_screen() -> Html {
                             let event: Result<UploadStageEvent, _> = serde_wasm_bindgen::from_value(payload);
                             if let Ok(event) = event {
                                 if event.id == (*upload_current_id).clone() {
-                                    let stage = event.stage;
+                                    let stage = event.stage.clone();
                                     if stage == "uploading" {
                                         upload_progress.set(0.0);
                                     }
