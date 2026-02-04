@@ -31,12 +31,29 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 		auth.GET("/discord/callback", DiscordCallbackHandler(store))
 	}
 
+	// Feature flags
+	router.GET("/features", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"chat_enabled": cfg.Features.ChatEnabled,
+		})
+	})
+
 	// Protected user routes
 	users := router.Group("/users")
 	users.Use(AuthMiddleware(store))
 	{
 		users.GET("/me", MeHandler(store))
 		users.GET("/:id", store.getUserEp)
+	}
+
+	// Protected chat routes (optional)
+	if cfg.Features.ChatEnabled {
+		chat := router.Group("/chat")
+		chat.Use(AuthMiddleware(store))
+		{
+			chat.GET("/messages", store.getChatMessagesEp)
+			chat.POST("/messages", store.postChatMessageEp)
+		}
 	}
 
 	runServer(router, store, cfg)
@@ -84,4 +101,39 @@ func (s *Store) getUserEp(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, user)
+}
+
+func (s *Store) getChatMessagesEp(c *gin.Context) {
+	limit := 100
+	messages, err := s.ListChatMessages(limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "chat list failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"messages": messages})
+}
+
+func (s *Store) postChatMessageEp(c *gin.Context) {
+	userID := c.MustGet("user_id").(string)
+	user, err := s.GetUser(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})
+		return
+	}
+
+	var body struct {
+		Message string `json:"message"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Message == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid message"})
+		return
+	}
+
+	msg := NewChatMessage(user, body.Message)
+	if err := s.AddChatMessage(msg); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "chat insert failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, msg)
 }

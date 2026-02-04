@@ -11,6 +11,7 @@ type Config struct {
 	Port    int           `toml:"port"`
 	Mode    string        `toml:"mode"`
 	Discord DiscordConfig `toml:"discord"`
+	Features Features     `toml:"features"`
 }
 
 type DiscordConfig struct {
@@ -18,6 +19,10 @@ type DiscordConfig struct {
 	ClientSecret string   `toml:"client_secret"`
 	RedirectURI  string   `toml:"redirect_uri"`
 	Scopes       []string `toml:"scopes"`
+}
+
+type Features struct {
+	ChatEnabled bool `toml:"chat_enabled"`
 }
 
 func LoadConfig() (*Config, error) {

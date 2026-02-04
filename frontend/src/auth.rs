@@ -3,7 +3,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{window, Headers, Request, RequestInit, Response, UrlSearchParams};
 use yew::UseStateHandle;
 
-use crate::app::AppState;
+use crate::app::{AppState, User};
 
 pub const SERVER_IP_KEY: &str = "gaggle_server_ip";
 pub const SESSION_TOKEN_KEY: &str = "gaggle_session_token";
@@ -38,6 +38,7 @@ pub fn handle_logout(app_state: UseStateHandle<AppState>) {
         server_ip: get_local_storage_item(SERVER_IP_KEY),
         session_token: None,
         auth_error: None,
+        user: None,
     });
 }
 
@@ -105,14 +106,14 @@ pub fn remove_local_storage_item(key: &str) {
 
 pub async fn check_session(server_ip: &str, token: &str) -> Result<(), String> {
     let url = format!("http://{server_ip}:2121/users/me");
-    let mut opts = RequestInit::new();
-    opts.method("GET");
+    let opts = RequestInit::new();
+    opts.set_method("GET");
 
     let headers = Headers::new().map_err(|_| "Failed to create headers.".to_string())?;
     headers
         .set("Authorization", &format!("Bearer {token}"))
         .map_err(|_| "Failed to set auth header.".to_string())?;
-    opts.headers(&headers);
+    opts.set_headers(&headers);
 
     let request =
         Request::new_with_str_and_init(&url, &opts).map_err(|_| "Failed to build request.".to_string())?;
@@ -132,4 +133,44 @@ pub async fn check_session(server_ip: &str, token: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+pub async fn fetch_me(server_ip: &str, token: &str) -> Result<User, String> {
+	let url = format!("http://{server_ip}:2121/users/me");
+	let opts = RequestInit::new();
+	opts.set_method("GET");
+
+	let headers = Headers::new().map_err(|_| "Failed to create headers.".to_string())?;
+	headers
+		.set("Authorization", &format!("Bearer {token}"))
+		.map_err(|_| "Failed to set auth header.".to_string())?;
+	opts.set_headers(&headers);
+
+	let request = Request::new_with_str_and_init(&url, &opts)
+		.map_err(|_| "Failed to build request.".to_string())?;
+	let win = window().ok_or_else(|| "No window available.".to_string())?;
+	let resp_value = JsFuture::from(win.fetch_with_request(&request))
+		.await
+		.map_err(|_| format!("Cannot reach backend at {url}."))?;
+	let resp: Response = resp_value
+		.dyn_into()
+		.map_err(|_| "Invalid response type.".to_string())?;
+
+	if resp.status() == 401 {
+		return Err("Session expired. Please log in again.".to_string());
+	}
+	if !resp.ok() {
+		return Err(format!("Backend error (HTTP {}).", resp.status()));
+	}
+
+	let json = JsFuture::from(
+		resp.json()
+			.map_err(|_| "Failed to parse user JSON.".to_string())?,
+	)
+	.await
+	.map_err(|_| "Failed to parse user JSON.".to_string())?;
+	let user: User = serde_wasm_bindgen::from_value(json)
+		.map_err(|_| "Invalid user response.".to_string())?;
+
+	Ok(user)
 }

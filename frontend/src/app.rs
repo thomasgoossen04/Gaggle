@@ -7,9 +7,9 @@ use yew::prelude::*;
 use futures_util::stream::StreamExt;
 
 use crate::auth::{
-    check_session, clear_query_param, get_local_storage_item, get_query_param, handle_login,
-    handle_logout, remove_local_storage_item, set_local_storage_item, LOGIN_SUCCESS_KEY, SERVER_IP_KEY,
-    SESSION_TOKEN_KEY,
+    check_session, clear_query_param, fetch_me, get_local_storage_item, get_query_param,
+    handle_login, handle_logout, remove_local_storage_item, set_local_storage_item,
+    LOGIN_SUCCESS_KEY, SERVER_IP_KEY, SESSION_TOKEN_KEY,
 };
 use crate::components::{Button, Card};
 use crate::screens::dashboard::Dashboard;
@@ -28,6 +28,13 @@ pub struct AppState {
     pub server_ip: Option<String>,
     pub session_token: Option<String>,
     pub auth_error: Option<String>,
+    pub user: Option<User>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct User {
+    pub id: String,
+    pub username: String,
 }
 
 type AppStateHandle = UseStateHandle<AppState>;
@@ -39,6 +46,7 @@ pub fn app() -> Html {
         server_ip: None,
         session_token: None,
         auth_error: None,
+        user: None,
     });
 
     {
@@ -61,6 +69,7 @@ pub fn app() -> Html {
                         server_ip,
                         session_token: token,
                         auth_error: None,
+                        user: None,
                     });
                     if token_from_query.is_some() {
                         clear_query_param("token");
@@ -108,6 +117,7 @@ fn app_router() -> Html {
                 app_state.server_ip.clone(),
                 app_state.session_token.clone(),
                 app_state.auth_error.clone(),
+                app_state.user.clone(),
             ),
             move |_| {
                 if !app_state.logged_in
@@ -123,6 +133,22 @@ fn app_router() -> Html {
                 let app_state_interval = app_state.clone();
 
                 spawn_local(async move {
+                    if app_state_interval.user.is_none() {
+                        match fetch_me(&server_ip, &token).await {
+                            Ok(user) => {
+                                let mut next = (*app_state_interval).clone();
+                                next.user = Some(user);
+                                app_state_interval.set(next);
+                            }
+                            Err(message) => {
+                                let mut next = (*app_state_interval).clone();
+                                next.auth_error = Some(message);
+                                app_state_interval.set(next);
+                                return;
+                            }
+                        }
+                    }
+
                     if let Err(message) = check_session(&server_ip, &token).await {
                         let mut next = (*app_state_interval).clone();
                         next.auth_error = Some(message);

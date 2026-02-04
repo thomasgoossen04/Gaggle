@@ -5,6 +5,7 @@ use crate::components::Button;
 #[derive(Properties, PartialEq)]
 pub struct SettingsScreenProps {
     pub on_logout: Callback<MouseEvent>,
+    pub user: Option<crate::app::User>,
 }
 
 #[function_component(SettingsScreen)]
@@ -22,6 +23,16 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
                         <p class="mt-2 text-sm text-secondary/70">
                             { "Signed in with Discord." }
                         </p>
+                        if let Some(user) = props.user.clone() {
+                            <div class="mt-4 text-sm text-secondary/80">
+                                <p>{ format!("Username: {}", user.username) }</p>
+                                <p class="mt-1">{ format!("User ID: {}", user.id) }</p>
+                            </div>
+                        } else {
+                            <div class="mt-4 text-sm text-secondary/60">
+                                { "User info not loaded." }
+                            </div>
+                        }
                     </div>
                     <Button onclick={props.on_logout.clone()}>
                         { "Log out" }
