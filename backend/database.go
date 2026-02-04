@@ -9,6 +9,7 @@ import (
 type User struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
+	IsAdmin  bool   `json:"is_admin"`
 }
 
 type Store struct {
@@ -94,4 +95,19 @@ func (s *Store) ListUsers() ([]User, error) {
 	})
 
 	return users, err
+}
+
+func (s *Store) CountSessions() (int, error) {
+	count := 0
+	err := s.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		prefix := []byte("session:")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			count++
+		}
+		return nil
+	})
+	return count, err
 }

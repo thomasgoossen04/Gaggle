@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod chat;
 pub mod dashboard;
 pub mod error;

@@ -1,9 +1,8 @@
-use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{Headers, Request, RequestInit, Response};
 use yew::prelude::*;
 
 use crate::app::AppState;
+use crate::api::{get_json, send_json};
 
 #[function_component(ChatScreen)]
 pub fn chat_screen() -> Html {
@@ -11,6 +10,7 @@ pub fn chat_screen() -> Html {
         .expect("AppState context not found. Ensure ChatScreen is under <ContextProvider>.");
     let server_ip = app_state.server_ip.clone().unwrap_or_default();
     let token = app_state.session_token.clone().unwrap_or_default();
+    let is_admin = app_state.user.as_ref().map(|u| u.is_admin).unwrap_or(false);
 
     let messages = use_state(Vec::<ChatMessage>::new);
     let input = use_state(String::new);
@@ -25,38 +25,35 @@ pub fn chat_screen() -> Html {
         let loading = loading.clone();
         let server_ip = server_ip.clone();
         let token = token.clone();
-        use_effect_with(
-            (server_ip.clone(), token.clone()),
-            move |_| {
-                if server_ip.is_empty() || token.is_empty() {
-                    loading.set(false);
-                    return ();
-                }
+        use_effect_with((server_ip.clone(), token.clone()), move |_| {
+            if server_ip.is_empty() || token.is_empty() {
+                loading.set(false);
+                return ();
+            }
 
-                spawn_local(async move {
-                    let chat_enabled = match fetch_features(&server_ip).await {
-                        Ok(chat_enabled) => {
-                            enabled.set(chat_enabled);
-                            chat_enabled
-                        }
-                        Err(msg) => {
-                            error.set(Some(msg));
-                            loading.set(false);
-                            return;
-                        }
-                    };
-
-                    if chat_enabled {
-                        match fetch_messages(&server_ip, &token).await {
-                            Ok(msgs) => messages.set(msgs),
-                            Err(msg) => error.set(Some(msg)),
-                        }
+            spawn_local(async move {
+                let chat_enabled = match fetch_features(&server_ip).await {
+                    Ok(chat_enabled) => {
+                        enabled.set(chat_enabled);
+                        chat_enabled
                     }
-                    loading.set(false);
-                });
-                ()
-            },
-        );
+                    Err(msg) => {
+                        error.set(Some(msg));
+                        loading.set(false);
+                        return;
+                    }
+                };
+
+                if chat_enabled {
+                    match fetch_messages(&server_ip, &token).await {
+                        Ok(msgs) => messages.set(msgs),
+                        Err(msg) => error.set(Some(msg)),
+                    }
+                }
+                loading.set(false);
+            });
+            ()
+        });
     }
 
     let on_input = {
@@ -96,6 +93,29 @@ pub fn chat_screen() -> Html {
         })
     };
 
+    let on_delete = {
+        let messages = messages.clone();
+        let error = error.clone();
+        let server_ip = server_ip.clone();
+        let token = token.clone();
+        Callback::from(move |id: String| {
+            let messages = messages.clone();
+            let error = error.clone();
+            let server_ip = server_ip.clone();
+            let token = token.clone();
+            spawn_local(async move {
+                match delete_message(&server_ip, &token, &id).await {
+                    Ok(_) => {
+                        let mut next = (*messages).clone();
+                        next.retain(|msg| msg.id != id);
+                        messages.set(next);
+                    }
+                    Err(msg) => error.set(Some(msg)),
+                }
+            });
+        })
+    };
+
     let on_keydown = {
         let on_send = on_send.clone();
         Callback::from(move |event: KeyboardEvent| {
@@ -115,9 +135,6 @@ pub fn chat_screen() -> Html {
         <div class="flex h-full min-h-0 flex-col overflow-hidden">
             <div>
                 <h1 class="text-3xl font-semibold">{ "Chat" }</h1>
-                <p class="mt-2 text-base text-accent">
-                    { "Stay connected with your team." }
-                </p>
             </div>
             if *loading {
                 <div class="mt-6 rounded-2xl border border-ink/50 bg-inkLight p-6 text-base text-secondary/70">
@@ -141,11 +158,28 @@ pub fn chat_screen() -> Html {
                         <div class="h-full min-h-0 overflow-y-auto pr-2 scrollbar-thin">
                             <div class="flex flex-col gap-4">
                             { for messages.iter().map(|msg| {
+                                let on_delete = on_delete.clone();
+                                let msg_id = msg.id.clone();
+                                let on_delete_click = Callback::from(move |_| {
+                                    on_delete.emit(msg_id.clone())
+                                });
                                 html! {
                                     <div class="rounded-2xl border border-ink/60 bg-ink/30 p-4 shadow-lg">
-                                        <p class="text-xs uppercase tracking-wide text-accent/80">
-                                            { format!("{} · {}", msg.username, format_time(msg.timestamp)) }
-                                        </p>
+                                        <div class="flex items-start justify-between gap-3">
+                                            <p class="text-xs uppercase tracking-wide text-accent/80">
+                                                { format!("{} · {}", msg.username, format_time(msg.timestamp)) }
+                                            </p>
+                                            if is_admin {
+                                                <button
+                                                    class="text-rose-300/80 transition hover:text-rose-200"
+                                                    type="button"
+                                                    onclick={on_delete_click}
+                                                    title="Delete message"
+                                                >
+                                                    <TrashIcon />
+                                                </button>
+                                            }
+                                        </div>
                                         <p class="mt-2 text-base text-secondary/95">
                                             { msg.message.clone() }
                                         </p>
@@ -195,6 +229,20 @@ fn send_icon() -> Html {
     }
 }
 
+#[function_component(TrashIcon)]
+fn trash_icon() -> Html {
+    html! {
+        <svg
+            class="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true"
+        >
+            <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 6h2v9h-2V9Zm4 0h2v9h-2V9ZM7 9h2v9H7V9Z"/>
+        </svg>
+    }
+}
+
 #[derive(Clone, PartialEq, serde::Deserialize)]
 struct ChatMessage {
     pub id: String,
@@ -223,90 +271,41 @@ fn format_time(ts: i64) -> String {
 
 async fn fetch_features(server_ip: &str) -> Result<bool, String> {
     let url = format!("http://{server_ip}:2121/features");
-    let request = Request::new_with_str(&url).map_err(|_| "Failed to build request.".to_string())?;
-    let win = web_sys::window().ok_or_else(|| "No window available.".to_string())?;
-    let resp_value = wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&request))
-        .await
-        .map_err(|_| "Cannot reach backend for features.".to_string())?;
-    let resp: Response = resp_value
-        .dyn_into()
-        .map_err(|_| "Invalid response type.".to_string())?;
-    if !resp.ok() {
-        return Err(format!("Features error (HTTP {}).", resp.status()));
-    }
-    let json = wasm_bindgen_futures::JsFuture::from(
-        resp.json().map_err(|_| "Failed to parse features JSON.".to_string())?,
-    )
-    .await
-    .map_err(|_| "Failed to parse features JSON.".to_string())?;
-    let data: FeaturesResponse = serde_wasm_bindgen::from_value(json)
-        .map_err(|_| "Invalid features response.".to_string())?;
+    let data: FeaturesResponse = get_json(&url, None).await?;
     Ok(data.chat_enabled)
 }
 
 async fn fetch_messages(server_ip: &str, token: &str) -> Result<Vec<ChatMessage>, String> {
     let url = format!("http://{server_ip}:2121/chat/messages");
-    let opts = RequestInit::new();
-    opts.set_method("GET");
-    let headers = Headers::new().map_err(|_| "Failed to create headers.".to_string())?;
-    headers
-        .set("Authorization", &format!("Bearer {token}"))
-        .map_err(|_| "Failed to set auth header.".to_string())?;
-    opts.set_headers(&headers);
-    let request =
-        Request::new_with_str_and_init(&url, &opts).map_err(|_| "Failed to build request.".to_string())?;
-    let win = web_sys::window().ok_or_else(|| "No window available.".to_string())?;
-    let resp_value = wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&request))
-        .await
-        .map_err(|_| "Cannot reach backend for chat.".to_string())?;
-    let resp: Response = resp_value
-        .dyn_into()
-        .map_err(|_| "Invalid response type.".to_string())?;
-    if !resp.ok() {
-        return Err(format!("Chat error (HTTP {}).", resp.status()));
-    }
-    let json = wasm_bindgen_futures::JsFuture::from(
-        resp.json().map_err(|_| "Failed to parse chat JSON.".to_string())?,
-    )
-    .await
-    .map_err(|_| "Failed to parse chat JSON.".to_string())?;
-    let data: ChatListResponse = serde_wasm_bindgen::from_value(json)
-        .map_err(|_| "Invalid chat response.".to_string())?;
+    let data: ChatListResponse = get_json(&url, Some(token)).await?;
     Ok(data.messages)
 }
 
 async fn post_message(server_ip: &str, token: &str, message: &str) -> Result<ChatMessage, String> {
     let url = format!("http://{server_ip}:2121/chat/messages");
-    let opts = RequestInit::new();
-    opts.set_method("POST");
-    let headers = Headers::new().map_err(|_| "Failed to create headers.".to_string())?;
-    headers
-        .set("Authorization", &format!("Bearer {token}"))
-        .map_err(|_| "Failed to set auth header.".to_string())?;
-    headers
-        .set("Content-Type", "application/json")
-        .map_err(|_| "Failed to set content type.".to_string())?;
-    opts.set_headers(&headers);
     let body = serde_json::json!({ "message": message });
-    opts.set_body(&JsValue::from_str(&body.to_string()));
-    let request =
-        Request::new_with_str_and_init(&url, &opts).map_err(|_| "Failed to build request.".to_string())?;
-    let win = web_sys::window().ok_or_else(|| "No window available.".to_string())?;
-    let resp_value = wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&request))
-        .await
-        .map_err(|_| "Cannot reach backend for chat.".to_string())?;
-    let resp: Response = resp_value
-        .dyn_into()
-        .map_err(|_| "Invalid response type.".to_string())?;
+    let resp = send_json("POST", &url, Some(token), Some(body)).await?;
     if !resp.ok() {
         return Err(format!("Chat error (HTTP {}).", resp.status()));
     }
     let json = wasm_bindgen_futures::JsFuture::from(
-        resp.json().map_err(|_| "Failed to parse chat JSON.".to_string())?,
+        resp.json()
+            .map_err(|_| "Failed to parse chat JSON.".to_string())?,
     )
     .await
     .map_err(|_| "Failed to parse chat JSON.".to_string())?;
-    let data: ChatMessage = serde_wasm_bindgen::from_value(json)
-        .map_err(|_| "Invalid chat response.".to_string())?;
+    let data: ChatMessage =
+        serde_wasm_bindgen::from_value(json).map_err(|_| "Invalid chat response.".to_string())?;
+
     Ok(data)
+}
+
+async fn delete_message(server_ip: &str, token: &str, id: &str) -> Result<(), String> {
+    let url = format!("http://{server_ip}:2121/admin/chat/messages/{id}");
+    let resp = send_json("DELETE", &url, Some(token), None).await?;
+    if !resp.ok() {
+        return Err(format!("Delete error (HTTP {}).", resp.status()));
+    }
+
+    Ok(())
 }

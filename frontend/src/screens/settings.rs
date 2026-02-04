@@ -27,6 +27,7 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
                             <div class="mt-4 text-sm text-secondary/80">
                                 <p>{ format!("Username: {}", user.username) }</p>
                                 <p class="mt-1">{ format!("User ID: {}", user.id) }</p>
+                                <p class="mt-1">{ format!("Role: {}", if user.is_admin { "Admin" } else { "User" }) }</p>
                             </div>
                         } else {
                             <div class="mt-4 text-sm text-secondary/60">

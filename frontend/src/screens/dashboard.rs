@@ -2,8 +2,9 @@ use yew::prelude::*;
 
 use crate::app::AppState;
 use crate::auth::handle_logout;
-use crate::components::Button;
-use crate::screens::{chat::ChatScreen, library::LibraryScreen, settings::SettingsScreen};
+use crate::screens::{
+    admin::AdminScreen, chat::ChatScreen, library::LibraryScreen, settings::SettingsScreen,
+};
 use crate::toast::{use_toast, ToastVariant};
 
 type AppStateHandle = UseStateHandle<AppState>;
@@ -13,28 +14,18 @@ enum Tab {
     Library,
     Chat,
     Settings,
+    Admin,
 }
 
 #[function_component(Dashboard)]
 pub fn dashboard() -> Html {
     let app_state = use_context::<AppStateHandle>()
         .expect("AppState context not found. Ensure Dashboard is under <ContextProvider>.");
-    let toast = use_toast();
     let active_tab = use_state(|| Tab::Library);
 
     let on_logout = {
         let app_state = app_state.clone();
         Callback::from(move |_| handle_logout(app_state.clone()))
-    };
-    let on_test_toast = {
-        let toast = toast.clone();
-        Callback::from(move |_| {
-            toast.toast(
-                "Test toast: everything is wired.",
-                ToastVariant::Info,
-                Some(3000),
-            );
-        })
     };
 
     let tab_button = |label: &'static str, tab: Tab| {
@@ -59,7 +50,10 @@ pub fn dashboard() -> Html {
     let content = match *active_tab {
         Tab::Library => html! { <LibraryScreen /> },
         Tab::Chat => html! { <ChatScreen /> },
-        Tab::Settings => html! { <SettingsScreen on_logout={on_logout.clone()} user={app_state.user.clone()} /> },
+        Tab::Settings => {
+            html! { <SettingsScreen on_logout={on_logout.clone()} user={app_state.user.clone()} /> }
+        }
+        Tab::Admin => html! { <AdminScreen /> },
     };
 
     html! {
@@ -71,12 +65,10 @@ pub fn dashboard() -> Html {
                         { tab_button("Library", Tab::Library) }
                         { tab_button("Chat", Tab::Chat) }
                         { tab_button("Settings", Tab::Settings) }
+                        if app_state.user.as_ref().map(|u| u.is_admin).unwrap_or(false) {
+                            { tab_button("Admin", Tab::Admin) }
+                        }
                     </nav>
-                    <div class="mt-10">
-                        <Button onclick={on_test_toast}>
-                            { "Show test toast" }
-                        </Button>
-                    </div>
                 </aside>
                 <section class="flex-1 bg-ink/70 p-10 min-h-screen overflow-hidden">
                     <div class="h-full min-h-0 rounded-3xl border border-ink/40 bg-ink/40 p-8 shadow-2xl backdrop-blur flex flex-col">

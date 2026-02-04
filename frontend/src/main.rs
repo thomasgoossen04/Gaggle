@@ -1,4 +1,5 @@
 mod app;
+mod api;
 mod auth;
 mod components;
 mod screens;

@@ -35,6 +35,7 @@ pub struct AppState {
 pub struct User {
     pub id: String,
     pub username: String,
+    pub is_admin: bool,
 }
 
 type AppStateHandle = UseStateHandle<AppState>;

@@ -12,6 +12,7 @@ type Config struct {
 	Mode    string        `toml:"mode"`
 	Discord DiscordConfig `toml:"discord"`
 	Features Features     `toml:"features"`
+	Admins  []string      `toml:"admins"`
 }
 
 type DiscordConfig struct {

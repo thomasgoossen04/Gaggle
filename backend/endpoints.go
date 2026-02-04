@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/dgraph-io/badger"
 	"github.com/gin-gonic/gin"
 )
 
@@ -42,7 +43,7 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 	users := router.Group("/users")
 	users.Use(AuthMiddleware(store))
 	{
-		users.GET("/me", MeHandler(store))
+		users.GET("/me", MeHandler(store, cfg))
 		users.GET("/:id", store.getUserEp)
 	}
 
@@ -54,6 +55,15 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 			chat.GET("/messages", store.getChatMessagesEp)
 			chat.POST("/messages", store.postChatMessageEp)
 		}
+	}
+
+	// Admin routes
+	admin := router.Group("/admin")
+	admin.Use(AuthMiddleware(store), AdminMiddleware(cfg))
+	{
+		admin.GET("/stats", store.getAdminStatsEp)
+		admin.DELETE("/chat/messages", store.clearChatMessagesEp)
+		admin.DELETE("/chat/messages/:id", store.deleteChatMessageEp)
 	}
 
 	runServer(router, store, cfg)
@@ -136,4 +146,42 @@ func (s *Store) postChatMessageEp(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, msg)
+}
+
+func (s *Store) getAdminStatsEp(c *gin.Context) {
+	sessions, err := s.CountSessions()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "session count failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"sessions": sessions,
+	})
+}
+
+func (s *Store) clearChatMessagesEp(c *gin.Context) {
+	deleted, err := s.ClearChatMessages()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "chat clear failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": deleted})
+}
+
+func (s *Store) deleteChatMessageEp(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing id"})
+		return
+	}
+	if err := s.DeleteChatMessage(id); err != nil {
+		if err == badger.ErrKeyNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }

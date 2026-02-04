@@ -127,7 +127,7 @@ func AuthMiddleware(store *Store) gin.HandlerFunc {
 	}
 }
 
-func MeHandler(store *Store) gin.HandlerFunc {
+func MeHandler(store *Store, cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 
 		userID := c.MustGet("user_id").(string)
@@ -138,7 +138,29 @@ func MeHandler(store *Store) gin.HandlerFunc {
 			return
 		}
 
+		user.IsAdmin = isAdmin(cfg, user.ID)
 		c.JSON(200, user)
+	}
+}
+
+func isAdmin(cfg *Config, userID string) bool {
+	for _, id := range cfg.Admins {
+		if id == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func AdminMiddleware(cfg *Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID := c.MustGet("user_id").(string)
+		if !isAdmin(cfg, userID) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "admin access required"})
+			c.Abort()
+			return
+		}
+		c.Next()
 	}
 }
 

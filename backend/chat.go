@@ -84,3 +84,45 @@ func NewChatMessage(user *User, content string) ChatMessage {
 		Timestamp: time.Now().UnixMilli(),
 	}
 }
+
+func (s *Store) DeleteChatMessage(id string) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		prefix := []byte("chat:")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			var msg ChatMessage
+			err := item.Value(func(v []byte) error {
+				return json.Unmarshal(v, &msg)
+			})
+			if err != nil {
+				return err
+			}
+			if msg.ID == id {
+				return txn.Delete(item.KeyCopy(nil))
+			}
+		}
+		return badger.ErrKeyNotFound
+	})
+}
+
+func (s *Store) ClearChatMessages() (int, error) {
+	deleted := 0
+	err := s.db.Update(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		prefix := []byte("chat:")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			key := it.Item().KeyCopy(nil)
+			if err := txn.Delete(key); err != nil {
+				return err
+			}
+			deleted++
+		}
+		return nil
+	})
+	return deleted, err
+}
