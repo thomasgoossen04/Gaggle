@@ -91,11 +91,3 @@ pub fn build_ws_url(server_ip: &str, _server_port: &str, path: &str) -> String {
     // 3. Bare hostname → wss, ignore server_port
     format!("wss://{}/{}", server_ip, path)
 }
-
-fn normalize_base_url(input: &str) -> Option<String> {
-    let trimmed = input.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return Some(trimmed.trim_end_matches('/').to_string());
-    }
-    None
-}
