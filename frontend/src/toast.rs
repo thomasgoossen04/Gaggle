@@ -5,6 +5,7 @@ use yew::prelude::*;
 
 #[derive(Clone, PartialEq)]
 pub enum ToastVariant {
+    #[allow(dead_code)]
     Info,
     Success,
     Warning,

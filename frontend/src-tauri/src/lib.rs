@@ -11,15 +11,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use reqwest::header::RANGE;
 use reqwest::multipart::{Form, Part};
-use reqwest::Body;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::open_path;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
-use tokio_util::io::ReaderStream;
 
 pub mod net;
 
@@ -36,6 +34,7 @@ struct RunManager {
 
 struct RunningProcess {
     child: Arc<StdMutex<std::process::Child>>,
+    #[allow(dead_code)]
     start: Instant,
 }
 
@@ -757,13 +756,6 @@ struct RunStartResult {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct RunAppResult {
-    duration_seconds: u64,
-    exit_code: Option<i32>,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct RunEvent {
     id: String,
     status: String,
@@ -832,7 +824,7 @@ async fn run_app_executable_tracked(
     }
 
     let exec_path_for_fallback = exec_path.clone();
-    let mut child = match std::process::Command::new(&exec_path)
+    let child = match std::process::Command::new(&exec_path)
         .current_dir(&content_dir)
         .spawn()
     {

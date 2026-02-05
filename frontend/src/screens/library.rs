@@ -76,6 +76,7 @@ struct RunEvent {
     status: String,
     duration_seconds: u64,
     #[serde(default)]
+    #[allow(dead_code)]
     exit_code: Option<i32>,
 }
 
@@ -467,89 +468,86 @@ pub fn library_screen() -> Html {
             let listen = listen.unwrap();
             let listen_fn: Function = listen.dyn_into().unwrap();
 
-            let callback =
-                Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
-                    let payload = Reflect::get(&value, &JsValue::from_str("payload"))
-                        .unwrap_or(JsValue::NULL);
-                    let event: Result<RunEvent, _> = serde_wasm_bindgen::from_value(payload);
-                    if let Ok(event) = event {
-                        if event.status == "started" {
-                            let mut next = (*running).clone();
-                            next.insert(event.id.clone());
-                            running.set(next);
-                            return;
-                        }
-                        if event.status != "stopped" {
-                            return;
-                        }
+            let callback = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
+                let payload =
+                    Reflect::get(&value, &JsValue::from_str("payload")).unwrap_or(JsValue::NULL);
+                let event: Result<RunEvent, _> = serde_wasm_bindgen::from_value(payload);
+                if let Ok(event) = event {
+                    if event.status == "started" {
                         let mut next = (*running).clone();
-                        next.remove(&event.id);
+                        next.insert(event.id.clone());
                         running.set(next);
+                        return;
+                    }
+                    if event.status != "stopped" {
+                        return;
+                    }
+                    let mut next = (*running).clone();
+                    next.remove(&event.id);
+                    running.set(next);
 
-                        let server_ip = server_ip.clone();
-                        let server_port = server_port.clone();
-                        let token = token.clone();
-                        let playtime = playtime.clone();
-                        let toast = toast.clone();
-                        let id = event.id.clone();
-                        let duration = event.duration_seconds as i64;
-                        spawn_local(async move {
-                            if !server_ip.trim().is_empty()
-                                && !server_port.trim().is_empty()
-                                && !token.trim().is_empty()
-                            {
-                                let status_url = build_http_url(
-                                    server_ip.trim(),
-                                    server_port.trim(),
-                                    "social/status",
-                                );
-                                let body = serde_json::json!({ "status": "online" });
-                                let _ =
-                                    send_json("POST", &status_url, Some(token.trim()), Some(body))
-                                        .await;
-                            }
-                            if duration <= 0 {
-                                return;
-                            }
-                            if server_ip.trim().is_empty()
-                                || server_port.trim().is_empty()
-                                || token.trim().is_empty()
-                            {
-                                return;
-                            }
-                            let url = build_http_url(
+                    let server_ip = server_ip.clone();
+                    let server_port = server_port.clone();
+                    let token = token.clone();
+                    let playtime = playtime.clone();
+                    let toast = toast.clone();
+                    let id = event.id.clone();
+                    let duration = event.duration_seconds as i64;
+                    spawn_local(async move {
+                        if !server_ip.trim().is_empty()
+                            && !server_port.trim().is_empty()
+                            && !token.trim().is_empty()
+                        {
+                            let status_url = build_http_url(
                                 server_ip.trim(),
                                 server_port.trim(),
-                                &format!("apps/{}/playtime", id),
+                                "social/status",
                             );
-                            let body = serde_json::json!({ "seconds": duration });
-                            if let Ok(resp) = send_json("POST", &url, Some(token.trim()), Some(body)).await
-                            {
-                                if resp.ok() {
-                                    if let Ok(promise) = resp.json() {
-                                        if let Ok(json) = JsFuture::from(promise).await {
-                                            if let Ok(entry) =
-                                                serde_wasm_bindgen::from_value::<PlaytimeEntry>(
-                                                    json,
-                                                )
-                                            {
-                                                let mut next = (*playtime).clone();
-                                                next.insert(entry.app_id.clone(), entry);
-                                                playtime.set(next);
-                                            }
+                            let body = serde_json::json!({ "status": "online" });
+                            let _ = send_json("POST", &status_url, Some(token.trim()), Some(body))
+                                .await;
+                        }
+                        if duration <= 0 {
+                            return;
+                        }
+                        if server_ip.trim().is_empty()
+                            || server_port.trim().is_empty()
+                            || token.trim().is_empty()
+                        {
+                            return;
+                        }
+                        let url = build_http_url(
+                            server_ip.trim(),
+                            server_port.trim(),
+                            &format!("apps/{}/playtime", id),
+                        );
+                        let body = serde_json::json!({ "seconds": duration });
+                        if let Ok(resp) =
+                            send_json("POST", &url, Some(token.trim()), Some(body)).await
+                        {
+                            if resp.ok() {
+                                if let Ok(promise) = resp.json() {
+                                    if let Ok(json) = JsFuture::from(promise).await {
+                                        if let Ok(entry) =
+                                            serde_wasm_bindgen::from_value::<PlaytimeEntry>(json)
+                                        {
+                                            let mut next = (*playtime).clone();
+                                            next.insert(entry.app_id.clone(), entry);
+                                            playtime.set(next);
                                         }
                                     }
-                                } else {
-                                    toast.toast(
-                                        "Playtime upload failed.",
-                                        ToastVariant::Warning,
-                                        Some(2500),
-                                    );
                                 }
+                            } else {
+                                toast.toast(
+                                    "Playtime upload failed.",
+                                    ToastVariant::Warning,
+                                    Some(2500),
+                                );
                             }
-                        });
-                    }
-                }));
+                        }
+                    });
+                }
+            }));
 
             let _ = listen_fn.call2(
                 &event,

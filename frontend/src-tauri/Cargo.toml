@@ -1,6 +1,6 @@
 [package]
-name = "frontend"
-version = "0.1.0"
+name = "gaggle_frontend_tauri"
+version = "1.0.0"
 description = "A Tauri App"
 authors = ["Thomas Goossen"]
 edition = "2021"
