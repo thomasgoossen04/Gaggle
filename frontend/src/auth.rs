@@ -64,8 +64,7 @@ pub fn handle_logout(app_state: UseStateHandle<AppState>) {
     app_state.set(AppState {
         logged_in: false,
         server_ip: get_local_storage_item(SERVER_IP_KEY),
-        server_port: get_local_storage_item(SERVER_PORT_KEY)
-            .or_else(|| Some("2121".to_string())),
+        server_port: get_local_storage_item(SERVER_PORT_KEY).or_else(|| Some("2121".to_string())),
         session_token: None,
         auth_error: None,
         user: None,
@@ -149,20 +148,10 @@ fn normalize_server_input(input: &str) -> Result<(String, String), String> {
         return Ok((base, port_hint));
     }
 
-    let default_port = "2121".to_string();
-    let base = if trimmed.contains(':') {
-        format!("http://{trimmed}")
-    } else {
-        format!("http://{trimmed}:{default_port}")
-    };
-    Ok((base, default_port))
+    Ok((trimmed.to_string(), "2121".to_string()))
 }
 
-pub async fn check_session(
-    server_ip: &str,
-    server_port: &str,
-    token: &str,
-) -> Result<(), String> {
+pub async fn check_session(server_ip: &str, server_port: &str, token: &str) -> Result<(), String> {
     let url = build_http_url(server_ip, server_port, "users/me");
     let resp = send_request("GET", &url, Some(token), None).await?;
     if resp.status() == 401 {

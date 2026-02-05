@@ -89,7 +89,7 @@ func listApps() ([]AppInfo, error) {
 		return nil, err
 	}
 
-	var apps []AppInfo
+	apps := []AppInfo{}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".toml") {
 			continue
