@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"strings"
 	"time"
 
@@ -14,6 +15,9 @@ import (
 )
 
 var discordOAuthConfig *oauth2.Config
+var loginChallenges = newLoginChallengeStore()
+
+const loginChallengeTTL = 10 * time.Minute
 
 func InitDiscordOAuth(cfg *Config) {
 	discordOAuthConfig = &oauth2.Config{
@@ -28,16 +32,27 @@ func InitDiscordOAuth(cfg *Config) {
 	}
 }
 
-func DiscordLoginHandler(c *gin.Context) {
-	redirect := c.Query("redirect")
-	if redirect == "" {
-		c.JSON(400, gin.H{"error": "missing redirect"})
-		return
-	}
+func DiscordLoginHandler(cfg *Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		redirect := c.Query("redirect")
+		if redirect == "" {
+			c.JSON(400, gin.H{"error": "missing redirect"})
+			return
+		}
 
-	state := uuid.NewString() + "|" + redirect
-	url := discordOAuthConfig.AuthCodeURL(state)
-	c.Redirect(http.StatusTemporaryRedirect, url)
+		if cfg.LoginPasswordRequired() {
+			password := c.Query("password")
+			if password == "" || password != cfg.LoginPassword() {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid access password"})
+				return
+			}
+		}
+
+		nonce := loginChallenges.Create(loginChallengeTTL)
+		state := nonce + "|" + redirect
+		url := discordOAuthConfig.AuthCodeURL(state)
+		c.Redirect(http.StatusTemporaryRedirect, url)
+	}
 }
 
 func DiscordCallbackHandler(store *Store, cfg *Config) gin.HandlerFunc {
@@ -57,8 +72,12 @@ func DiscordCallbackHandler(store *Store, cfg *Config) gin.HandlerFunc {
 			c.JSON(400, gin.H{"error": "invalid state"})
 			return
 		}
-
+		nonce := parts[0]
 		redirect := parts[1]
+		if !loginChallenges.Consume(nonce) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid login request"})
+			return
+		}
 
 		token, err := discordOAuthConfig.Exchange(context.Background(), code)
 		if err != nil {
@@ -245,4 +264,51 @@ func (s *Store) DeleteSession(token string) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete([]byte("session:" + token))
 	})
+}
+
+type loginChallengeStore struct {
+	mu    sync.Mutex
+	items map[string]time.Time
+}
+
+func newLoginChallengeStore() *loginChallengeStore {
+	return &loginChallengeStore{
+		items: make(map[string]time.Time),
+	}
+}
+
+func (s *loginChallengeStore) Create(ttl time.Duration) string {
+	nonce := uuid.NewString()
+	expiry := time.Now().Add(ttl)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked()
+	s.items[nonce] = expiry
+	return nonce
+}
+
+func (s *loginChallengeStore) Consume(nonce string) bool {
+	if nonce == "" {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiry, ok := s.items[nonce]
+	if !ok {
+		s.cleanupLocked()
+		return false
+	}
+	delete(s.items, nonce)
+	s.cleanupLocked()
+	return expiry.After(now)
+}
+
+func (s *loginChallengeStore) cleanupLocked() {
+	now := time.Now()
+	for key, expiry := range s.items {
+		if !expiry.After(now) {
+			delete(s.items, key)
+		}
+	}
 }

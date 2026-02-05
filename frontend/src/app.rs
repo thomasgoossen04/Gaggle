@@ -321,9 +321,10 @@ fn app_router() -> Html {
 #[function_component(LoginScreen)]
 fn login_screen() -> Html {
     let server_ip = use_state(|| get_local_storage_item(SERVER_IP_KEY).unwrap_or_default());
-    let server_port =
-        use_state(|| get_local_storage_item(SERVER_PORT_KEY).unwrap_or_else(|| "2121".to_string()));
+    let password = use_state(String::new);
+    let password_required = use_state(|| false);
     let toast = use_toast();
+    let feature_req_id = use_mut_ref(|| 0u64);
     let on_ip_input = {
         let server_ip = server_ip.clone();
         Callback::from(move |event: InputEvent| {
@@ -332,43 +333,96 @@ fn login_screen() -> Html {
             console::log_1(&"login: ip input changed".into());
         })
     };
-    let on_port_input = {
-        let server_port = server_port.clone();
-        Callback::from(move |event: InputEvent| {
-            let input: HtmlInputElement = event.target_unchecked_into();
-            server_port.set(input.value());
-            console::log_1(&"login: port input changed".into());
-        })
-    };
+
+    {
+        let server_ip = server_ip.clone();
+        let password_required = password_required.clone();
+        let feature_req_id = feature_req_id.clone();
+        use_effect_with(server_ip.clone(), move |server_ip| {
+            let server_ip = server_ip.clone();
+            if server_ip.trim().is_empty() {
+                password_required.set(false);
+                return ();
+            }
+            *feature_req_id.borrow_mut() += 1;
+            let req_id = *feature_req_id.borrow();
+            spawn_local(async move {
+                let features_url = build_http_url(&server_ip, "2121", "features");
+                let mut requires_password = false;
+                if let Ok(resp) = send_request("GET", &features_url, None, None).await {
+                    if resp.ok() {
+                        if let Ok(json) = resp.json() {
+                            if let Ok(value) = wasm_bindgen_futures::JsFuture::from(json).await {
+                                if let Ok(features) =
+                                    serde_wasm_bindgen::from_value::<serde_json::Value>(value)
+                                {
+                                    requires_password = features
+                                        .get("login_password_required")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                }
+                            }
+                        }
+                    }
+                }
+                if *feature_req_id.borrow() == req_id {
+                    password_required.set(requires_password);
+                }
+            });
+            ()
+        });
+    }
     let on_login_click = {
         let server_ip = server_ip.clone();
-        let server_port = server_port.clone();
+        let password = password.clone();
+        let password_required = password_required.clone();
         let toast = toast.clone();
         Callback::from(move |_| {
             let ip = server_ip.as_str().trim().to_string();
-            let port = server_port.as_str().trim().to_string();
             if ip.is_empty() {
                 toast.toast(
-                    "Please enter your server IP before logging in.",
+                    "Please enter your server URL before logging in.",
                     ToastVariant::Warning,
                     Some(3000),
                 );
                 return;
             }
-            if port.is_empty() {
-                toast.toast(
-                    "Please enter your server port before logging in.",
-                    ToastVariant::Warning,
-                    Some(3000),
-                );
-                return;
-            }
+            let password_value = password.as_str().trim().to_string();
 
             let toast = toast.clone();
+            let password_required = password_required.clone();
             spawn_local(async move {
-                let ping_url = build_http_url(&ip, &port, "ping");
+                let features_url = build_http_url(&ip, "2121", "features");
+                let mut requires_password = false;
+                if let Ok(resp) = send_request("GET", &features_url, None, None).await {
+                    if resp.ok() {
+                        if let Ok(json) = resp.json() {
+                            if let Ok(value) = wasm_bindgen_futures::JsFuture::from(json).await {
+                                if let Ok(features) =
+                                    serde_wasm_bindgen::from_value::<serde_json::Value>(value)
+                                {
+                                    requires_password = features
+                                        .get("login_password_required")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                }
+                            }
+                        }
+                    }
+                }
+                password_required.set(requires_password);
+                if requires_password && password_value.is_empty() {
+                    toast.toast(
+                        "This server requires a login password.",
+                        ToastVariant::Warning,
+                        Some(3000),
+                    );
+                    return;
+                }
+
+                let ping_url = build_http_url(&ip, "2121", "ping");
                 match send_request("GET", &ping_url, None, None).await {
-                    Ok(resp) if resp.ok() => handle_login(&ip, &port),
+                    Ok(resp) if resp.ok() => handle_login(&ip, Some(&password_value)),
                     Ok(resp) => {
                         toast.toast(
                             &format!("Backend error (HTTP {}).", resp.status()),
@@ -387,6 +441,13 @@ fn login_screen() -> Html {
             });
         })
     };
+    let on_password_input = {
+        let password = password.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            password.set(input.value());
+        })
+    };
 
     html! {
         <main class="min-h-screen text-secondary flex items-center justify-center">
@@ -395,28 +456,34 @@ fn login_screen() -> Html {
                     { "Gaggle launcher" }
                 </h1>
                 <p class="mt-2 text-sm text-accent">
-                    { "Enter your server IP to continue." }
+                    { "Enter your server URL to continue." }
                 </p>
-                <div class="mt-6 flex items-center justify-between text-xs uppercase tracking-wide text-accent/80">
-                    <span>{ "Server IP" }</span>
-                    <span class="w-28 text-left">{ "Port" }</span>
+                <div class="mt-6 text-xs uppercase tracking-wide text-accent/80">
+                    { "Server URL" }
                 </div>
-                <div class="mt-2 flex gap-3">
+                <div class="mt-2">
                     <input
                         class="w-full rounded border border-ink/50 bg-ink/50 px-3 py-2 text-secondary placeholder:text-secondary/60 outline outline-1 outline-accent/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
                         type="text"
-                        placeholder="192.168.1.10"
+                        placeholder="https://gaggle.example.com"
                         value={(*server_ip).clone()}
                         oninput={on_ip_input}
                     />
-                    <input
-                        class="w-28 rounded border border-ink/50 bg-ink/50 px-3 py-2 text-secondary placeholder:text-secondary/60 outline outline-1 outline-accent/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
-                        type="text"
-                        placeholder="2121"
-                        value={(*server_port).clone()}
-                        oninput={on_port_input}
-                    />
                 </div>
+                if *password_required {
+                    <div class="mt-4 text-xs uppercase tracking-wide text-accent/80">
+                        { "Access Password" }
+                    </div>
+                    <div class="mt-2">
+                        <input
+                            class="w-full rounded border border-ink/50 bg-ink/50 px-3 py-2 text-secondary placeholder:text-secondary/60 outline outline-1 outline-accent/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                            type="password"
+                            placeholder="Enter server access password"
+                            value={(*password).clone()}
+                            oninput={on_password_input}
+                        />
+                    </div>
+                }
                 <Button
                     class={Some("mt-6 relative z-10".to_string())}
                     onclick={on_login_click}

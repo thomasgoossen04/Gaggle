@@ -1036,7 +1036,7 @@ pub fn library_screen() -> Html {
                                 <p class="mt-4 text-lg font-semibold">{ app.name.clone() }</p>
                                 <p class="mt-2 text-sm text-secondary/70">{ app.description.clone() }</p>
                                 <div class="mt-4 flex items-center justify-between text-xs text-secondary/60">
-                                    <span>{ format!("Version {}", if app.version.is_empty() { "â€”" } else { &app.version }) }</span>
+                                    <span>{ format!("Version {}", if app.version.is_empty() { "-" } else { &app.version }) }</span>
                                     <span>{ format_size(app.archive_size) }</span>
                                 </div>
                                 <div class="mt-2 text-xs text-secondary/60">
@@ -1070,7 +1070,7 @@ pub fn library_screen() -> Html {
 
 fn format_size(size: i64) -> String {
     if size <= 0 {
-        return "â€”".to_string();
+        return "-".to_string();
     }
     let size = size as f64;
     let units = ["B", "KB", "MB", "GB"];

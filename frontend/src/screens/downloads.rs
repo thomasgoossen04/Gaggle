@@ -382,7 +382,7 @@ pub fn downloads_screen() -> Html {
 
 fn format_size(size: i64) -> String {
     if size <= 0 {
-        return "â€”".to_string();
+        return "-".to_string();
     }
     let size = size as f64;
     let units = ["B", "KB", "MB", "GB"];
@@ -400,7 +400,7 @@ fn format_size(size: i64) -> String {
 
 fn format_duration(seconds: f64) -> String {
     if !seconds.is_finite() || seconds <= 0.0 {
-        return "â€”".to_string();
+        return "-".to_string();
     }
     let total = seconds.round() as i64;
     let hrs = total / 3600;

@@ -15,6 +15,7 @@ type Config struct {
 	Mode    string        `toml:"mode" json:"mode"`
 	Discord DiscordConfig `toml:"discord" json:"discord"`
 	Features Features     `toml:"features" json:"features"`
+	Access  AccessConfig  `toml:"access" json:"access"`
 	Admins  []string      `toml:"admins" json:"admins"`
 	Session SessionConfig `toml:"session" json:"session"`
 	Theme   *ThemeConfig  `toml:"theme" json:"theme"`
@@ -30,6 +31,10 @@ type DiscordConfig struct {
 
 type Features struct {
 	ChatEnabled bool `toml:"chat_enabled" json:"chat_enabled"`
+}
+
+type AccessConfig struct {
+	Password string `toml:"password" json:"password"`
 }
 
 type SessionConfig struct {
@@ -78,6 +83,7 @@ func (c *Config) Reload() error {
 	c.Mode = next.Mode
 	c.Discord = next.Discord
 	c.Features = next.Features
+	c.Access = next.Access
 	c.Admins = next.Admins
 	c.Session = next.Session
 	c.Theme = next.Theme
@@ -102,6 +108,7 @@ func (c *Config) Snapshot() Config {
 		Mode:     c.Mode,
 		Discord:  discord,
 		Features: c.Features,
+		Access:   AccessConfig{},
 		Admins:   admins,
 		Session:  c.Session,
 		Theme:    themeCopy,
@@ -157,6 +164,18 @@ func (c *Config) ChatEnabled() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Features.ChatEnabled
+}
+
+func (c *Config) LoginPasswordRequired() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Access.Password != ""
+}
+
+func (c *Config) LoginPassword() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Access.Password
 }
 
 func (c *Config) SessionTTL() time.Duration {

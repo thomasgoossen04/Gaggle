@@ -14,25 +14,33 @@ pub const SESSION_TOKEN_KEY: &str = "gaggle_session_token";
 pub const LOGIN_SUCCESS_KEY: &str = "gaggle_login_success";
 pub const INSTALL_DIR_KEY: &str = "gaggle_install_dir";
 
-pub fn handle_login(server_ip: &str, server_port: &str) {
-    let server_ip = server_ip.trim();
-    let server_port = server_port.trim();
-    if server_ip.is_empty() || server_port.is_empty() {
-        return;
-    }
+pub fn handle_login(server_input: &str, password: Option<&str>) {
+    let (server_base, port_hint) = match normalize_server_input(server_input) {
+        Ok(result) => result,
+        Err(_) => return,
+    };
 
-    set_local_storage_item(SERVER_IP_KEY, server_ip);
-    set_local_storage_item(SERVER_PORT_KEY, server_port);
+    set_local_storage_item(SERVER_IP_KEY, &server_base);
+    set_local_storage_item(SERVER_PORT_KEY, &port_hint);
 
     let redirect = current_app_url();
     let redirect = js_sys::encode_uri_component(&redirect)
         .as_string()
         .unwrap_or_default();
-    let login_url = build_http_url(
-        server_ip,
-        server_port,
+    let mut login_url = build_http_url(
+        &server_base,
+        &port_hint,
         &format!("auth/discord/login?redirect={redirect}"),
     );
+    if let Some(password) = password {
+        let password = password.trim();
+        if !password.is_empty() {
+            let encoded = js_sys::encode_uri_component(password)
+                .as_string()
+                .unwrap_or_default();
+            login_url = format!("{login_url}&password={encoded}");
+        }
+    }
 
     if let Some(win) = window() {
         if win.location().set_href(&login_url).is_ok() {
@@ -124,6 +132,30 @@ pub fn remove_local_storage_item(key: &str) {
     if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item(key);
     }
+}
+
+fn normalize_server_input(input: &str) -> Result<(String, String), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("missing server address".to_string());
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let base = trimmed.trim_end_matches('/').to_string();
+        let port_hint = if trimmed.starts_with("https://") {
+            "443".to_string()
+        } else {
+            "80".to_string()
+        };
+        return Ok((base, port_hint));
+    }
+
+    let default_port = "2121".to_string();
+    let base = if trimmed.contains(':') {
+        format!("http://{trimmed}")
+    } else {
+        format!("http://{trimmed}:{default_port}")
+    };
+    Ok((base, default_port))
 }
 
 pub async fn check_session(

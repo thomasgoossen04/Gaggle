@@ -39,7 +39,7 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 	// OAuth routes
 	auth := router.Group("/auth")
 	{
-		auth.GET("/discord/login", DiscordLoginHandler)
+		auth.GET("/discord/login", DiscordLoginHandler(cfg))
 		auth.GET("/discord/callback", DiscordCallbackHandler(store, cfg))
 		auth.POST("/logout", LogoutHandler(store))
 	}
@@ -47,7 +47,8 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 	// Feature flags
 	router.GET("/features", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"chat_enabled": cfg.ChatEnabled(),
+			"chat_enabled":            cfg.ChatEnabled(),
+			"login_password_required": cfg.LoginPasswordRequired(),
 		})
 	})
 
@@ -129,6 +130,7 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 	admin.Use(AuthMiddleware(store), AdminMiddleware(cfg))
 	{
 		admin.GET("/stats", store.getAdminStatsEp)
+		admin.DELETE("/sessions", store.clearSessionsEp)
 		admin.DELETE("/chat/messages", store.clearChatMessagesEp)
 		admin.DELETE("/chat/messages/:id", store.deleteChatMessageEp)
 		admin.GET("/config", func(c *gin.Context) {
@@ -394,6 +396,15 @@ func (s *Store) getAdminStatsEp(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"sessions": sessions,
 	})
+}
+
+func (s *Store) clearSessionsEp(c *gin.Context) {
+	removed, err := s.ClearSessions()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "session clear failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": removed})
 }
 
 func (s *Store) clearChatMessagesEp(c *gin.Context) {

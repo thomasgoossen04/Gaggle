@@ -1,4 +1,4 @@
-use wasm_bindgen_futures::spawn_local;
+﻿use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
@@ -59,6 +59,7 @@ pub fn admin_screen() -> Html {
     let error = use_state(|| None::<String>);
     let loading = use_state(|| true);
     let clearing = use_state(|| false);
+    let clearing_sessions = use_state(|| false);
     let confirm = use_confirm();
     let toast = use_toast();
     let reloading = use_state(|| false);
@@ -153,6 +154,72 @@ pub fn admin_screen() -> Html {
                         }
                         clearing.set(false);
                     });
+                }),
+            });
+        })
+    };
+
+    let on_clear_sessions = {
+        let clearing_sessions = clearing_sessions.clone();
+        let server_ip = server_ip.clone();
+        let server_port = server_port.clone();
+        let token = token.clone();
+        let toast = toast.clone();
+        let sessions = sessions.clone();
+        let confirm = confirm.clone();
+
+        Callback::from(move |_| {
+            if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
+                toast.toast(
+                    "Missing server address or token.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
+                return;
+            }
+
+            let clearing_sessions = clearing_sessions.clone();
+            let toast = toast.clone();
+            let sessions = sessions.clone();
+
+            // clone once per click
+            let server_ip = server_ip.clone();
+            let server_port = server_port.clone();
+            let token = token.clone();
+
+            confirm.confirm(ConfirmRequest {
+                title: "Clear all sessions?".to_string(),
+                message: "This logs out all users immediately.".to_string(),
+                confirm_label: "Clear sessions".to_string(),
+                cancel_label: "Cancel".to_string(),
+
+                on_confirm: Callback::from({
+                    let clearing_sessions = clearing_sessions.clone();
+                    let toast = toast.clone();
+                    let sessions = sessions.clone();
+
+                    move |_| {
+                        clearing_sessions.set(true);
+
+                        // clone INSIDE the Fn callback
+                        let clearing_sessions = clearing_sessions.clone();
+                        let toast = toast.clone();
+                        let sessions = sessions.clone();
+                        let server_ip = server_ip.clone();
+                        let server_port = server_port.clone();
+                        let token = token.clone();
+
+                        spawn_local(async move {
+                            if let Err(msg) = clear_sessions(&server_ip, &server_port, &token).await
+                            {
+                                toast.toast(msg, ToastVariant::Error, Some(3000));
+                            } else {
+                                sessions.set(Some(0));
+                                toast.toast("Sessions cleared.", ToastVariant::Success, Some(2500));
+                            }
+                            clearing_sessions.set(false);
+                        });
+                    }
                 }),
             });
         })
@@ -358,7 +425,11 @@ pub fn admin_screen() -> Html {
                         upload_folder.set(path);
                     }
                 } else {
-                    toast.toast("Failed to open folder picker.", ToastVariant::Error, Some(3000));
+                    toast.toast(
+                        "Failed to open folder picker.",
+                        ToastVariant::Error,
+                        Some(3000),
+                    );
                 }
             });
         })
@@ -377,15 +448,18 @@ pub fn admin_screen() -> Html {
                         let listen_fn: Function = listen.dyn_into().unwrap();
                         let upload_current_id = upload_current_id.clone();
                         let upload_progress = upload_progress.clone();
-                        let callback = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
-                            let payload = Reflect::get(&value, &JsValue::from_str("payload")).unwrap_or(JsValue::NULL);
-                            let event: Result<UploadProgressEvent, _> = serde_wasm_bindgen::from_value(payload);
-                            if let Ok(event) = event {
-                                if event.id == (*upload_current_id).clone() {
-                                    upload_progress.set(event.pct);
+                        let callback =
+                            Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
+                                let payload = Reflect::get(&value, &JsValue::from_str("payload"))
+                                    .unwrap_or(JsValue::NULL);
+                                let event: Result<UploadProgressEvent, _> =
+                                    serde_wasm_bindgen::from_value(payload);
+                                if let Ok(event) = event {
+                                    if event.id == (*upload_current_id).clone() {
+                                        upload_progress.set(event.pct);
+                                    }
                                 }
-                            }
-                        }));
+                            }));
                         let _ = listen_fn.call2(
                             &event,
                             &JsValue::from_str("app_upload_progress"),
@@ -403,19 +477,22 @@ pub fn admin_screen() -> Html {
                         let upload_current_id = upload_current_id.clone();
                         let upload_stage = upload_stage.clone();
                         let upload_progress = upload_progress.clone();
-                        let callback = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
-                            let payload = Reflect::get(&value, &JsValue::from_str("payload")).unwrap_or(JsValue::NULL);
-                            let event: Result<UploadStageEvent, _> = serde_wasm_bindgen::from_value(payload);
-                            if let Ok(event) = event {
-                                if event.id == (*upload_current_id).clone() {
-                                    let stage = event.stage.clone();
-                                    if stage == "uploading" {
-                                        upload_progress.set(0.0);
+                        let callback =
+                            Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
+                                let payload = Reflect::get(&value, &JsValue::from_str("payload"))
+                                    .unwrap_or(JsValue::NULL);
+                                let event: Result<UploadStageEvent, _> =
+                                    serde_wasm_bindgen::from_value(payload);
+                                if let Ok(event) = event {
+                                    if event.id == (*upload_current_id).clone() {
+                                        let stage = event.stage.clone();
+                                        if stage == "uploading" {
+                                            upload_progress.set(0.0);
+                                        }
+                                        upload_stage.set(stage);
                                     }
-                                    upload_stage.set(stage);
                                 }
-                            }
-                        }));
+                            }));
                         let _ = listen_fn.call2(
                             &event,
                             &JsValue::from_str("app_upload_stage"),
@@ -437,31 +514,39 @@ pub fn admin_screen() -> Html {
         let manage_apps = manage_apps.clone();
         let manage_loading = manage_loading.clone();
         let manage_error = manage_error.clone();
-        use_effect_with((admin_tab.clone(), server_ip.clone(), server_port.clone(), token.clone()), move |_| {
-            if *admin_tab != AdminTab::Manage {
-                return ();
-            }
-            if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                return ();
-            }
-            manage_loading.set(true);
-            manage_error.set(None);
-            let server_ip = server_ip.clone();
-            let server_port = server_port.clone();
-            let token = token.clone();
-            let manage_apps = manage_apps.clone();
-            let manage_loading = manage_loading.clone();
-            let manage_error = manage_error.clone();
-            spawn_local(async move {
-                let url = build_http_url(&server_ip, &server_port, "apps");
-                match get_json::<Vec<AppInfo>>(&url, Some(&token)).await {
-                    Ok(list) => manage_apps.set(list),
-                    Err(msg) => manage_error.set(Some(msg)),
+        use_effect_with(
+            (
+                admin_tab.clone(),
+                server_ip.clone(),
+                server_port.clone(),
+                token.clone(),
+            ),
+            move |_| {
+                if *admin_tab != AdminTab::Manage {
+                    return ();
                 }
-                manage_loading.set(false);
-            });
-            ()
-        });
+                if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
+                    return ();
+                }
+                manage_loading.set(true);
+                manage_error.set(None);
+                let server_ip = server_ip.clone();
+                let server_port = server_port.clone();
+                let token = token.clone();
+                let manage_apps = manage_apps.clone();
+                let manage_loading = manage_loading.clone();
+                let manage_error = manage_error.clone();
+                spawn_local(async move {
+                    let url = build_http_url(&server_ip, &server_port, "apps");
+                    match get_json::<Vec<AppInfo>>(&url, Some(&token)).await {
+                        Ok(list) => manage_apps.set(list),
+                        Err(msg) => manage_error.set(Some(msg)),
+                    }
+                    manage_loading.set(false);
+                });
+                ()
+            },
+        );
     }
 
     let on_upload_app = {
@@ -481,7 +566,11 @@ pub fn admin_screen() -> Html {
         let toast = toast.clone();
         Callback::from(move |_| {
             if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                toast.toast("Missing server address or token.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Missing server address or token.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             let id = upload_id.as_str().trim().to_string();
@@ -496,7 +585,11 @@ pub fn admin_screen() -> Html {
             }
             let folder = upload_folder.as_str().trim().to_string();
             if folder.is_empty() {
-                toast.toast("Pick an app folder to upload.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Pick an app folder to upload.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
 
@@ -574,7 +667,11 @@ pub fn admin_screen() -> Html {
         let toast = toast.clone();
         Callback::from(move |app_id: String| {
             if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                toast.toast("Missing server address or token.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Missing server address or token.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             manage_open.set(true);
@@ -586,7 +683,11 @@ pub fn admin_screen() -> Html {
             let manage_config = manage_config.clone();
             let toast = toast.clone();
             spawn_local(async move {
-                let url = build_http_url(&server_ip, &server_port, &format!("admin/apps/{}/config", app_id));
+                let url = build_http_url(
+                    &server_ip,
+                    &server_port,
+                    &format!("admin/apps/{}/config", app_id),
+                );
                 match get_json::<RawConfigPayload>(&url, Some(&token)).await {
                     Ok(payload) => manage_config.set(payload.content),
                     Err(msg) => toast.toast(msg, ToastVariant::Error, Some(3000)),
@@ -606,7 +707,11 @@ pub fn admin_screen() -> Html {
         let toast = toast.clone();
         Callback::from(move |_| {
             if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                toast.toast("Missing server address or token.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Missing server address or token.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             let app_id = manage_app_id.as_str().trim().to_string();
@@ -623,7 +728,11 @@ pub fn admin_screen() -> Html {
             let manage_open = manage_open.clone();
             let toast = toast.clone();
             spawn_local(async move {
-                let url = build_http_url(&server_ip, &server_port, &format!("admin/apps/{}/config", app_id));
+                let url = build_http_url(
+                    &server_ip,
+                    &server_port,
+                    &format!("admin/apps/{}/config", app_id),
+                );
                 let body = serde_json::json!({ "content": manage_config });
                 match send_json("PUT", &url, Some(&token), Some(body)).await {
                     Ok(resp) if resp.ok() => {
@@ -631,7 +740,11 @@ pub fn admin_screen() -> Html {
                         manage_open.set(false);
                     }
                     Ok(resp) => {
-                        toast.toast(format!("Save failed (HTTP {}).", resp.status()), ToastVariant::Error, Some(3000));
+                        toast.toast(
+                            format!("Save failed (HTTP {}).", resp.status()),
+                            ToastVariant::Error,
+                            Some(3000),
+                        );
                     }
                     Err(msg) => {
                         toast.toast(msg, ToastVariant::Error, Some(3000));
@@ -651,7 +764,11 @@ pub fn admin_screen() -> Html {
         let manage_apps = manage_apps.clone();
         Callback::from(move |app_id: String| {
             if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                toast.toast("Missing server address or token.", ToastVariant::Warning, Some(2500));
+                toast.toast(
+                    "Missing server address or token.",
+                    ToastVariant::Warning,
+                    Some(2500),
+                );
                 return;
             }
             let server_ip = server_ip.clone();
@@ -672,7 +789,11 @@ pub fn admin_screen() -> Html {
                     let manage_apps = manage_apps.clone();
                     let app_id = app_id.clone();
                     spawn_local(async move {
-                        let url = build_http_url(&server_ip, &server_port, &format!("admin/apps/{}", app_id));
+                        let url = build_http_url(
+                            &server_ip,
+                            &server_port,
+                            &format!("admin/apps/{}", app_id),
+                        );
                         match send_json("DELETE", &url, Some(&token), None).await {
                             Ok(resp) if resp.ok() => {
                                 toast.toast("App deleted.", ToastVariant::Success, Some(2500));
@@ -681,7 +802,11 @@ pub fn admin_screen() -> Html {
                                 manage_apps.set(next);
                             }
                             Ok(resp) => {
-                                toast.toast(format!("Delete failed (HTTP {}).", resp.status()), ToastVariant::Error, Some(3000));
+                                toast.toast(
+                                    format!("Delete failed (HTTP {}).", resp.status()),
+                                    ToastVariant::Error,
+                                    Some(3000),
+                                );
                             }
                             Err(msg) => toast.toast(msg, ToastVariant::Error, Some(3000)),
                         }
@@ -747,9 +872,16 @@ pub fn admin_screen() -> Html {
                         <p class="mt-4 text-lg font-semibold">{ count }</p>
                         <p class="mt-2 text-sm text-secondary/70">{ "Active sessions." }</p>
                     } else {
-                        <p class="mt-4 text-lg font-semibold">{ "—" }</p>
+                        <p class="mt-4 text-lg font-semibold">{ "-" }</p>
                         <p class="mt-2 text-sm text-secondary/70">{ "No data." }</p>
                     }
+                    <Button
+                        class={Some("mt-4 border border-rose-400/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30".to_string())}
+                        onclick={on_clear_sessions}
+                        disabled={*clearing_sessions}
+                    >
+                        { if *clearing_sessions { "Clearing..." } else { "Clear sessions" } }
+                    </Button>
                 </div>
                 <div class="rounded-2xl border border-ink/50 bg-inkLight p-6">
                     <p class="text-xs uppercase tracking-wide text-accent/80">{ "Feature Flags" }</p>
@@ -1052,6 +1184,15 @@ async fn clear_chat(server_ip: &str, server_port: &str, token: &str) -> Result<(
     let resp = send_json("DELETE", &url, Some(token), None).await?;
     if !resp.ok() {
         return Err(format!("Clear chat error (HTTP {}).", resp.status()));
+    }
+    Ok(())
+}
+
+async fn clear_sessions(server_ip: &str, server_port: &str, token: &str) -> Result<(), String> {
+    let url = build_http_url(server_ip, server_port, "admin/sessions");
+    let resp = send_json("DELETE", &url, Some(token), None).await?;
+    if !resp.ok() {
+        return Err(format!("Clear sessions error (HTTP {}).", resp.status()));
     }
     Ok(())
 }

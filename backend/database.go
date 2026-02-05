@@ -116,3 +116,36 @@ func (s *Store) CountSessions() (int, error) {
 	})
 	return count, err
 }
+
+func (s *Store) ClearSessions() (int, error) {
+	var keys [][]byte
+	err := s.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		prefix := []byte("session:")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			key := it.Item().KeyCopy(nil)
+			keys = append(keys, key)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	removed := 0
+	err = s.db.Update(func(txn *badger.Txn) error {
+		for _, key := range keys {
+			if err := txn.Delete(key); err != nil {
+				return err
+			}
+			removed++
+		}
+		return nil
+	})
+	if err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
