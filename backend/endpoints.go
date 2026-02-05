@@ -72,9 +72,9 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 		apps.GET("/:id/config", getAppConfigHandler)
 		apps.GET("/:id/archive", getAppArchiveHandler)
 		apps.POST("/refresh", func(c *gin.Context) {
-		// Ensure apps directory exists; listing always reads from disk.
-		_ = os.MkdirAll(appsDir, 0755)
-		c.JSON(http.StatusOK, gin.H{"status": "refreshed"})
+			// Ensure apps directory exists; listing always reads from disk.
+			_ = os.MkdirAll(appsDir, 0755)
+			c.JSON(http.StatusOK, gin.H{"status": "refreshed"})
 		})
 	}
 
@@ -236,9 +236,14 @@ func StartServer(router *gin.Engine, store *Store, cfg *Config) {
 
 func runServer(router *gin.Engine, store *Store, cfg *Config) {
 	// Create HTTP server
+	router.SetTrustedProxies([]string{"127.0.0.1"})
 	srv := &http.Server{
-		Addr:    ":" + strconv.Itoa(cfg.Port),
-		Handler: router,
+		Addr:              "127.0.0.1:" + strconv.Itoa(cfg.Port),
+		Handler:           router,
+		ReadTimeout:       0, // for uploads no timeout
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      0, // for downloads no timeout
+		IdleTimeout:       120 * time.Second,
 	}
 	httpServer = srv
 

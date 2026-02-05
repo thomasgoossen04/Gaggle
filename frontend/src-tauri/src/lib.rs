@@ -21,6 +21,8 @@ use tauri_plugin_opener::open_path;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::io::ReaderStream;
 
+pub mod net;
+
 #[derive(Default)]
 struct DownloadManager {
     tasks: Mutex<HashMap<String, DownloadTask>>,
@@ -308,21 +310,40 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
         last_emit: Instant::now(),
     }));
     {
-        let tar_file =
-            fs::File::create(&archive_path).map_err(|_| "Failed to create archive.".to_string())?;
-        let encoder = flate2::write::GzEncoder::new(tar_file, flate2::Compression::fast());
-        let mut builder = tar::Builder::new(encoder);
-        add_dir_to_tar(
-            &mut builder,
-            &folder,
-            &folder,
-            &progress_state,
-            &app,
-            &request.id,
-        )?;
-        builder
-            .finish()
-            .map_err(|_| "Failed to finalize archive.".to_string())?;
+        let app_clone = app.clone();
+        let id_clone = request.id.clone();
+        let folder_clone = folder.clone();
+        let archive_path_clone = archive_path.clone();
+        let progress_state_clone = progress_state.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let tar_file = fs::File::create(&archive_path_clone)
+                .map_err(|_| "Failed to create archive.".to_string())?;
+
+            let encoder = flate2::write::GzEncoder::new(tar_file, flate2::Compression::fast());
+
+            let mut builder = tar::Builder::new(encoder);
+
+            add_dir_to_tar(
+                &mut builder,
+                &folder_clone,
+                &folder_clone,
+                &progress_state_clone,
+                &app_clone,
+                &id_clone,
+            )?;
+
+            let encoder = builder
+                .into_inner()
+                .map_err(|_| "Failed to finalize tar".to_string())?;
+
+            encoder
+                .finish()
+                .map_err(|_| "Failed to finalize gzip".to_string())?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| "Compression task panicked".to_string())??;
     }
     let total = if total_size == 0 { 1 } else { total_size };
     let _ = app.emit(
@@ -335,38 +356,18 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
         },
     );
 
-    let url = format!(
-        "http://{}:{}/admin/apps/upload",
-        request.server_ip.trim(),
-        request.server_port.trim()
+    let url = crate::net::build_http_url(
+        &request.server_ip,
+        &request.server_port,
+        "/admin/apps/upload",
     );
 
     let archive_len = fs::metadata(&archive_path)
         .map_err(|_| "Failed to read archive size.".to_string())?
         .len();
-    let file = tokio::fs::File::open(&archive_path)
+    let archive_part = Part::file(&archive_path)
         .await
-        .map_err(|_| "Failed to open archive.".to_string())?;
-    let mut sent: u64 = 0;
-    let upload_id = request.id.clone();
-    let app_handle = app.clone();
-    let stream = ReaderStream::new(file).map_ok(move |chunk| {
-        sent = sent.saturating_add(chunk.len() as u64);
-        let total = if archive_len == 0 { 1 } else { archive_len };
-        let pct = (sent as f64 / total as f64) * 100.0;
-        let _ = app_handle.emit(
-            "app_upload_progress",
-            UploadProgress {
-                id: upload_id.clone(),
-                sent,
-                total,
-                pct,
-            },
-        );
-        chunk
-    });
-    let body = Body::wrap_stream(stream);
-    let archive_part = Part::stream_with_length(body, archive_len)
+        .map_err(|_| "Failed to attach archive".to_string())?
         .file_name(format!("{}.tar.gz", request.id))
         .mime_str("application/gzip")
         .map_err(|_| "Failed to set archive type.".to_string())?;
@@ -391,7 +392,7 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
         .multipart(form)
         .send()
         .await
-        .map_err(|_| "Upload failed.".to_string())?;
+        .map_err(|e| format!("Upload failed: {}", e))?;
 
     fs::remove_dir_all(&temp_dir).ok();
 

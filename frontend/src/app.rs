@@ -163,10 +163,7 @@ pub fn apply_theme(theme: &Theme) {
                 theme.ink,
                 theme.ink_light,
                 font_stack,
-                theme
-                    .radius
-                    .clone()
-                    .unwrap_or_else(|| "18px".to_string())
+                theme.radius.clone().unwrap_or_else(|| "18px".to_string())
             );
             if let Some(root) = doc.document_element() {
                 let _ = root.set_attribute("style", &style);

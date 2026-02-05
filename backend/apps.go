@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -149,8 +150,9 @@ func uploadAppHandler(c *gin.Context) error {
 	if !isSafeAppID(id) {
 		return fmt.Errorf("invalid app id")
 	}
-	config := c.PostForm("config")
-	if strings.TrimSpace(config) == "" {
+
+	config := strings.TrimSpace(c.PostForm("config"))
+	if config == "" {
 		return fmt.Errorf("missing config")
 	}
 
@@ -168,9 +170,22 @@ func uploadAppHandler(c *gin.Context) error {
 		return fmt.Errorf("failed to save config")
 	}
 
+	// Stream archive to disk
+	src, err := archiveHeader.Open()
+	if err != nil {
+		return fmt.Errorf("failed to open archive")
+	}
+	defer src.Close()
+
 	archivePath := filepath.Join(appsDir, id+".tar.gz")
-	if err := c.SaveUploadedFile(archiveHeader, archivePath); err != nil {
-		return fmt.Errorf("failed to save archive")
+	dst, err := os.Create(archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to create archive file")
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("failed to write archive")
 	}
 
 	return nil
