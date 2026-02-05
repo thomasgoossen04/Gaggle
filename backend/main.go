@@ -7,6 +7,7 @@ import (
 
 func main() {
 	cfg := MustLoadConfig()
+	gin.SetMode(cfg.Mode)
 	router := gin.Default()
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"*"},
@@ -14,7 +15,6 @@ func main() {
 		AllowHeaders:     []string{"*"},
 		AllowCredentials: false,
 	}))
-	gin.SetMode(cfg.Mode)
 
 	store, err := InitDb("./db")
 	if err != nil {

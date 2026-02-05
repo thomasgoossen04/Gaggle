@@ -16,7 +16,7 @@ use reqwest::header::RANGE;
 use reqwest::multipart::{Form, Part};
 use reqwest::Body;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::open_path;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
 use tokio_util::io::ReaderStream;
@@ -27,6 +27,16 @@ pub mod net;
 struct DownloadManager {
     tasks: Mutex<HashMap<String, DownloadTask>>,
     status: Arc<Mutex<HashMap<String, DownloadSnapshot>>>,
+}
+
+#[derive(Default)]
+struct RunManager {
+    processes: StdMutex<HashMap<String, RunningProcess>>,
+}
+
+struct RunningProcess {
+    child: Arc<StdMutex<std::process::Child>>,
+    start: Instant,
 }
 
 #[derive(Clone)]
@@ -741,7 +751,22 @@ struct RunAppExecutableRequest {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct RunStartResult {
+    tracked: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct RunAppResult {
+    duration_seconds: u64,
+    exit_code: Option<i32>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RunEvent {
+    id: String,
+    status: String,
     duration_seconds: u64,
     exit_code: Option<i32>,
 }
@@ -791,7 +816,9 @@ fn run_app_executable(request: RunAppExecutableRequest) -> Result<(), String> {
 #[tauri::command]
 async fn run_app_executable_tracked(
     request: RunAppExecutableRequest,
-) -> Result<RunAppResult, String> {
+    state: State<'_, RunManager>,
+    app: AppHandle,
+) -> Result<RunStartResult, String> {
     let app_dir = PathBuf::from(request.dest_dir).join(&request.id);
     if !app_dir.exists() {
         return Err("App folder not found.".to_string());
@@ -799,36 +826,102 @@ async fn run_app_executable_tracked(
     let exec_path = resolve_executable(&app_dir, &request.executable)?;
     let content_dir = app_dir.join("content");
 
-    let exec_path_for_fallback = exec_path.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let start = Instant::now();
-        let status = std::process::Command::new(&exec_path)
-            .current_dir(&content_dir)
-            .spawn()
-            .and_then(|mut child| child.wait());
+    let mut map = state.processes.lock().unwrap();
+    if map.contains_key(&request.id) {
+        return Err("App is already running.".to_string());
+    }
 
-        let status = match status {
-            Ok(status) => status,
-            Err(_) => {
-                // Fall back to default OS handler (e.g., README.txt).
-                open_path(exec_path_for_fallback, Option::<&str>::None)
-                    .map_err(|_| "Failed to launch executable.".to_string())?;
-                return Ok(RunAppResult {
-                    duration_seconds: 0,
-                    exit_code: None,
-                });
+    let exec_path_for_fallback = exec_path.clone();
+    let mut child = match std::process::Command::new(&exec_path)
+        .current_dir(&content_dir)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            // Fall back to default OS handler (e.g., README.txt).
+            open_path(exec_path_for_fallback, Option::<&str>::None)
+                .map_err(|_| "Failed to launch executable.".to_string())?;
+            return Ok(RunStartResult { tracked: false });
+        }
+    };
+
+    let start = Instant::now();
+    let child = Arc::new(StdMutex::new(child));
+    map.insert(
+        request.id.clone(),
+        RunningProcess {
+            child: child.clone(),
+            start,
+        },
+    );
+    drop(map);
+
+    let _ = app.emit(
+        "app_run_event",
+        RunEvent {
+            id: request.id.clone(),
+            status: "started".to_string(),
+            duration_seconds: 0,
+            exit_code: None,
+        },
+    );
+
+    let app_clone = app.clone();
+    let id_clone = request.id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let exit_code = loop {
+            let status = {
+                let mut child = child.lock().unwrap();
+                child.try_wait()
+            };
+            match status {
+                Ok(Some(status)) => break status.code(),
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(_) => break None,
             }
         };
 
-        Ok(RunAppResult {
-            duration_seconds: start.elapsed().as_secs(),
-            exit_code: status.code(),
-        })
-    })
-    .await
-    .map_err(|_| "Failed to track executable.".to_string())?;
+        let duration_seconds = start.elapsed().as_secs();
+        let _ = app_clone.emit(
+            "app_run_event",
+            RunEvent {
+                id: id_clone.clone(),
+                status: "stopped".to_string(),
+                duration_seconds,
+                exit_code,
+            },
+        );
 
-    result
+        let state = app_clone.state::<RunManager>();
+        let mut map = state.processes.lock().unwrap();
+        map.remove(&id_clone);
+    });
+
+    Ok(RunStartResult { tracked: true })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StopRunRequest {
+    id: String,
+}
+
+#[tauri::command]
+fn stop_app_executable_tracked(
+    request: StopRunRequest,
+    state: State<'_, RunManager>,
+) -> Result<(), String> {
+    let map = state.processes.lock().unwrap();
+    let running = map
+        .get(&request.id)
+        .ok_or_else(|| "App is not running.".to_string())?;
+    let mut child = running.child.lock().unwrap();
+    child
+        .kill()
+        .map_err(|_| "Failed to stop running app.".to_string())?;
+    Ok(())
 }
 
 async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String> {
@@ -1113,6 +1206,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(DownloadManager::default())
+        .manage(RunManager::default())
         .invoke_handler(tauri::generate_handler![
             get_default_apps_dir,
             pick_install_dir,
@@ -1127,6 +1221,7 @@ pub fn run() {
             open_app_folder,
             run_app_executable,
             run_app_executable_tracked,
+            stop_app_executable_tracked,
             upload_app
         ])
         .run(tauri::generate_context!())
