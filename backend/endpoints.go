@@ -189,7 +189,7 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 			}
 			c.JSON(http.StatusOK, gin.H{"status": "reloaded"})
 		})
-		admin.POST("/apps/upload", func(c *gin.Context) {
+		admin.PUT("/apps/upload/:id", func(c *gin.Context) {
 			if err := uploadAppHandler(c); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
