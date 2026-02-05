@@ -788,7 +788,9 @@ fn run_app_executable(request: RunAppExecutableRequest) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn run_app_executable_tracked(request: RunAppExecutableRequest) -> Result<RunAppResult, String> {
+async fn run_app_executable_tracked(
+    request: RunAppExecutableRequest,
+) -> Result<RunAppResult, String> {
     let app_dir = PathBuf::from(request.dest_dir).join(&request.id);
     if !app_dir.exists() {
         return Err("App folder not found.".to_string());
@@ -796,29 +798,36 @@ fn run_app_executable_tracked(request: RunAppExecutableRequest) -> Result<RunApp
     let exec_path = resolve_executable(&app_dir, &request.executable)?;
     let content_dir = app_dir.join("content");
 
-    let start = Instant::now();
-    let status = std::process::Command::new(&exec_path)
-        .current_dir(&content_dir)
-        .spawn()
-        .and_then(|mut child| child.wait());
+    let exec_path_for_fallback = exec_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let start = Instant::now();
+        let status = std::process::Command::new(&exec_path)
+            .current_dir(&content_dir)
+            .spawn()
+            .and_then(|mut child| child.wait());
 
-    let status = match status {
-        Ok(status) => status,
-        Err(_) => {
-            // Fall back to default OS handler (e.g., README.txt).
-            open_path(exec_path, Option::<&str>::None)
-                .map_err(|_| "Failed to launch executable.".to_string())?;
-            return Ok(RunAppResult {
-                duration_seconds: 0,
-                exit_code: None,
-            });
-        }
-    };
+        let status = match status {
+            Ok(status) => status,
+            Err(_) => {
+                // Fall back to default OS handler (e.g., README.txt).
+                open_path(exec_path_for_fallback, Option::<&str>::None)
+                    .map_err(|_| "Failed to launch executable.".to_string())?;
+                return Ok(RunAppResult {
+                    duration_seconds: 0,
+                    exit_code: None,
+                });
+            }
+        };
 
-    Ok(RunAppResult {
-        duration_seconds: start.elapsed().as_secs(),
-        exit_code: status.code(),
+        Ok(RunAppResult {
+            duration_seconds: start.elapsed().as_secs(),
+            exit_code: status.code(),
+        })
     })
+    .await
+    .map_err(|_| "Failed to track executable.".to_string())?;
+
+    result
 }
 
 async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String> {

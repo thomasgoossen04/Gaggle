@@ -66,7 +66,8 @@ struct DownloadEvent {
     downloaded: u64,
     total: Option<u64>,
     status: String,
-    _speed_bps: f64,
+    #[serde(default)]
+    speed_bps: f64,
 }
 
 #[derive(serde::Serialize)]
@@ -389,13 +390,19 @@ pub fn library_screen() -> Html {
                             let status = event.status.clone();
                             let mut entry = next.get(&event.id).cloned().unwrap_or_default();
                             let now = js_sys::Date::now();
-                            if let Some((last_time, last_bytes)) = entry.last_tick {
-                                let delta_t = (now - last_time) / 1000.0;
-                                if delta_t > 0.0 {
-                                    let delta_b =
-                                        event.downloaded.saturating_sub(last_bytes) as f64;
-                                    entry.speed_bps = delta_b / delta_t;
+                            let mut speed = event.speed_bps;
+                            if speed <= 0.0 {
+                                if let Some((last_time, last_bytes)) = entry.last_tick {
+                                    let delta_t = (now - last_time) / 1000.0;
+                                    if delta_t > 0.0 {
+                                        let delta_b =
+                                            event.downloaded.saturating_sub(last_bytes) as f64;
+                                        speed = delta_b / delta_t;
+                                    }
                                 }
+                            }
+                            if speed > 0.0 {
+                                entry.speed_bps = speed;
                             }
                             entry.last_tick = Some((now, event.downloaded));
                             entry.status = status.clone();

@@ -298,7 +298,10 @@ func (s *Store) getChatMessagesEp(c *gin.Context) {
 }
 
 func (s *Store) postChatMessageEp(c *gin.Context, chatHub *ChatHub) {
-	userID := c.MustGet("user_id").(string)
+	userID, ok := getUserID(c)
+	if !ok {
+		return
+	}
 	user, err := s.GetUser(userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})

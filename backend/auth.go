@@ -102,6 +102,7 @@ func AuthMiddleware(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token, ok := getBearerToken(c)
 		if !ok {
+			c.Abort()
 			return
 		}
 
@@ -119,8 +120,10 @@ func AuthMiddleware(store *Store) gin.HandlerFunc {
 
 func MeHandler(store *Store, cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-
-		userID := c.MustGet("user_id").(string)
+		userID, ok := getUserID(c)
+		if !ok {
+			return
+		}
 
 		user, err := store.GetUser(userID)
 		if err != nil {
@@ -165,9 +168,28 @@ func getBearerToken(c *gin.Context) (string, bool) {
 	return authHeader[len(prefix):], true
 }
 
+func getUserID(c *gin.Context) (string, bool) {
+	value, ok := c.Get("user_id")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing user context"})
+		c.Abort()
+		return "", false
+	}
+	userID, ok := value.(string)
+	if !ok || userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid user context"})
+		c.Abort()
+		return "", false
+	}
+	return userID, true
+}
+
 func AdminMiddleware(cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userID := c.MustGet("user_id").(string)
+		userID, ok := getUserID(c)
+		if !ok {
+			return
+		}
 		if !cfg.IsAdmin(userID) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "admin access required"})
 			c.Abort()

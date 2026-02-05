@@ -68,7 +68,10 @@ func (s *Store) postSocialStatusEp(c *gin.Context, hub *SocialHub) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "social disabled"})
 		return
 	}
-	userID := c.MustGet("user_id").(string)
+	userID, ok := getUserID(c)
+	if !ok {
+		return
+	}
 	user, err := s.GetUser(userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})

@@ -8,7 +8,10 @@ import (
 )
 
 func (s *Store) getPlaytimeEp(c *gin.Context) {
-	userID := c.MustGet("user_id").(string)
+	userID, ok := getUserID(c)
+	if !ok {
+		return
+	}
 	items, err := s.ListPlaytime(userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "playtime list failed"})
@@ -18,7 +21,10 @@ func (s *Store) getPlaytimeEp(c *gin.Context) {
 }
 
 func (s *Store) postPlaytimeEp(c *gin.Context) {
-	userID := c.MustGet("user_id").(string)
+	userID, ok := getUserID(c)
+	if !ok {
+		return
+	}
 	appID := c.Param("id")
 	if !isSafeAppID(appID) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid app id"})

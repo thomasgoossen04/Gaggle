@@ -18,6 +18,7 @@ type Store struct {
 
 func InitDb(path string) (*Store, error) {
 	opts := badger.DefaultOptions(path)
+	opts.Truncate = true
 	db, err := badger.Open(opts)
 	if err != nil {
 		return nil, err
