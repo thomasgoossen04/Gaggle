@@ -280,6 +280,15 @@ fn dir_total_size(path: &Path) -> Result<u64, String> {
 
 #[tauri::command]
 async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), String> {
+    use base64::{engine::general_purpose, Engine as _};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Mutex as StdMutex},
+        time::Instant,
+    };
+    use tokio_util::io::ReaderStream;
+
     if request.token.trim().is_empty() {
         return Err("Missing auth token.".to_string());
     }
@@ -298,11 +307,13 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
         return Err("Folder not found.".to_string());
     }
 
+    // ---------- TEMP ARCHIVE ----------
     let temp_dir = std::env::temp_dir().join(format!("gaggle_upload_{}", request.id));
     if temp_dir.exists() {
         fs::remove_dir_all(&temp_dir).ok();
     }
     fs::create_dir_all(&temp_dir).map_err(|_| "Failed to prepare temp folder.".to_string())?;
+
     let archive_path = temp_dir.join(format!("{}.tar.gz", request.id));
 
     let _ = app.emit(
@@ -312,24 +323,26 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
             stage: "compressing".to_string(),
         },
     );
+
     let total_size = dir_total_size(&folder)?;
     let progress_state = Arc::new(StdMutex::new(UploadProgressState {
         sent: 0,
         total: total_size,
         last_emit: Instant::now(),
     }));
+
     {
         let app_clone = app.clone();
         let id_clone = request.id.clone();
         let folder_clone = folder.clone();
         let archive_path_clone = archive_path.clone();
         let progress_state_clone = progress_state.clone();
+
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let tar_file = fs::File::create(&archive_path_clone)
                 .map_err(|_| "Failed to create archive.".to_string())?;
 
             let encoder = flate2::write::GzEncoder::new(tar_file, flate2::Compression::fast());
-
             let mut builder = tar::Builder::new(encoder);
 
             add_dir_to_tar(
@@ -343,17 +356,18 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
 
             let encoder = builder
                 .into_inner()
-                .map_err(|_| "Failed to finalize tar".to_string())?;
+                .map_err(|_| "Failed to finalize tar.".to_string())?;
 
             encoder
                 .finish()
-                .map_err(|_| "Failed to finalize gzip".to_string())?;
+                .map_err(|_| "Failed to finalize gzip.".to_string())?;
 
             Ok(())
         })
         .await
-        .map_err(|_| "Compression task panicked".to_string())??;
+        .map_err(|_| "Compression task panicked.".to_string())??;
     }
+
     let total = if total_size == 0 { 1 } else { total_size };
     let _ = app.emit(
         "app_upload_progress",
@@ -365,40 +379,38 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
         },
     );
 
+    // ---------- STREAMING UPLOAD ----------
     let url = crate::net::build_http_url(
         &request.server_ip,
         &request.server_port,
-        "/admin/apps/upload",
+        &format!("/admin/apps/upload/{}", request.id),
     );
 
-    let archive_len = fs::metadata(&archive_path)
-        .map_err(|_| "Failed to read archive size.".to_string())?
-        .len();
-    let archive_part = Part::file(&archive_path)
+    let file = tokio::fs::File::open(&archive_path)
         .await
-        .map_err(|_| "Failed to attach archive".to_string())?
-        .file_name(format!("{}.tar.gz", request.id))
-        .mime_str("application/gzip")
-        .map_err(|_| "Failed to set archive type.".to_string())?;
+        .map_err(|_| "Failed to open archive for upload.".to_string())?;
 
-    let upload_id = request.id.clone();
-    let form = Form::new()
-        .text("id", upload_id.clone())
-        .text("config", request.config_toml)
-        .part("archive", archive_part);
+    let stream = ReaderStream::new(file);
+    let body = reqwest::Body::wrap_stream(stream);
+
+    let config_b64 = general_purpose::STANDARD.encode(&request.config_toml);
 
     let client = reqwest::Client::new();
+
     let _ = app.emit(
         "app_upload_stage",
         UploadStage {
-            id: upload_id.clone(),
+            id: request.id.clone(),
             stage: "uploading".to_string(),
         },
     );
+
     let resp = client
-        .post(url)
-        .bearer_auth(request.token)
-        .multipart(form)
+        .put(url)
+        .bearer_auth(&request.token)
+        .header("X-App-Config", config_b64)
+        .header("Content-Type", "application/octet-stream")
+        .body(body)
         .send()
         .await
         .map_err(|e| format!("Upload failed: {}", e))?;
@@ -408,16 +420,6 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
     if !resp.status().is_success() {
         return Err(format!("Upload failed (HTTP {}).", resp.status()));
     }
-
-    let _ = app.emit(
-        "app_upload_progress",
-        UploadProgress {
-            id: upload_id,
-            sent: archive_len,
-            total: archive_len,
-            pct: 100.0,
-        },
-    );
 
     Ok(())
 }

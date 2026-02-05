@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -146,19 +147,19 @@ func isSafeAppID(id string) bool {
 }
 
 func uploadAppHandler(c *gin.Context) error {
-	id := strings.TrimSpace(c.PostForm("id"))
+	id := strings.TrimSpace(c.Param("id"))
 	if !isSafeAppID(id) {
 		return fmt.Errorf("invalid app id")
 	}
 
-	config := strings.TrimSpace(c.PostForm("config"))
-	if config == "" {
+	configB64 := c.GetHeader("X-App-Config")
+	if configB64 == "" {
 		return fmt.Errorf("missing config")
 	}
 
-	archiveHeader, err := c.FormFile("archive")
+	configBytes, err := base64.StdEncoding.DecodeString(configB64)
 	if err != nil {
-		return fmt.Errorf("missing archive")
+		return fmt.Errorf("invalid config encoding")
 	}
 
 	if err := os.MkdirAll(appsDir, 0755); err != nil {
@@ -166,16 +167,9 @@ func uploadAppHandler(c *gin.Context) error {
 	}
 
 	configPath := filepath.Join(appsDir, id+".toml")
-	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+	if err := os.WriteFile(configPath, configBytes, 0644); err != nil {
 		return fmt.Errorf("failed to save config")
 	}
-
-	// Stream archive to disk
-	src, err := archiveHeader.Open()
-	if err != nil {
-		return fmt.Errorf("failed to open archive")
-	}
-	defer src.Close()
 
 	archivePath := filepath.Join(appsDir, id+".tar.gz")
 	dst, err := os.Create(archivePath)
@@ -184,8 +178,9 @@ func uploadAppHandler(c *gin.Context) error {
 	}
 	defer dst.Close()
 
-	if _, err := io.Copy(dst, src); err != nil {
-		return fmt.Errorf("failed to write archive")
+	// TRUE streaming copy
+	if _, err := io.Copy(dst, c.Request.Body); err != nil {
+		return fmt.Errorf("failed to stream archive")
 	}
 
 	return nil
