@@ -78,6 +78,9 @@ jobs:
                     cargo install trunk
                   fi
 
+            - name: install wasm target
+              run: rustup target add wasm32-unknown-unknown
+
             # ---------------------------
             # Frontend build (Trunk)
             # ---------------------------
