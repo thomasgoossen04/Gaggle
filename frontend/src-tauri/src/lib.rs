@@ -15,6 +15,7 @@ use futures_util::StreamExt;
 use reqwest::header::RANGE;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
+use tauri::http::request;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::open_path;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
@@ -41,6 +42,7 @@ struct RunningProcess {
 #[derive(Clone)]
 struct DownloadTask {
     id: String,
+    name: String,
     archive_url: String,
     config_url: String,
     token: String,
@@ -57,6 +59,7 @@ struct DownloadTask {
 #[derive(Serialize, Clone)]
 struct DownloadEvent {
     id: String,
+    name: String,
     downloaded: u64,
     total: Option<u64>,
     status: String,
@@ -66,6 +69,7 @@ struct DownloadEvent {
 #[derive(Serialize, Clone)]
 struct DownloadSnapshot {
     id: String,
+    name: String,
     downloaded: u64,
     total: Option<u64>,
     status: String,
@@ -76,6 +80,7 @@ struct DownloadSnapshot {
 #[serde(rename_all = "camelCase")]
 struct DownloadMeta {
     id: String,
+    name: String,
     archive_url: String,
     config_url: String,
     dest_dir: String,
@@ -87,6 +92,7 @@ struct DownloadMeta {
 #[serde(rename_all = "camelCase")]
 struct DownloadRequest {
     id: String,
+    name: String,
     archive_url: String,
     config_url: String,
     dest_dir: String,
@@ -447,6 +453,7 @@ async fn start_app_download(
 
     let task = DownloadTask {
         id: request.id.clone(),
+        name: request.name.clone(),
         archive_url: request.archive_url,
         config_url: request.config_url,
         token: request.token,
@@ -469,6 +476,7 @@ async fn start_app_download(
             &task.status,
             DownloadSnapshot {
                 id: task.id.clone(),
+                name: task.name.clone(),
                 downloaded: 0,
                 total: None,
                 status: "downloading".to_string(),
@@ -481,6 +489,7 @@ async fn start_app_download(
                 "app_download_progress",
                 DownloadEvent {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded: 0,
                     total: None,
                     status: format!("error:{err}"),
@@ -491,6 +500,7 @@ async fn start_app_download(
                 &task.status,
                 DownloadSnapshot {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded: 0,
                     total: None,
                     status: format!("error:{err}"),
@@ -547,6 +557,7 @@ async fn resume_download(
         let config_path = app_dir.join(format!("{}.toml", meta.id));
         let task = DownloadTask {
             id: meta.id.clone(),
+            name: meta.name.clone(),
             archive_url: meta.archive_url,
             config_url: meta.config_url,
             token,
@@ -578,6 +589,7 @@ async fn resume_download(
                 "app_download_progress",
                 DownloadEvent {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded: 0,
                     total: None,
                     status: format!("error:{err}"),
@@ -608,6 +620,7 @@ async fn cancel_download(
         "app_download_progress",
         DownloadEvent {
             id: id.clone(),
+            name: task.name.clone(),
             downloaded: 0,
             total: None,
             status: "cancelled".to_string(),
@@ -672,6 +685,7 @@ async fn list_downloads(
                         meta.id.clone(),
                         DownloadSnapshot {
                             id: meta.id,
+                            name: meta.name,
                             downloaded,
                             total: meta.total,
                             status: "paused".to_string(),
@@ -974,6 +988,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
             "app_download_progress",
             DownloadEvent {
                 id: task.id.clone(),
+                name: task.name.clone(),
                 downloaded,
                 total: Some(downloaded),
                 status: "completed".to_string(),
@@ -1016,6 +1031,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
                 "app_download_progress",
                 DownloadEvent {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded,
                     total,
                     status: "cancelled".to_string(),
@@ -1026,6 +1042,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
                 &task.status,
                 DownloadSnapshot {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded,
                     total,
                     status: "cancelled".to_string(),
@@ -1041,6 +1058,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
                 "app_download_progress",
                 DownloadEvent {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded,
                     total,
                     status: "paused".to_string(),
@@ -1051,6 +1069,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
                 &task.status,
                 DownloadSnapshot {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded,
                     total,
                     status: "paused".to_string(),
@@ -1078,6 +1097,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
                 "app_download_progress",
                 DownloadEvent {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded,
                     total,
                     status: "downloading".to_string(),
@@ -1088,6 +1108,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
                 &task.status,
                 DownloadSnapshot {
                     id: task.id.clone(),
+                    name: task.name.clone(),
                     downloaded,
                     total,
                     status: "downloading".to_string(),
@@ -1108,6 +1129,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
         "app_download_progress",
         DownloadEvent {
             id: task.id.clone(),
+            name: task.name.clone(),
             downloaded,
             total,
             status: "installing".to_string(),
@@ -1118,6 +1140,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
         &task.status,
         DownloadSnapshot {
             id: task.id.clone(),
+            name: task.name.clone(),
             downloaded,
             total,
             status: "installing".to_string(),
@@ -1135,6 +1158,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
         "app_download_progress",
         DownloadEvent {
             id: task.id.clone(),
+            name: task.name.clone(),
             downloaded,
             total,
             status: "completed".to_string(),
@@ -1145,6 +1169,7 @@ async fn download_task(task: DownloadTask, app: AppHandle) -> Result<(), String>
         &task.status,
         DownloadSnapshot {
             id: task.id.clone(),
+            name: task.name.clone(),
             downloaded,
             total,
             status: "completed".to_string(),
@@ -1180,6 +1205,7 @@ async fn update_status(
 async fn write_download_meta(task: &DownloadTask, total: Option<u64>) -> Result<(), String> {
     let meta = DownloadMeta {
         id: task.id.clone(),
+        name: task.name.clone(),
         archive_url: task.archive_url.clone(),
         config_url: task.config_url.clone(),
         dest_dir: task.dest_dir.to_string_lossy().to_string(),

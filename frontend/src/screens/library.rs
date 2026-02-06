@@ -83,6 +83,7 @@ struct RunEvent {
 #[derive(serde::Serialize)]
 struct StartDownloadArgs {
     id: String,
+    name: String,
     archive_url: String,
     config_url: String,
     dest_dir: String,
@@ -605,6 +606,7 @@ pub fn library_screen() -> Html {
                 build_http_url(&server_ip, &server_port, &format!("apps/{}/config", app.id));
             let args = StartDownloadArgs {
                 id: app.id.clone(),
+                name: app.name.clone(),
                 archive_url,
                 config_url,
                 dest_dir,
@@ -616,6 +618,7 @@ pub fn library_screen() -> Html {
                 let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
                     "request": {
                         "id": args.id.clone(),
+                        "name": args.name.clone(),
                         "archiveUrl": args.archive_url,
                         "configUrl": args.config_url,
                         "destDir": args.dest_dir,
@@ -880,7 +883,7 @@ pub fn library_screen() -> Html {
     };
 
     html! {
-        <div>
+        <div class="h-full">
             <div class="flex items-center justify-between gap-4">
                 <div>
                     <h1 class="text-2xl font-semibold">{ "Library" }</h1>
@@ -943,7 +946,7 @@ pub fn library_screen() -> Html {
                 <div
                     ref={carousel_ref.clone()}
                     onwheel={on_carousel_wheel}
-                    class="mt-8 flex gap-6 overflow-x-auto pb-4 snap-x snap-mandatory scrollbar-thin"
+                    class="mt-8 flex gap-6 h-full overflow-x-auto pb-4 snap-x snap-mandatory scrollbar-thin"
                 >
                     { for {
                         let mut items: Vec<_> = apps
@@ -1129,8 +1132,8 @@ pub fn library_screen() -> Html {
                         };
 
                         html! {
-                            <div key={app.id.clone()} class="snap-start shrink-0 w-[min(92vw,28rem)] rounded-3xl border-2 border-ink/40 bg-ink/30 p-1 shadow-xl">
-                                <div class="min-h-[22rem] rounded-2xl border border-ink/50 bg-inkLight p-6 flex flex-col">
+                            <div key={app.id.clone()} class="snap-start w-[min(60vw,24rem)] rounded-3xl border-2 border-ink/40 bg-ink/30 p-1 shadow-xl">
+                                <div class="h-full rounded-2xl w-[min(60vw,24rem)] border border-ink/50 bg-inkLight p-6 flex flex-col">
                                 <p class="text-xs uppercase tracking-wide text-accent/80">{ "App" }</p>
                                 <p class="mt-4 text-lg font-semibold">{ app.name.clone() }</p>
                                 <p class="mt-2 text-sm text-secondary/70">{ app.description.clone() }</p>
@@ -1143,7 +1146,7 @@ pub fn library_screen() -> Html {
                                 </div>
                                 <div class="mt-auto flex items-center justify-between">
                                     { action }
-                                    if !progress.is_empty() || !status_label.is_empty() {
+                                    if !progress.is_empty() && !status_label.is_empty() {
                                         <span class="text-xs text-secondary/60">
                                             { if status_label.is_empty() {
                                                 if speed.is_empty() { progress.clone() } else { format!("{progress} - {speed}") }

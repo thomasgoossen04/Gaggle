@@ -22,6 +22,7 @@ extern "C" {
 #[derive(Clone, PartialEq, Default)]
 struct DownloadView {
     status: String,
+    name: String,
     downloaded: u64,
     total: Option<u64>,
     speeds: Vec<f64>,
@@ -31,6 +32,7 @@ struct DownloadView {
 #[derive(Deserialize)]
 struct DownloadEvent {
     id: String,
+    name: String,
     downloaded: u64,
     total: Option<u64>,
     status: String,
@@ -40,6 +42,7 @@ struct DownloadEvent {
 #[derive(Deserialize)]
 struct DownloadSnapshot {
     id: String,
+    name: String,
     downloaded: u64,
     total: Option<u64>,
     status: String,
@@ -154,6 +157,7 @@ pub fn downloads_screen() -> Html {
                     for snapshot in list {
                         let mut view = next.get(&snapshot.id).cloned().unwrap_or_default();
                         view.status = snapshot.status;
+                        view.name = snapshot.name;
                         view.downloaded = snapshot.downloaded;
                         view.total = snapshot.total;
                         if snapshot.speed_bps > 0.0 {
@@ -219,6 +223,7 @@ pub fn downloads_screen() -> Html {
                                 }
                             }
                             view.last_tick = Some((now, event.downloaded));
+                            view.name = event.name;
                             view.status = event.status;
                             view.downloaded = event.downloaded;
                             view.total = event.total;
@@ -318,7 +323,7 @@ pub fn downloads_screen() -> Html {
                                     <div class="flex flex-wrap items-center justify-between gap-4">
                                         <div>
                                             <p class="text-xs uppercase tracking-wide text-accent/80">{ "Download" }</p>
-                                            <p class="mt-2 text-xl font-semibold">{ id.clone() }</p>
+                                            <p class="mt-2 text-xl font-semibold">{ view.name.clone() }</p>
                                             <p class="mt-1 text-sm text-secondary/70">
                                                 { format!("{} - {}", format_size(view.downloaded as i64), format_size(total as i64)) }
                                             </p>
