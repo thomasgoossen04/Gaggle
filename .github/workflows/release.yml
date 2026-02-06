@@ -15,9 +15,24 @@ jobs:
 
         runs-on: ${{ matrix.platform }}
 
+        env:
+            # Rust build speed
+            CARGO_INCREMENTAL: 0
+            CARGO_TERM_COLOR: always
+
+            # sccache
+            RUSTC_WRAPPER: sccache
+            SCCACHE_GHA_ENABLED: "true"
+
         steps:
+            # ---------------------------
+            # Checkout
+            # ---------------------------
             - uses: actions/checkout@v4
 
+            # ---------------------------
+            # Linux system deps
+            # ---------------------------
             - name: install dependencies (ubuntu only)
               if: matrix.platform == 'ubuntu-22.04'
               run: |
@@ -28,21 +43,61 @@ jobs:
                     librsvg2-dev \
                     patchelf
 
+            # ---------------------------
+            # Rust toolchain
+            # ---------------------------
             - name: install Rust
               uses: dtolnay/rust-toolchain@stable
 
+            # ---------------------------
+            # Rust + Cargo cache
+            # ---------------------------
+            - name: Rust cache
+              uses: swatinem/rust-cache@v2
+              with:
+                  workspaces: ./frontend/src-tauri -> target
+
+            # ---------------------------
+            # sccache
+            # ---------------------------
+            - name: setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.6
+
+            # ---------------------------
+            # Cache cargo binaries (Trunk)
+            # ---------------------------
+            - name: cache cargo bin
+              uses: actions/cache@v4
+              with:
+                  path: ~/.cargo/bin
+                  key: cargo-bin-${{ runner.os }}-trunk-0.21
+
             - name: install Trunk
-              run: cargo install trunk
+              run: |
+                  if ! command -v trunk >/dev/null; then
+                    cargo install trunk
+                  fi
 
+            # ---------------------------
+            # Frontend build (Trunk)
+            # ---------------------------
             - name: build frontend
-              run: trunk build
+              working-directory: ./frontend
+              env:
+                  TRUNK_SKIP_VERSION_CHECK: true
+              run: trunk build --release
 
-            - uses: tauri-apps/tauri-action@v0
+            # ---------------------------
+            # Tauri build + GitHub Release
+            # ---------------------------
+            - name: build tauri app and publish release
+              uses: tauri-apps/tauri-action@v0
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
                   TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
               with:
+                  projectPath: ./frontend
                   tagName: v__VERSION__
                   releaseName: "Gaggle v__VERSION__"
                   releaseBody: "See the assets to download this version."
