@@ -13,9 +13,7 @@ use std::{
 
 use futures_util::StreamExt;
 use reqwest::header::RANGE;
-use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
-use tauri::http::request;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::open_path;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
