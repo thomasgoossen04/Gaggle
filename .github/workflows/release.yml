@@ -72,6 +72,7 @@ jobs:
                   key: cargo-bin-${{ runner.os }}-trunk-0.21
 
             - name: install Trunk
+              shell: bash
               run: |
                   if ! command -v trunk >/dev/null; then
                     cargo install trunk
