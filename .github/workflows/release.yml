@@ -1,9 +1,11 @@
-name: release
+name: manual-release
 
 on:
-    push:
-        tags:
-            - "v*.*.*"
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: "Release tag (e.g. v1.0.1)"
+                required: true
 
 permissions:
     contents: write
@@ -45,15 +47,15 @@ jobs:
             - name: Build frontend
               run: trunk build
 
-            - name: Build Tauri app
+            - name: Build Tauri app + Release
               uses: tauri-apps/tauri-action@v2
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
                   TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
               with:
-                  tagName: ${{ github.ref_name }}
-                  releaseName: "Gaggle ${{ github.ref_name }}"
-                  releaseBody: "See the assets to download this version."
+                  tagName: ${{ inputs.tag }}
+                  releaseName: "Gaggle ${{ inputs.tag }}"
+                  releaseBody: "Release ${{ inputs.tag }}"
                   releaseDraft: false
                   prerelease: false
