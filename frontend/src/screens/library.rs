@@ -1132,9 +1132,8 @@ pub fn library_screen() -> Html {
                         };
 
                         html! {
-                            <div key={app.id.clone()} class="snap-start w-[min(60vw,24rem)] rounded-3xl border-2 border-ink/40 bg-ink/30 p-1 shadow-xl">
-                                <div class="h-full rounded-2xl w-[min(60vw,24rem)] border border-ink/50 bg-inkLight p-6 flex flex-col">
-                                <p class="text-xs uppercase tracking-wide text-accent/80">{ "App" }</p>
+                            <div key={app.id.clone()} class="h-full snap-start w-[min(60vw,28rem)] rounded-3xl border-2 border-ink/40 bg-ink/30 p-1 shadow-xl">
+                                <div class="h-full rounded-2xl w-[min(60vw,28rem)] border border-ink/50 bg-inkLight p-6 flex flex-col">
                                 <p class="mt-4 text-lg font-semibold">{ app.name.clone() }</p>
                                 <p class="mt-2 text-sm text-secondary/70">{ app.description.clone() }</p>
                                 <div class="mt-4 flex items-center justify-between text-xs text-secondary/60">

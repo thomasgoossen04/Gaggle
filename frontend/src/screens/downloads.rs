@@ -10,7 +10,8 @@ use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 use crate::auth::{get_local_storage_item, INSTALL_DIR_KEY, SESSION_TOKEN_KEY};
-use crate::components::{Button, IndeterminateBar, ProgressBar};
+use crate::components::DownloadSpeedGraph;
+use crate::components::{Button, IndeterminateBar};
 use crate::toast::{use_toast, ToastVariant};
 
 #[wasm_bindgen]
@@ -26,7 +27,9 @@ struct DownloadView {
     downloaded: u64,
     total: Option<u64>,
     speeds: Vec<f64>,
+    speed_points: Vec<(f64, f64)>, // (timestamp_secs, speed)
     last_tick: Option<(f64, u64)>,
+    logical_time: f64,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +50,10 @@ struct DownloadSnapshot {
     total: Option<u64>,
     status: String,
     speed_bps: f64,
+}
+
+fn now_secs() -> f64 {
+    js_sys::Date::now() / 1000.0
 }
 
 #[function_component(DownloadsScreen)]
@@ -155,7 +162,9 @@ pub fn downloads_screen() -> Html {
                 if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<DownloadSnapshot>>(initial) {
                     let mut next = (*downloads).clone();
                     for snapshot in list {
-                        let mut view = next.get(&snapshot.id).cloned().unwrap_or_default();
+                        let view = next
+                            .entry(snapshot.id.clone())
+                            .or_insert_with(DownloadView::default);
                         view.status = snapshot.status;
                         view.name = snapshot.name;
                         view.downloaded = snapshot.downloaded;
@@ -167,7 +176,6 @@ pub fn downloads_screen() -> Html {
                             }
                         }
                         view.last_tick = Some((js_sys::Date::now(), snapshot.downloaded));
-                        next.insert(snapshot.id.clone(), view);
                     }
                     downloads.set(next);
                 }
@@ -203,7 +211,9 @@ pub fn downloads_screen() -> Html {
                                 downloads.set(next);
                                 return;
                             }
-                            let mut view = next.get(&event.id).cloned().unwrap_or_default();
+                            let view = next
+                                .entry(event.id.clone())
+                                .or_insert_with(DownloadView::default);
                             let now = js_sys::Date::now();
                             let mut speed = event.speed_bps;
                             if speed <= 0.0 {
@@ -221,13 +231,17 @@ pub fn downloads_screen() -> Html {
                                 if view.speeds.len() > 60 {
                                     view.speeds.remove(0);
                                 }
+
+                                let now = now_secs();
+                                view.speed_points.push((now, speed));
+                                let cutoff = now - 10.0;
+                                view.speed_points.retain(|(t, _)| *t >= cutoff);
                             }
                             view.last_tick = Some((now, event.downloaded));
                             view.name = event.name;
                             view.status = event.status;
                             view.downloaded = event.downloaded;
                             view.total = event.total;
-                            next.insert(event.id.clone(), view);
                             downloads.set(next);
                         }
                     }));
@@ -334,7 +348,11 @@ pub fn downloads_screen() -> Html {
                                         </div>
                                     </div>
                                     <div class="mt-5">
-                                        <ProgressBar value={progress} />
+                                        <DownloadSpeedGraph
+                                            points={view.speed_points.clone()}
+                                            paused={view.status=="paused"}
+                                        />
+
                                         if view.status == "installing" {
                                             <div class="mt-3">
                                                 <p class="mb-2 text-xs uppercase tracking-wide text-accent/70">{ "Installing" }</p>
