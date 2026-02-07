@@ -450,112 +450,126 @@ pub fn library_screen() -> Html {
         let server_port = server_port.clone();
         let token = token.clone();
         use_effect_with((), move |_| {
-            let cleanup = || ();
-            let window = web_sys::window().unwrap();
-            let tauri = Reflect::get(&window, &JsValue::from_str("__TAURI__"));
-            if tauri.is_err() {
-                return cleanup;
-            }
-            let tauri = tauri.unwrap();
-            let event = Reflect::get(&tauri, &JsValue::from_str("event"));
-            if event.is_err() {
-                return cleanup;
-            }
-            let event = event.unwrap();
-            let listen = Reflect::get(&event, &JsValue::from_str("listen"));
-            if listen.is_err() {
-                return cleanup;
-            }
-            let listen = listen.unwrap();
-            let listen_fn: Function = listen.dyn_into().unwrap();
+            let cleanup: Box<dyn FnOnce()> = match (|| {
+                let window = web_sys::window().unwrap();
 
-            let callback = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
-                let payload =
-                    Reflect::get(&value, &JsValue::from_str("payload")).unwrap_or(JsValue::NULL);
-                let event: Result<RunEvent, _> = serde_wasm_bindgen::from_value(payload);
-                if let Ok(event) = event {
-                    if event.status == "started" {
+                let tauri = Reflect::get(&window, &JsValue::from_str("__TAURI__"))?;
+                let event = Reflect::get(&tauri, &JsValue::from_str("event"))?;
+                let listen = Reflect::get(&event, &JsValue::from_str("listen"))?;
+
+                let listen_fn: Function = listen.dyn_into().unwrap();
+
+                let callback =
+                    Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
+                        let payload = Reflect::get(&value, &JsValue::from_str("payload"))
+                            .unwrap_or(JsValue::NULL);
+
+                        let event: Result<RunEvent, _> = serde_wasm_bindgen::from_value(payload);
+                        let Ok(event) = event else {
+                            return;
+                        };
+
+                        if event.status == "started" {
+                            let mut next = (*running).clone();
+                            next.insert(event.id.clone());
+                            running.set(next);
+                            return;
+                        }
+
+                        if event.status != "stopped" {
+                            return;
+                        }
+
                         let mut next = (*running).clone();
-                        next.insert(event.id.clone());
+                        next.remove(&event.id);
                         running.set(next);
-                        return;
-                    }
-                    if event.status != "stopped" {
-                        return;
-                    }
-                    let mut next = (*running).clone();
-                    next.remove(&event.id);
-                    running.set(next);
 
-                    let server_ip = server_ip.clone();
-                    let server_port = server_port.clone();
-                    let token = token.clone();
-                    let playtime = playtime.clone();
-                    let toast = toast.clone();
-                    let id = event.id.clone();
-                    let duration = event.duration_seconds as i64;
-                    spawn_local(async move {
-                        if !server_ip.trim().is_empty()
-                            && !server_port.trim().is_empty()
-                            && !token.trim().is_empty()
-                        {
-                            let status_url = build_http_url(
+                        let server_ip = server_ip.clone();
+                        let server_port = server_port.clone();
+                        let token = token.clone();
+                        let playtime = playtime.clone();
+                        let toast = toast.clone();
+                        let id = event.id.clone();
+                        let duration = event.duration_seconds as i64;
+
+                        spawn_local(async move {
+                            if !server_ip.trim().is_empty()
+                                && !server_port.trim().is_empty()
+                                && !token.trim().is_empty()
+                            {
+                                let status_url = build_http_url(
+                                    server_ip.trim(),
+                                    server_port.trim(),
+                                    "social/status",
+                                );
+                                let body = serde_json::json!({ "status": "online" });
+                                let _ =
+                                    send_json("POST", &status_url, Some(token.trim()), Some(body))
+                                        .await;
+                            }
+
+                            if duration <= 0 {
+                                return;
+                            }
+
+                            if server_ip.trim().is_empty()
+                                || server_port.trim().is_empty()
+                                || token.trim().is_empty()
+                            {
+                                return;
+                            }
+
+                            let url = build_http_url(
                                 server_ip.trim(),
                                 server_port.trim(),
-                                "social/status",
+                                &format!("apps/{}/playtime", id),
                             );
-                            let body = serde_json::json!({ "status": "online" });
-                            let _ = send_json("POST", &status_url, Some(token.trim()), Some(body))
-                                .await;
-                        }
-                        if duration <= 0 {
-                            return;
-                        }
-                        if server_ip.trim().is_empty()
-                            || server_port.trim().is_empty()
-                            || token.trim().is_empty()
-                        {
-                            return;
-                        }
-                        let url = build_http_url(
-                            server_ip.trim(),
-                            server_port.trim(),
-                            &format!("apps/{}/playtime", id),
-                        );
-                        let body = serde_json::json!({ "seconds": duration });
-                        if let Ok(resp) =
-                            send_json("POST", &url, Some(token.trim()), Some(body)).await
-                        {
-                            if resp.ok() {
-                                if let Ok(promise) = resp.json() {
-                                    if let Ok(json) = JsFuture::from(promise).await {
-                                        if let Ok(entry) =
-                                            serde_wasm_bindgen::from_value::<PlaytimeEntry>(json)
-                                        {
-                                            let mut next = (*playtime).clone();
-                                            next.insert(entry.app_id.clone(), entry);
-                                            playtime.set(next);
+                            let body = serde_json::json!({ "seconds": duration });
+
+                            if let Ok(resp) =
+                                send_json("POST", &url, Some(token.trim()), Some(body)).await
+                            {
+                                if resp.ok() {
+                                    if let Ok(promise) = resp.json() {
+                                        if let Ok(json) = JsFuture::from(promise).await {
+                                            if let Ok(entry) =
+                                                serde_wasm_bindgen::from_value::<PlaytimeEntry>(
+                                                    json,
+                                                )
+                                            {
+                                                let mut next = (*playtime).clone();
+                                                next.insert(entry.app_id.clone(), entry);
+                                                playtime.set(next);
+                                            }
                                         }
                                     }
+                                } else {
+                                    toast.toast(
+                                        "Playtime upload failed.",
+                                        ToastVariant::Warning,
+                                        Some(2500),
+                                    );
                                 }
-                            } else {
-                                toast.toast(
-                                    "Playtime upload failed.",
-                                    ToastVariant::Warning,
-                                    Some(2500),
-                                );
                             }
-                        }
-                    });
-                }
-            }));
+                        });
+                    }));
 
-            let _ = listen_fn.call2(
-                &event,
-                &JsValue::from_str("app_run_event"),
-                callback.as_ref().unchecked_ref(),
-            );
-            callback.forget();
+                let _ = listen_fn.call2(
+                    &event,
+                    &JsValue::from_str("app_run_event"),
+                    callback.as_ref().unchecked_ref(),
+                );
+
+                callback.forget();
+
+                Ok::<_, JsValue>(())
+            })() {
+                Ok(_) => Box::new(|| {
+                    // optional cleanup (unlisten if available)
+                }),
+                Err(_) => Box::new(|| {}),
+            };
+
             cleanup
         });
     }

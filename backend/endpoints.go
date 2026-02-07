@@ -144,7 +144,7 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 				return
 			}
 			if err := SaveConfig(&next); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "save failed"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 			if err := cfg.Reload(); err != nil {
