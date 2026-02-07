@@ -138,7 +138,7 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 		})
 		admin.PUT("/config", func(c *gin.Context) {
 			var next Config
-			if err := c.ShouldBindJSON(&next); err != nil {
+			if err := c.ShouldBindBodyWithJSON(&next); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid config payload"})
 				return
 			}
@@ -164,7 +164,7 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 			var body struct {
 				Content string `json:"content"`
 			}
-			if err := c.ShouldBindJSON(&body); err != nil {
+			if err := c.ShouldBindBodyWithJSON(&body); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid config payload"})
 				return
 			}
@@ -208,7 +208,7 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 			var body struct {
 				Content string `json:"content"`
 			}
-			if err := c.ShouldBindJSON(&body); err != nil {
+			if err := c.ShouldBindBodyWithJSON(&body); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid config payload"})
 				return
 			}
