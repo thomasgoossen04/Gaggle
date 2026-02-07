@@ -13,6 +13,8 @@ use crate::api::{get_json, send_json};
 use crate::app::AppState;
 use crate::auth::{get_local_storage_item, set_local_storage_item, INSTALL_DIR_KEY};
 use crate::components::Button;
+use crate::confirm::use_confirm;
+use crate::confirm::ConfirmRequest;
 use crate::net::build_http_url;
 use crate::toast::{use_toast, ToastVariant};
 
@@ -661,13 +663,17 @@ pub fn library_screen() -> Html {
         })
     };
 
+    let confirm = use_confirm();
     let on_remove = {
         let install_dir = install_dir.clone();
         let installed = installed.clone();
         let downloads = downloads.clone();
         let toast = toast.clone();
+        let confirm = confirm.clone();
+
         Callback::from(move |id: String| {
             let install_dir = (*install_dir).clone();
+
             if install_dir.trim().is_empty() {
                 toast.toast(
                     "No install folder configured.",
@@ -676,24 +682,43 @@ pub fn library_screen() -> Html {
                 );
                 return;
             }
+
             let installed = installed.clone();
             let downloads = downloads.clone();
-            spawn_local(async move {
-                let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
-                    "request": {
-                        "id": id.clone(),
-                        "destDir": install_dir
-                    }
-                }))
-                .unwrap_or(JsValue::NULL);
-                let _ = invoke("remove_installed_app", payload).await;
-                let mut next = (*installed).clone();
-                next.remove(&id);
-                installed.set(next);
-                let mut downloads_next = (*downloads).clone();
-                downloads_next.remove(&id);
-                downloads.set(downloads_next);
-            });
+
+            confirm.confirm(ConfirmRequest {
+            title: "Remove application".into(),
+            message: "This will remove the installed application from your system. This action cannot be undone."
+                .into(),
+            confirm_label: "Remove".into(),
+            cancel_label: "Cancel".into(),
+            on_confirm: Callback::from(move |_| {
+                let id = id.clone();
+                let install_dir = install_dir.clone();
+                let installed = installed.clone();
+                let downloads = downloads.clone();
+
+                spawn_local(async move {
+                    let payload = serde_wasm_bindgen::to_value(&serde_json::json!({
+                        "request": {
+                            "id": id.clone(),
+                            "destDir": install_dir
+                        }
+                    }))
+                    .unwrap_or(JsValue::NULL);
+
+                    let _ = invoke("remove_installed_app", payload).await;
+
+                    let mut next = (*installed).clone();
+                    next.remove(&id);
+                    installed.set(next);
+
+                    let mut downloads_next = (*downloads).clone();
+                    downloads_next.remove(&id);
+                    downloads.set(downloads_next);
+                });
+            }),
+        });
         })
     };
 

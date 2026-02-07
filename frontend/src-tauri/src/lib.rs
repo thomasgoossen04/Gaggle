@@ -16,6 +16,7 @@ use reqwest::header::RANGE;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::open_path;
+use tauri_plugin_updater::UpdaterExt;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
 
 pub mod net;
@@ -106,6 +107,34 @@ struct ResumeRequest {
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+#[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+async fn check_and_install_update(app: tauri::AppHandle) -> Result<bool, String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+
+    if let Some(update) = updater.check().await.map_err(|e| e.to_string())? {
+        update
+            .download_and_install(
+                |_chunk, _total| {
+                    // progress callback (optional)
+                },
+                || {
+                    // download finished callback
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 #[tauri::command]
 fn get_default_apps_dir() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|_| "Failed to locate app binary.".to_string())?;
@@ -1227,6 +1256,8 @@ pub fn run() {
         .manage(DownloadManager::default())
         .manage(RunManager::default())
         .invoke_handler(tauri::generate_handler![
+            get_app_version,
+            check_and_install_update,
             get_default_apps_dir,
             pick_install_dir,
             pick_upload_folder,

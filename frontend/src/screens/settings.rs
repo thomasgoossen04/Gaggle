@@ -26,6 +26,8 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
     let server_ip = app_state.server_ip.clone();
     let server_port = app_state.server_port.clone();
     let toast = use_toast();
+    let updating = use_state(|| false);
+    let app_version = use_state(|| None::<String>);
     let install_dir = use_state(|| get_local_storage_item(INSTALL_DIR_KEY).unwrap_or_default());
 
     {
@@ -36,17 +38,37 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
                 return ();
             }
             spawn_local(async move {
-                match invoke("get_default_apps_dir", JsValue::NULL).await.as_string() {
+                match invoke("get_default_apps_dir", JsValue::NULL)
+                    .await
+                    .as_string()
+                {
                     Some(path) => {
                         set_local_storage_item(INSTALL_DIR_KEY, &path);
                         install_dir.set(path);
                     }
-                    None => toast.toast("Failed to load default install folder.", ToastVariant::Error, Some(3000)),
+                    None => toast.toast(
+                        "Failed to load default install folder.",
+                        ToastVariant::Error,
+                        Some(3000),
+                    ),
                 }
             });
             ()
         });
     }
+
+    {
+        let app_version = app_version.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                if let Some(version) = invoke("get_app_version", JsValue::NULL).await.as_string() {
+                    app_version.set(Some(version));
+                }
+            });
+            ()
+        });
+    }
+
     let on_reload_theme = {
         let server_ip = server_ip.clone();
         let server_port = server_port.clone();
@@ -101,6 +123,51 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
                     }
                 }
                 toast.toast("No folder selected.", ToastVariant::Warning, Some(2000));
+            });
+        })
+    };
+
+    let on_check_and_update = {
+        let toast = toast.clone();
+        let updating = updating.clone();
+
+        Callback::from(move |_| {
+            if *updating {
+                return;
+            }
+
+            updating.set(true);
+            let toast = toast.clone();
+            let updating = updating.clone();
+
+            spawn_local(async move {
+                let result = invoke("check_and_install_update", JsValue::NULL).await;
+
+                updating.set(false);
+
+                match result.as_bool() {
+                    Some(true) => {
+                        toast.toast(
+                            "Update installed. Restart the app to apply changes.",
+                            ToastVariant::Success,
+                            Some(4000),
+                        );
+                    }
+                    Some(false) => {
+                        toast.toast(
+                            "You're already on the latest version.",
+                            ToastVariant::Success,
+                            Some(2500),
+                        );
+                    }
+                    None => {
+                        toast.toast(
+                            "Failed to check for updates.",
+                            ToastVariant::Error,
+                            Some(3000),
+                        );
+                    }
+                }
             });
         })
     };
@@ -171,6 +238,43 @@ pub fn settings_screen(props: &SettingsScreenProps) -> Html {
                     </Button>
                 </div>
             </div>
+            <div class="mt-6 rounded-2xl border border-ink/50 bg-inkLight p-6">
+            <div class="flex items-center justify-between gap-4">
+                <div>
+                    <h2 class="text-sm font-semibold">{ "Application" }</h2>
+                    <p class="mt-2 text-sm text-secondary/70">
+                        {
+                            if let Some(version) = (*app_version).clone() {
+                                format!("Version {}", version)
+                            } else {
+                                "Loading version…".to_string()
+                            }
+                        }
+                    </p>
+                </div>
+
+                <Button
+                    onclick={on_check_and_update}
+                    disabled={*updating}
+                    class={Some(
+                        if *updating {
+                            "opacity-60 cursor-not-allowed".to_string()
+                        } else {
+                            "border border-accent/50 bg-accent/20 text-secondary hover:bg-accent/30"
+                                .to_string()
+                        }
+                    )}
+                >
+                    {
+                        if *updating {
+                            "Checking…"
+                        } else {
+                            "Check for updates"
+                        }
+                    }
+                </Button>
+            </div>
+        </div>
         </div>
     }
 }

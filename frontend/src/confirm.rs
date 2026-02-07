@@ -55,12 +55,24 @@ pub fn confirm_provider(props: &ConfirmProviderProps) -> Html {
             if let Some(req) = (*active).clone() {
                 <div class="fixed inset-0 z-50 flex items-center justify-center">
                     <div class="absolute inset-0 bg-ink/70 backdrop-blur-sm" onclick={on_cancel.clone()} />
-                    <div class="relative w-[min(92vw,28rem)] rounded-2xl border border-ink/50 bg-inkLight p-6 shadow-2xl">
+                    <div class="relative w-[min(92vw,28rem)] rounded-2xl border border-accent/50 bg-inkLight p-6 shadow-2xl">
                         <h2 class="text-lg font-semibold text-secondary">{ req.title }</h2>
                         <p class="mt-2 text-sm text-accent">{ req.message }</p>
                         <div class="mt-6 flex items-center justify-end gap-3">
                             <button
-                                class="rounded-xl border border-ink/50 bg-ink/40 px-4 py-2 text-sm font-semibold text-secondary transition hover:bg-ink/50"
+                                class="cursor-pointer
+                                    rounded-xl
+                                    border border-accent/60
+                                    bg-accent/20
+                                    px-4 py-2
+                                    text-sm font-semibold text-secondary
+                                    shadow-sm
+                                    transition
+                                    hover:bg-accent/30
+                                    active:scale-[0.98]
+                                    focus:outline-none
+                                    focus-visible:ring-2
+                                    focus-visible:ring-accent/60"
                                 type="button"
                                 onclick={on_cancel}
                             >
