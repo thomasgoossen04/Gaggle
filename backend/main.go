@@ -9,6 +9,7 @@ func main() {
 	cfg := MustLoadConfig()
 	gin.SetMode(cfg.Mode)
 	router := gin.Default()
+	router.Use(gin.Logger(), gin.Recovery())
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"*"},

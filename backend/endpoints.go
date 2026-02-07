@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -168,12 +169,18 @@ func RegisterRoutes(router *gin.Engine, store *Store, cfg *Config) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid config payload"})
 				return
 			}
+			if strings.TrimSpace(body.Content) == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "content is empty"})
+				return
+			}
 			if err := os.WriteFile(configPath, []byte(body.Content), 0644); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "save failed"})
 				return
 			}
 			if err := cfg.Reload(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "reload failed"})
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": err.Error(),
+				})
 				return
 			}
 			c.JSON(http.StatusOK, gin.H{"status": "saved"})
