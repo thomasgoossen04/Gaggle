@@ -1,6 +1,6 @@
 {
     "name": "frontend",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "This template should help get you started developing with Tauri and Yew.",
     "main": "index.js",
     "scripts": {

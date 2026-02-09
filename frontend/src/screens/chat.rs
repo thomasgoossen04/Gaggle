@@ -1,5 +1,5 @@
-use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use js_sys::{ArrayBuffer, Uint8Array};
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{BinaryType, Blob, MessageEvent, WebSocket};
 use yew::prelude::*;
@@ -55,44 +55,47 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
         let server_ip = server_ip.clone();
         let server_port = server_port.clone();
         let token = token.clone();
-        use_effect_with((server_ip.clone(), server_port.clone(), token.clone()), move |_| {
-            if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
-                loading.set(false);
-                return ();
-            }
-
-            spawn_local(async move {
-                let chat_enabled = match fetch_features(&server_ip, &server_port).await {
-                    Ok(chat_enabled) => {
-                        enabled.set(chat_enabled);
-                        chat_enabled
-                    }
-                    Err(msg) => {
-                        error.set(Some(msg));
-                        loading.set(false);
-                        return;
-                    }
-                };
-
-                if chat_enabled {
-                    match fetch_messages(&server_ip, &server_port, &token).await {
-                        Ok(msgs) => {
-                            let mut next = (*messages).clone();
-                            for msg in msgs {
-                                if !next.iter().any(|m| m.id == msg.id) {
-                                    next.push(msg);
-                                }
-                            }
-                            next.sort_by_key(|m| m.timestamp);
-                            messages.set(next);
-                        }
-                        Err(msg) => error.set(Some(msg)),
-                    }
+        use_effect_with(
+            (server_ip.clone(), server_port.clone(), token.clone()),
+            move |_| {
+                if server_ip.is_empty() || server_port.is_empty() || token.is_empty() {
+                    loading.set(false);
+                    return ();
                 }
-                loading.set(false);
-            });
-            ()
-        });
+
+                spawn_local(async move {
+                    let chat_enabled = match fetch_features(&server_ip, &server_port).await {
+                        Ok(chat_enabled) => {
+                            enabled.set(chat_enabled);
+                            chat_enabled
+                        }
+                        Err(msg) => {
+                            error.set(Some(msg));
+                            loading.set(false);
+                            return;
+                        }
+                    };
+
+                    if chat_enabled {
+                        match fetch_messages(&server_ip, &server_port, &token).await {
+                            Ok(msgs) => {
+                                let mut next = (*messages).clone();
+                                for msg in msgs {
+                                    if !next.iter().any(|m| m.id == msg.id) {
+                                        next.push(msg);
+                                    }
+                                }
+                                next.sort_by_key(|m| m.timestamp);
+                                messages.set(next);
+                            }
+                            Err(msg) => error.set(Some(msg)),
+                        }
+                    }
+                    loading.set(false);
+                });
+                ()
+            },
+        );
     }
 
     {
@@ -108,7 +111,13 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
         let on_unread = props.on_unread.clone();
 
         use_effect_with(
-            (server_ip.clone(), server_port.clone(), token.clone(), *enabled, *loading),
+            (
+                server_ip.clone(),
+                server_port.clone(),
+                token.clone(),
+                *enabled,
+                *loading,
+            ),
             move |_| {
                 if server_ip.is_empty()
                     || server_port.is_empty()
@@ -116,92 +125,97 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
                     || *loading
                     || !*enabled
                 {
-                return Box::new(|| ()) as Box<dyn FnOnce()>;
-            }
-
-            let ws_url =
-                build_ws_url(&server_ip, &server_port, &format!("chat/ws?token={token}"));
-            let ws = match WebSocket::new(&ws_url) {
-                Ok(ws) => ws,
-                Err(_) => {
-                    error.set(Some("Failed to open chat socket.".to_string()));
                     return Box::new(|| ()) as Box<dyn FnOnce()>;
                 }
-            };
-            ws.set_binary_type(BinaryType::Arraybuffer);
 
-            let onmessage = {
-                let messages = messages.clone();
-                let online_users = online_users.clone();
-                let error = error.clone();
-                let active_ref = active_ref.clone();
-                let on_unread = on_unread.clone();
-                Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
-                    let data = event.data();
+                let ws_url =
+                    build_ws_url(&server_ip, &server_port, &format!("chat/ws?token={token}"));
+                let ws = match WebSocket::new(&ws_url) {
+                    Ok(ws) => ws,
+                    Err(_) => {
+                        error.set(Some("Failed to open chat socket.".to_string()));
+                        return Box::new(|| ()) as Box<dyn FnOnce()>;
+                    }
+                };
+                ws.set_binary_type(BinaryType::Arraybuffer);
+
+                let onmessage = {
                     let messages = messages.clone();
                     let online_users = online_users.clone();
+                    let error = error.clone();
                     let active_ref = active_ref.clone();
                     let on_unread = on_unread.clone();
-                    let error = error.clone();
+                    Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(
+                        move |event: MessageEvent| {
+                            let data = event.data();
+                            let messages = messages.clone();
+                            let online_users = online_users.clone();
+                            let active_ref = active_ref.clone();
+                            let on_unread = on_unread.clone();
+                            let error = error.clone();
 
-                    if let Some(event) = parse_chat_event(data.clone()) {
-                        let is_active = *active_ref.borrow();
-                        apply_chat_event(
-                            event,
-                            &messages,
-                            &online_users,
-                            is_active,
-                            &on_unread,
-                        );
-                        return;
-                    }
-
-                    if data.is_instance_of::<Blob>() {
-                        let blob: Blob = data.unchecked_into();
-                        let messages = messages.clone();
-                        let online_users = online_users.clone();
-                        let active_ref = active_ref.clone();
-                        let on_unread = on_unread.clone();
-                        let error = error.clone();
-                        spawn_local(async move {
-                            if let Ok(buf) = wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await {
-                                if let Some(event) = parse_chat_event(buf) {
-                                    let is_active = *active_ref.borrow();
-                                    apply_chat_event(
-                                        event,
-                                        &messages,
-                                        &online_users,
-                                        is_active,
-                                        &on_unread,
-                                    );
-                                } else {
-                                    error.set(Some("Invalid chat event.".to_string()));
-                                }
+                            if let Some(event) = parse_chat_event(data.clone()) {
+                                let is_active = *active_ref.borrow();
+                                apply_chat_event(
+                                    event,
+                                    &messages,
+                                    &online_users,
+                                    is_active,
+                                    &on_unread,
+                                );
+                                return;
                             }
-                        });
-                        return;
-                    }
 
-                    error.set(Some("Invalid chat event.".to_string()));
-                }))
-            };
+                            if data.is_instance_of::<Blob>() {
+                                let blob: Blob = data.unchecked_into();
+                                let messages = messages.clone();
+                                let online_users = online_users.clone();
+                                let active_ref = active_ref.clone();
+                                let on_unread = on_unread.clone();
+                                let error = error.clone();
+                                spawn_local(async move {
+                                    if let Ok(buf) =
+                                        wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+                                            .await
+                                    {
+                                        if let Some(event) = parse_chat_event(buf) {
+                                            let is_active = *active_ref.borrow();
+                                            apply_chat_event(
+                                                event,
+                                                &messages,
+                                                &online_users,
+                                                is_active,
+                                                &on_unread,
+                                            );
+                                        } else {
+                                            error.set(Some("Invalid chat event.".to_string()));
+                                        }
+                                    }
+                                });
+                                return;
+                            }
 
-            ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-            onmessage.forget();
+                            error.set(Some("Invalid chat event.".to_string()));
+                        },
+                    ))
+                };
 
-            let onerror = {
-                let error = error.clone();
-                Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(move |_event| {
-                    error.set(Some("Chat connection error.".to_string()));
-                }))
-            };
-            ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-            onerror.forget();
+                ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+                onmessage.forget();
 
-            let ws_ref = ws.clone();
-            Box::new(move || {
-                let _ = ws_ref.close();
-            }) as Box<dyn FnOnce()>
+                let onerror = {
+                    let error = error.clone();
+                    Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(move |_event| {
+                        error.set(Some("Chat connection error.".to_string()));
+                    }))
+                };
+                ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+                onerror.forget();
+
+                let ws_ref = ws.clone();
+                Box::new(move || {
+                    let _ = ws_ref.close();
+                }) as Box<dyn FnOnce()>
             },
         );
     }
@@ -317,7 +331,7 @@ pub fn chat_screen(props: &ChatScreenProps) -> Html {
                     { msg }
                 </div>
             } else {
-                <div class="mt-6 h-[calc(100vh-18rem)] min-h-[18rem] overflow-hidden rounded-2xl border border-ink/50 bg-inkLight/90 p-6">
+                <div class="mt-6 h-[calc(96vh-18rem)] min-h-[18rem] overflow-hidden rounded-2xl border border-ink/50 bg-inkLight/90 p-6">
                     if messages.is_empty() {
                         <div class="flex h-full min-h-0 gap-6">
                             <aside class="w-48 shrink-0 rounded-xl border border-ink/50 bg-ink/40 p-3">

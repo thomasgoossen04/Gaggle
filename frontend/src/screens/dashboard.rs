@@ -1,15 +1,15 @@
 use yew::prelude::*;
 
+use crate::api::get_json;
 use crate::app::AppState;
 use crate::auth::handle_logout;
-use crate::net::build_http_url;
 use crate::components::Button;
-use wasm_bindgen_futures::spawn_local;
-use crate::api::get_json;
+use crate::net::build_http_url;
 use crate::screens::{
     admin::AdminScreen, chat::ChatScreen, downloads::DownloadsScreen, library::LibraryScreen,
-    social::SocialScreen, settings::SettingsScreen,
+    settings::SettingsScreen, social::SocialScreen,
 };
+use wasm_bindgen_futures::spawn_local;
 
 type AppStateHandle = UseStateHandle<AppState>;
 
@@ -125,8 +125,8 @@ pub fn dashboard() -> Html {
     };
 
     html! {
-        <main class="min-h-screen bg-ink text-secondary">
-            <div class="flex min-h-screen">
+        <main class="h-screen bg-ink text-secondary">
+            <div class="flex h-full">
                 <aside class="w-64 border-r border-ink/40 bg-inkLight/90 p-6 shadow-2xl">
                     <h2 class="text-6xl font-semibold">{ "Gaggle" }</h2>
                     <nav class="mt-8 flex flex-col gap-2 text-sm">
@@ -142,8 +142,8 @@ pub fn dashboard() -> Html {
                         }
                     </nav>
                 </aside>
-                <section class="flex-1 bg-ink/70 p-10 min-h-screen overflow-hidden">
-                    <div class="h-full min-h-0 rounded-3xl border border-ink/40 bg-ink/40 p-8 shadow-2xl backdrop-blur flex flex-col">
+                <section class="flex-1 bg-ink/70 p-10 min-h-screen overflow-y-auto">
+                    <div class="h-full min-h-0 rounded-3xl border border-ink/40 bg-ink/40 p-8 shadow-2xl backdrop-blur flex flex-col overflow-y-auto scrollbar-thin">
                         <div class={if *active_tab == Tab::Library { "" } else { "hidden" }}>
                             <LibraryScreen />
                         </div>
