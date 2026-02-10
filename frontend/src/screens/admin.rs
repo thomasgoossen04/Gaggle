@@ -437,71 +437,83 @@ pub fn admin_screen() -> Html {
 
     {
         let upload_progress = upload_progress.clone();
-        let upload_current_id = upload_current_id.clone();
-        let upload_stage = upload_stage.clone();
         use_effect_with((), move |_| {
-            let window = web_sys::window().unwrap();
-            let tauri = Reflect::get(&window, &JsValue::from_str("__TAURI__"));
-            if let Ok(tauri) = tauri {
-                if let Ok(event) = Reflect::get(&tauri, &JsValue::from_str("event")) {
-                    if let Ok(listen) = Reflect::get(&event, &JsValue::from_str("listen")) {
-                        let listen_fn: Function = listen.dyn_into().unwrap();
-                        let upload_current_id = upload_current_id.clone();
-                        let upload_progress = upload_progress.clone();
-                        let callback =
-                            Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
-                                let payload = Reflect::get(&value, &JsValue::from_str("payload"))
-                                    .unwrap_or(JsValue::NULL);
-                                let event: Result<UploadProgressEvent, _> =
-                                    serde_wasm_bindgen::from_value(payload);
-                                if let Ok(event) = event {
-                                    if event.id == (*upload_current_id).clone() {
-                                        upload_progress.set(event.pct);
-                                    }
-                                }
-                            }));
-                        let _ = listen_fn.call2(
-                            &event,
-                            &JsValue::from_str("app_upload_progress"),
-                            callback.as_ref().unchecked_ref(),
-                        );
-                        callback.forget();
-                    }
-                }
-            }
-            let tauri = Reflect::get(&window, &JsValue::from_str("__TAURI__"));
-            if let Ok(tauri) = tauri {
-                if let Ok(event) = Reflect::get(&tauri, &JsValue::from_str("event")) {
-                    if let Ok(listen) = Reflect::get(&event, &JsValue::from_str("listen")) {
-                        let listen_fn: Function = listen.dyn_into().unwrap();
-                        let upload_current_id = upload_current_id.clone();
-                        let upload_stage = upload_stage.clone();
-                        let upload_progress = upload_progress.clone();
-                        let callback =
-                            Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
-                                let payload = Reflect::get(&value, &JsValue::from_str("payload"))
-                                    .unwrap_or(JsValue::NULL);
-                                let event: Result<UploadStageEvent, _> =
-                                    serde_wasm_bindgen::from_value(payload);
-                                if let Ok(event) = event {
-                                    if event.id == (*upload_current_id).clone() {
-                                        let stage = event.stage.clone();
-                                        if stage == "uploading" {
-                                            upload_progress.set(0.0);
-                                        }
-                                        upload_stage.set(stage);
-                                    }
-                                }
-                            }));
-                        let _ = listen_fn.call2(
-                            &event,
-                            &JsValue::from_str("app_upload_stage"),
-                            callback.as_ref().unchecked_ref(),
-                        );
-                        callback.forget();
-                    }
-                }
-            }
+            let upload_progress = upload_progress.clone();
+
+            spawn_local(async move {
+                let window = web_sys::window().unwrap();
+                let tauri = Reflect::get(&window, &JsValue::from_str("__TAURI__")).unwrap();
+                let event = Reflect::get(&tauri, &JsValue::from_str("event")).unwrap();
+                let listen = Reflect::get(&event, &JsValue::from_str("listen")).unwrap();
+                let listen_fn: Function = listen.dyn_into().unwrap();
+
+                let callback =
+                    Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
+                        let payload = Reflect::get(&value, &JsValue::from_str("payload"))
+                            .unwrap_or(JsValue::NULL);
+
+                        if let Ok(event) =
+                            serde_wasm_bindgen::from_value::<UploadProgressEvent>(payload)
+                        {
+                            upload_progress.set(event.pct);
+                        }
+                    }));
+
+                let promise = listen_fn
+                    .call2(
+                        &event,
+                        &JsValue::from_str("app_upload_progress"),
+                        callback.as_ref().unchecked_ref(),
+                    )
+                    .expect("listen call failed");
+
+                let promise: js_sys::Promise = promise.into();
+
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+
+                callback.forget();
+            });
+
+            || ()
+        });
+    }
+
+    {
+        let upload_stage = upload_stage.clone();
+
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                let window = web_sys::window().unwrap();
+                let tauri = Reflect::get(&window, &JsValue::from_str("__TAURI__")).unwrap();
+                let event = Reflect::get(&tauri, &JsValue::from_str("event")).unwrap();
+                let listen = Reflect::get(&event, &JsValue::from_str("listen")).unwrap();
+                let listen_fn: Function = listen.dyn_into().unwrap();
+
+                let callback =
+                    Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |value: JsValue| {
+                        let payload = Reflect::get(&value, &JsValue::from_str("payload"))
+                            .unwrap_or(JsValue::NULL);
+
+                        if let Ok(evt) = serde_wasm_bindgen::from_value::<UploadStageEvent>(payload)
+                        {
+                            upload_stage.set(evt.stage);
+                        }
+                    }));
+
+                let promise = listen_fn
+                    .call2(
+                        &event,
+                        &JsValue::from_str("app_upload_stage"),
+                        callback.as_ref().unchecked_ref(),
+                    )
+                    .expect("listen failed");
+
+                let promise: js_sys::Promise = promise.into();
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+
+                callback.forget();
+            });
+
             || ()
         });
     }
