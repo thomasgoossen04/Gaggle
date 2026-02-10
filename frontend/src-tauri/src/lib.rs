@@ -424,7 +424,28 @@ async fn upload_app(request: UploadAppRequest, app: AppHandle) -> Result<(), Str
         .map_err(|_| "Failed to open archive for upload.".to_string())?;
 
     let stream = ReaderStream::new(file);
-    let body = reqwest::Body::wrap_stream(stream);
+    let app_clone = app.clone();
+    let id_clone = request.id.clone();
+    let sent = Arc::new(StdMutex::new(0u64));
+    let progress_stream = stream.map(move |chunk| {
+        if let Ok(ref bytes) = chunk {
+            let mut sent_guard = sent.lock().unwrap();
+            *sent_guard += bytes.len() as u64;
+            let pct = (*sent_guard as f64 / total as f64) * 100.0;
+            let _ = app_clone.emit(
+                "app_upload_progress",
+                UploadProgress {
+                    id: id_clone.clone(),
+                    sent: *sent_guard,
+                    total,
+                    pct,
+                },
+            );
+        }
+
+        chunk
+    });
+    let body = reqwest::Body::wrap_stream(progress_stream);
 
     let config_b64 = general_purpose::STANDARD.encode(&request.config_toml);
 
