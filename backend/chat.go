@@ -68,7 +68,6 @@ func (s *Store) ListChatMessages(limit int) ([]ChatMessage, error) {
 		}
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -149,9 +148,17 @@ func (h *ChatHub) run() {
 
 func (h *ChatHub) broadcastPresence() {
 	users := make([]string, 0, len(h.clients))
+	seen := make(map[string]struct{})
+
+	// Prevent duplicates
 	for _, client := range h.clients {
+		if _, ok := seen[client.UserID]; ok {
+			continue
+		}
+		seen[client.UserID] = struct{}{}
 		users = append(users, client.Username)
 	}
+
 	event := ChatEvent{Type: "presence", Users: users}
 	for _, client := range h.clients {
 		select {
