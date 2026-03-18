@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger"
@@ -14,8 +14,10 @@ import (
 	"golang.org/x/oauth2"
 )
 
-var discordOAuthConfig *oauth2.Config
-var loginChallenges = newLoginChallengeStore()
+var (
+	discordOAuthConfig *oauth2.Config
+	loginChallenges    = newLoginChallengeStore()
+)
 
 const loginChallengeTTL = 10 * time.Minute
 
@@ -57,7 +59,6 @@ func DiscordLoginHandler(cfg *Config) gin.HandlerFunc {
 
 func DiscordCallbackHandler(store *Store, cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-
 		code := c.Query("code")
 		state := c.Query("state")
 
