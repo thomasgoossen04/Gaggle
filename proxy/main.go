@@ -9,7 +9,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const defaultCacheSize = 10 * 1024 * 1024 * 1024 // 10GB
+const (
+	defaultCacheSize  = 10 * 1024 * 1024 * 1024 // 10GB
+	defaultNASBaseURL = "http://127.0.0.1:2122/apps"
+)
 
 func parseCacheSize() int64 {
 	val := os.Getenv("CACHE_SIZE")
@@ -42,13 +45,28 @@ func parseCacheSize() int64 {
 	return num * multiplier
 }
 
+func parseNASBaseURL() string {
+	val := strings.TrimSpace(os.Getenv("NAS_BASE_URL"))
+	if val == "" {
+		log.Printf("NAS_BASE_URL not set, using default: %s", defaultNASBaseURL)
+		return defaultNASBaseURL
+	}
+
+	// Ensure no trailing slash (avoids double //)
+	val = strings.TrimRight(val, "/")
+
+	return val
+}
+
 func main() {
 	cacheSize := parseCacheSize()
+	nasBase := parseNASBaseURL()
 
-	log.Printf("Cache size: %d bytes (%.2f GB)", cacheSize, float64(cacheSize)/(1024*1024*1024))
+	log.Printf("Cache size: %.2f GB", float64(cacheSize)/(1024*1024*1024))
+	log.Printf("NAS base URL: %s", nasBase)
 
 	cache := NewCache("./cache", cacheSize)
-	proxy := NewProxy(cache, "http://nas:8080/apps")
+	proxy := NewProxy(cache, nasBase)
 
 	r := gin.Default()
 	r.GET("/apps/:id/archive", proxy.HandleDownload)
