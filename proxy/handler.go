@@ -27,7 +27,35 @@ func (p *Proxy) HandleDownload(c *gin.Context) {
 	id := c.Param("id")
 	cachePath := p.cache.GetPath(id)
 
-	// Cache hit
+	rangeHeader := c.GetHeader("Range")
+
+	// If RANGE request → proxy directly (no cache)
+	if rangeHeader != "" {
+		url := p.nasBase + "/" + id + ".tar.gz"
+
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Range", rangeHeader)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			c.Status(502)
+			return
+		}
+		defer resp.Body.Close()
+
+		// copy headers
+		for k, v := range resp.Header {
+			for _, vv := range v {
+				c.Header(k, vv)
+			}
+		}
+
+		c.Status(resp.StatusCode)
+		io.Copy(c.Writer, resp.Body)
+		return
+	}
+
+	// Normal cache logic (no Range)
 	if entry, ok := p.cache.Exists(id); ok {
 		file, err := os.Open(entry.Path)
 		if err == nil {
@@ -38,13 +66,9 @@ func (p *Proxy) HandleDownload(c *gin.Context) {
 		}
 	}
 
-	// Cache miss → download
+	// fetch full file → cache → serve
 	_, err := p.group.Do(id, func() (interface{}, error) {
-		// Double-check after acquiring lock
-		if _, err := os.Stat(cachePath); err == nil {
-			return nil, nil
-		}
-
+		// download full file
 		url := p.nasBase + "/" + id + ".tar.gz"
 
 		resp, err := http.Get(url)
@@ -64,10 +88,8 @@ func (p *Proxy) HandleDownload(c *gin.Context) {
 			return nil, err
 		}
 
-		stat, err := os.Stat(cachePath)
-		if err == nil {
-			p.cache.Add(id, cachePath, stat.Size())
-		}
+		stat, _ := os.Stat(cachePath)
+		p.cache.Add(id, cachePath, stat.Size())
 
 		return nil, nil
 	})
@@ -76,14 +98,8 @@ func (p *Proxy) HandleDownload(c *gin.Context) {
 		return
 	}
 
-	// Now serve (ALL clients get it)
-	file, err := os.Open(cachePath)
-	if err != nil {
-		c.Status(500)
-		return
-	}
+	file, _ := os.Open(cachePath)
 	defer file.Close()
-
 	stat, _ := file.Stat()
 	http.ServeContent(c.Writer, c.Request, filepath.Base(cachePath), stat.ModTime(), file)
 }
