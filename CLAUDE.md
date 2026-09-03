@@ -242,6 +242,19 @@ thin gpui renderer that only ever calls `App`'s sync methods and reads `App::sna
 — it holds no `net` types and has no automated tests (a windowed GPU app can't run in
 CI). Put behaviour in `app-state`, pixels in `gui`.
 
+**Do not screenshot or launch the app to check visual changes.** After a GUI change,
+confirm it builds (`cargo build -p gui`) and passes `cargo clippy -p gui --all-targets`,
+then ask the user to run it and confirm the result looks right. Don't drive `spectacle`
+/ `grim` / `cargo run -p gui` for verification.
+
+`gui` module layout: `main.rs` (window + module wiring only) · `app.rs` (the one gpui
+view — state snapshot, tab, actions) · `ui/` (`widgets.rs` themed primitives,
+`chrome.rs` title bar + status bar, `views.rs` the three tabs) · `theme.rs` (swappable
+`Palette`s — `DARK`, `LIGHT`; every widget paints from `theme::active()`, a
+thread-local) · `clipboard.rs` · `util.rs`. Add a theme = one more `static Palette` +
+a branch in `theme::activate`. The window is decorationless (`WindowDecorations::Client`
++ `window_border()`); the header draws its own min/max/close and drag-to-move.
+
 ## GUI dependency note
 
 `gpui` and `gpui-component` are pulled from **crates.io** (`gpui = "0.2"`,

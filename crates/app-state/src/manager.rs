@@ -311,7 +311,12 @@ impl Manager {
                 }
             }
             Command::DownloadDone { id, outcome } => {
-                self.downloads.remove(&id);
+                // The scratch chunk store has served its purpose — the files are
+                // now materialised in the output dir and a `Complete` transfer is
+                // never resumed. Drop it so it doesn't sit around forever.
+                if let Some(job) = self.downloads.remove(&id) {
+                    clear_partial(job.chunk_dir);
+                }
                 if let Some(row) = self.state.transfers.get_mut(&id) {
                     row.status = TransferStatus::Complete;
                     row.files = outcome.files;
@@ -477,10 +482,16 @@ impl Manager {
         self.seeds.remove(&id);
         if let Some(job) = self.downloads.remove(&id) {
             job.task.abort();
-            let dir = job.chunk_dir;
-            tokio::task::spawn_blocking(move || {
-                let _ = std::fs::remove_dir_all(dir);
-            });
+            clear_partial(job.chunk_dir);
+        } else if let Some(mid) = self
+            .state
+            .transfers
+            .get(&id)
+            .filter(|r| r.kind == TransferKind::Downloading)
+            .map(|r| r.manifest_id)
+        {
+            // Job already finished or failed; its scratch dir may still be here.
+            clear_partial(self.partial_dir(mid));
         }
         self.state.transfers.remove(&id);
         self.recount();
@@ -529,6 +540,18 @@ impl Manager {
 
 async fn fail(tx: &mpsc::Sender<Command>, id: TransferId, error: String) {
     let _ = tx.send(Command::WorkerFailed { id, error }).await;
+}
+
+/// Delete a download's scratch chunk store off-thread, and the shared
+/// `.gaggle-partial` parent once it's left empty. Best-effort — any error
+/// (already gone, another download still using the parent) is ignored.
+fn clear_partial(dir: PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    });
 }
 
 async fn run_download(

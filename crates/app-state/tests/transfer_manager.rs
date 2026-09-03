@@ -128,6 +128,47 @@ async fn share_a_folder_then_subscribe_and_complete() {
 }
 
 #[tokio::test]
+async fn completing_a_download_removes_its_partial_dir() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let addr = seed.share_addr.clone().unwrap();
+    let manifest_id = seed.manifest_id;
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![addr],
+        credential: None,
+    });
+
+    wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+
+    // Files landed in the output tree…
+    dir_matches(folder.path(), &out.path().join("modpack"));
+
+    // …and the scratch chunk store is cleaned up (off-thread, so poll for it).
+    let partial_root = out.path().join(".gaggle-partial");
+    let gone = timeout(Duration::from_secs(5), async {
+        while partial_root.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "{} not removed after completion", partial_root.display());
+}
+
+#[tokio::test]
 async fn progress_is_reported_before_completion() {
     let folder = sample_folder();
     let seeder = App::new(None).await.unwrap();
