@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use gaggle_core::Hash;
-use net::{Multiaddr, PeerId};
+use net::{CacheStats, Multiaddr, PeerId};
 
 use crate::settings::Settings;
 
@@ -84,6 +84,17 @@ pub struct TransferRow {
     /// For a completed download: where the files were written.
     pub output_dir: Option<PathBuf>,
     pub error: Option<String>,
+    /// Manifest version currently held (download) or served (seed). Bumped by a
+    /// rescan or a resync.
+    pub version: u64,
+    /// Seed only: `true` once the share has been made invite-only.
+    pub private: bool,
+    /// Seed only: the local folder this share snapshots — the source a rescan
+    /// re-reads.
+    pub source_dir: Option<PathBuf>,
+    /// Download only: a newer manifest version seen by the last update check.
+    /// Cleared by a successful resync.
+    pub update_available: Option<u64>,
 }
 
 impl TransferRow {
@@ -104,6 +115,60 @@ pub struct SwarmStatus {
     pub downloading: usize,
 }
 
+/// Which accelerator role a machine has opted into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceleratorRole {
+    /// High-bandwidth hot-chunk cache + NAT relay / rendezvous point.
+    Relay,
+    /// Durable full replica of a designated share, LAN-priority serving.
+    Nas,
+}
+
+impl AcceleratorRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            AcceleratorRole::Relay => "Relay",
+            AcceleratorRole::Nas => "NAS replica",
+        }
+    }
+}
+
+/// Result of [`App::benchmark`](crate::App::benchmark) — the numbers the setup
+/// wizard uses to suggest a role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchmarkResult {
+    /// Sequential write throughput to the download directory, bytes per second.
+    pub disk_write_bps: u64,
+    /// Free space on the download directory's filesystem, bytes.
+    pub free_bytes: u64,
+    /// The role these numbers point at.
+    pub suggested: AcceleratorRole,
+}
+
+/// Live status of an in-process accelerator this node is running.
+#[derive(Debug, Clone)]
+pub struct AcceleratorState {
+    pub role: AcceleratorRole,
+    pub peer_id: PeerId,
+    /// Dialable `…/p2p/<id>` listen addresses.
+    pub listen_addrs: Vec<Multiaddr>,
+    /// One-line human status ("caching 3 shares from 1 upstream", …).
+    pub detail: String,
+    /// Relay role: hot-chunk cache occupancy and hit rate.
+    pub cache: Option<CacheStats>,
+    /// NAS role: chunks currently on the durable replica.
+    pub replica_chunks: Option<usize>,
+}
+
+/// A `gaggleshare1…` token just produced by
+/// [`App::mint_invite`](crate::App::mint_invite), so the GUI can pick it up on
+/// its next poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintedInvite {
+    pub transfer: TransferId,
+    pub token: String,
+}
+
 /// The whole observable app state. The GUI holds one of these and replaces it
 /// wholesale whenever [`App`](crate::App) signals a change.
 #[derive(Debug, Clone, Default)]
@@ -113,6 +178,12 @@ pub struct AppState {
     pub transfers: BTreeMap<TransferId, TransferRow>,
     pub settings: Settings,
     pub swarm: SwarmStatus,
+    /// The accelerator this node is running, if any.
+    pub accelerator: Option<AcceleratorState>,
+    /// The most recent [`App::benchmark`](crate::App::benchmark) result.
+    pub benchmark: Option<BenchmarkResult>,
+    /// The token from the most recent [`App::mint_invite`](crate::App::mint_invite).
+    pub minted_invite: Option<MintedInvite>,
 }
 
 impl AppState {

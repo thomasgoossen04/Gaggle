@@ -1,6 +1,6 @@
 //! Headless accelerator daemon. Runs as either a bandwidth-heavy relay node
-//! with a hot-chunk cache (milestone 5) or a storage-heavy cache/NAS replica
-//! node (milestone 6).
+//! with a hot-chunk cache or a storage-heavy cache/NAS replica
+//! node.
 //!
 //! ```text
 //! # relay + Kademlia bootstrap, caching a share pulled from an origin

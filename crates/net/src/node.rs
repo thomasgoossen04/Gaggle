@@ -226,7 +226,7 @@ impl Node {
         self.send(Command::SetCatalog(Box::new(catalog))).await
     }
 
-    /// Turn this node's share private (milestone 7): from now on it answers a
+    /// Turn this node's share private: from now on it answers a
     /// request only on a connection that has presented a valid
     /// [`SignedCapability`] for `share` and the currently-served manifest, and
     /// only within that capability's [`Scope`]. Call [`serve`](Self::serve)
@@ -265,6 +265,18 @@ impl Node {
             self.authenticate(peer, credential).await?;
         }
         Ok(())
+    }
+
+    /// Fetch just `peer`'s manifest — the small document, no chunk lists. Used
+    /// to cheaply check a subscribed share for a newer version.
+    pub async fn fetch_manifest(&self, peer: PeerId) -> anyhow::Result<gaggle_core::Manifest> {
+        match self.request(peer, Request::GetManifest).await? {
+            Response::Manifest(m) => {
+                m.validate().map_err(|e| anyhow::anyhow!("peer sent an invalid manifest: {e}"))?;
+                Ok(m)
+            }
+            other => anyhow::bail!("asked for the manifest, got {}", other.kind()),
+        }
     }
 
     /// Fetch and verify just `peer`'s share metadata — the manifest and every

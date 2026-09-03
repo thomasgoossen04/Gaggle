@@ -1,4 +1,4 @@
-//! Milestone 7: private swarms and per-item permissions.
+//! Private swarms and per-item permissions.
 //!
 //! A restricted `Node` / `RelayNode` serves nothing until a connection presents
 //! a capability the share's keypair signed, and then only the files that

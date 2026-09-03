@@ -1,4 +1,4 @@
-//! Milestones 2–7 as real processes on one machine.
+//! The chunk-exchange stack as real processes on one machine.
 //!
 //! ```text
 //! # one or more terminals — serve a folder, each prints a dialable multiaddr.

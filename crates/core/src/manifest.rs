@@ -82,8 +82,8 @@ impl Manifest {
 
     /// Content address of the manifest itself: `blake3` over its compact JSON.
     ///
-    /// This is the "manifest hash" an invite link carries (milestone 7) and the
-    /// key a share is announced and discovered under on the DHT (milestone 3).
+    /// This is the "manifest hash" an invite link carries and the
+    /// key a share is announced and discovered under on the DHT.
     /// [`canonicalize`](Self::canonicalize) first — the hash is only stable for
     /// sorted, de-duplicated entries.
     pub fn id(&self) -> Hash {

@@ -1,4 +1,4 @@
-//! Milestone 2 end-to-end, on the milestone-3 [`Node`]: snapshot a folder on one
+//! End-to-end on the [`Node`]: snapshot a folder on one
 //! side, hand its address over directly (no DHT), pull it back over loopback
 //! QUIC on the other, and prove every file reconstructs byte-for-byte.
 

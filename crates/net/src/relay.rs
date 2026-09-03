@@ -1,4 +1,4 @@
-//! [`RelayNode`] — an accelerator in its relay role (milestones 3 & 5).
+//! [`RelayNode`] — an accelerator in its relay role.
 //!
 //! It is three things at once:
 //!
@@ -6,7 +6,7 @@
 //!   (the TURN-style fallback path),
 //! - a **Kademlia server** that acts as the swarm's bootstrap / rendezvous
 //!   point, and
-//! - a **hot-chunk cache** (milestone 5): a byte-budgeted
+//! - a **hot-chunk cache**: a byte-budgeted
 //!   [`LruChunkCache`](gaggle_core::LruChunkCache) in front of the chunk
 //!   protocol. Once a share is registered with [`cache_share`](RelayNode::cache_share)
 //!   the relay answers `GetChunk` from cache; on a miss it fetches the chunk
@@ -159,7 +159,7 @@ impl RelayNode {
         Ok(rx.await?)
     }
 
-    /// Make the relay private (milestone 7): it will serve — from cache or via
+    /// Make the relay private: it will serve — from cache or via
     /// an upstream fill — only to a connection that has presented a valid
     /// [`SignedCapability`](gaggle_core::SignedCapability) for `share` and one
     /// of the cached manifests, and only within that capability's

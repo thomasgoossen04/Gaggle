@@ -1,16 +1,16 @@
-//! The composed libp2p behaviours for milestone 3.
+//! The composed libp2p behaviours.
 //!
 //! Two node shapes share one wire vocabulary:
 //!
-//! - [`PeerBehaviour`] — a standard peer (origin or subscriber): the milestone-2
-//!   chunk [`request_response`] protocol, plus **Kademlia** for discovery,
+//! - [`PeerBehaviour`] — a standard peer (origin or subscriber): the chunk
+//!   [`request_response`] protocol, plus **Kademlia** for discovery,
 //!   **identify** so peers learn each other's addresses, a **relay client** and
 //!   **dcutr** so a peer behind NAT can be reached through a relay and then
 //!   upgraded to a direct connection.
 //! - [`RelayBehaviour`] — an accelerator in its relay role: a **relay server**
 //!   plus a Kademlia node that doubles as the swarm's bootstrap/rendezvous
 //!   point, plus the chunk [`request_response`] protocol so it can also serve a
-//!   **hot-chunk cache** (milestone 5) read through to an upstream seed.
+//!   **hot-chunk cache** read through to an upstream seed.
 //!
 //! Both use private protocol names so a Gaggle swarm never touches the public
 //! IPFS DHT.

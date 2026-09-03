@@ -1,14 +1,14 @@
 //! Data-plane networking for Gaggle.
 //!
-//! - Milestone 2: a libp2p **request-response over QUIC** protocol
+//! - A libp2p **request-response over QUIC** protocol
 //!   ([`proto`], [`transfer`]) that pulls a share and verifies every chunk
 //!   against the manifest.
-//! - Milestone 3: [`Node`] wires that protocol together with **Kademlia**
+//! - [`Node`] wires that protocol together with **Kademlia**
 //!   discovery, **identify**, a **relay client** and **dcutr** so peers can find
 //!   each other's shares on the DHT and reach each other through a relay before
 //!   upgrading to a direct connection. [`RelayNode`] is the always-on relay +
 //!   bootstrap point (the accelerator's relay role).
-//! - Milestone 4: [`fetch_share_from_swarm`] pulls a share from many peers at
+//! - [`fetch_share_from_swarm`] pulls a share from many peers at
 //!   once, choosing the rarest chunk first and spreading load across sources;
 //!   [`Node::download_share_multi`] is the wired-up entry point.
 #![forbid(unsafe_code)]
@@ -92,5 +92,5 @@ pub(crate) fn build_relay_swarm() -> anyhow::Result<Swarm<RelayBehaviour>> {
 
 /// One-line status string for the accelerator daemon's start-up log.
 pub fn describe() -> &'static str {
-    "net: libp2p QUIC + Kademlia DHT + relay/dcutr + rarest-first swarm + hot-cache + invite ACLs (milestones 4–7)"
+    "net: libp2p QUIC + Kademlia DHT + relay/dcutr + rarest-first swarm + hot-cache + invite ACLs"
 }

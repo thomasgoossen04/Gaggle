@@ -12,7 +12,7 @@ use crate::error::Error;
 ///
 /// Equality and ordering are plain byte comparisons (lexicographic), *not*
 /// constant-time — content addresses are not secrets. Capability tokens and MACs
-/// (milestone 7) get their own constant-time types.
+/// get their own constant-time types.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash([u8; 32]);
 

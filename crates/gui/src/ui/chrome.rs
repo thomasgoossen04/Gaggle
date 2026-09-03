@@ -97,8 +97,9 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(tab_btn(app, cx, Tab::Shares, "Shares"))
                                 .child(tab_btn(app, cx, Tab::Transfers, "Transfers"))
+                                .child(tab_btn(app, cx, Tab::Shares, "Shares"))
+                                .child(tab_btn(app, cx, Tab::Accelerator, "Accelerator"))
                                 .child(tab_btn(app, cx, Tab::Settings, "Settings")),
                         ),
                 )
@@ -126,7 +127,11 @@ pub fn status_bar(app: &Gaggle) -> impl IntoElement {
     let t = theme::active();
     let s = &app.state.swarm;
     let text = app.notice.clone().unwrap_or_else(|| {
-        format!("{} SEEDING  //  {} DOWNLOADING", s.seeding, s.downloading).into()
+        let accel = match &app.state.accelerator {
+            Some(a) => format!("  //  ACCEL: {}", a.role.label().to_uppercase()),
+            None => String::new(),
+        };
+        format!("{} SEEDING  //  {} DOWNLOADING{accel}", s.seeding, s.downloading).into()
     });
     div()
         .flex()

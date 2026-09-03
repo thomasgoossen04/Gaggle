@@ -1,4 +1,4 @@
-//! Milestone 7: an invite published to the control-plane service comes back
+//! An invite published to the control-plane service comes back
 //! intact by its code, and the embedded credential still validates.
 
 use std::time::{SystemTime, UNIX_EPOCH};

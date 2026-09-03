@@ -13,10 +13,10 @@
 //!   normal peer downloads into.
 //! - [`LruChunkCache`] — a byte-budgeted in-RAM cache that evicts the
 //!   least-recently-used chunk when full. The relay accelerator's hot-chunk
-//!   cache (milestone 5): high bandwidth, deliberately small storage.
+//!   cache: high bandwidth, deliberately small storage.
 //! - [`DiskChunkStore`] — a durable content-addressed store on the filesystem,
 //!   one file per chunk, sharded by hash prefix. The cache/NAS accelerator's
-//!   full replica (milestone 6): survives restarts, resumes partial fills.
+//!   full replica: survives restarts, resumes partial fills.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -125,7 +125,7 @@ impl DedupStats {
 
 /// A byte-budgeted, in-memory chunk cache with least-recently-used eviction.
 ///
-/// This is the relay accelerator's hot-chunk cache (milestone 5): a node with
+/// This is the relay accelerator's hot-chunk cache: a node with
 /// lots of bandwidth but little storage keeps only the chunks that are being
 /// asked for right now, and re-fetches a cold chunk from upstream if it comes
 /// back into demand. [`get`](ChunkStore::get) and [`contains`](ChunkStore::contains)
@@ -281,7 +281,7 @@ pub struct CacheStats {
 ///
 /// One file per chunk, named by lowercase-hex hash, sharded into 256 directories
 /// by the first hash byte so no single directory holds the whole store. This is
-/// the cache/NAS accelerator's replica backing (milestone 6): it survives a
+/// the cache/NAS accelerator's replica backing: it survives a
 /// restart, and because [`put`](ChunkStore::put) skips chunks already on disk a
 /// half-finished replication just resumes.
 ///

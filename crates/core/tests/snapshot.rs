@@ -1,10 +1,12 @@
-//! End-to-end milestone 1: folder on disk -> chunks -> Merkle roots -> manifest,
+//! End-to-end: folder on disk -> chunks -> Merkle roots -> manifest,
 //! with a deduping store underneath.
 
 use std::fs;
 use std::path::Path;
 
-use gaggle_core::{DiskChunkStore, Manifest, MemoryChunkStore, snapshot_dir, write_share};
+use gaggle_core::{
+    DiskChunkStore, Manifest, MemoryChunkStore, snapshot_dir, sync_share, write_share,
+};
 
 /// Deterministic pseudo-random bytes (splitmix64).
 fn pattern(len: usize, mut seed: u64) -> Vec<u8> {
@@ -146,4 +148,62 @@ fn write_share_reconstructs_a_folder_from_a_disk_store() {
     let mut check = MemoryChunkStore::new();
     let again = snapshot_dir(out.path(), "replica", 1, &mut check).unwrap();
     assert_eq!(again.manifest.id(), snap.manifest.id());
+}
+
+#[test]
+fn sync_share_applies_only_the_delta_to_an_existing_tree() {
+    // v1 of the share: three files + an empty dir, materialized to `out`.
+    let src = tempfile::tempdir().unwrap();
+    let sroot = src.path();
+    write(sroot, "data/archive.bin", &pattern(12 * 1024 * 1024, 11));
+    write(sroot, "data/keep.txt", b"unchanged across versions");
+    write(sroot, "data/old-only.txt", b"present in v1, gone in v2");
+    fs::create_dir_all(sroot.join("data/dropme")).unwrap();
+
+    let mut store = MemoryChunkStore::new();
+    let v1 = snapshot_dir(sroot, "share", 1, &mut store).unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    write_share(out.path(), &v1.manifest, &v1.chunk_lists, &store).unwrap();
+
+    // v2: grow the archive, delete a file and its dir, add a new file.
+    let mut grown = pattern(12 * 1024 * 1024, 11);
+    grown.extend_from_slice(&pattern(768 * 1024, 22));
+    write(sroot, "data/archive.bin", &grown);
+    fs::remove_file(sroot.join("data/old-only.txt")).unwrap();
+    fs::remove_dir(sroot.join("data/dropme")).unwrap();
+    write(sroot, "data/new.txt", b"fresh in v2");
+
+    let v2 = snapshot_dir(sroot, "share", 2, &mut store).unwrap();
+
+    // Freeze the untouched file's mtime so we can prove it was never rewritten.
+    let keep_before = fs::metadata(out.path().join("data/keep.txt")).unwrap().modified().unwrap();
+
+    let outcome =
+        sync_share(out.path(), &v1.manifest, &v2.manifest, &v2.chunk_lists, &store).unwrap();
+
+    assert_eq!(outcome.written, ["data/archive.bin", "data/new.txt"]);
+    assert_eq!(outcome.removed, ["data/old-only.txt"]);
+
+    // The output tree now matches a fresh v2 materialization exactly.
+    for f in &v2.manifest.files {
+        assert_eq!(
+            fs::read(sroot.join(&f.path)).unwrap(),
+            fs::read(out.path().join(&f.path)).unwrap(),
+            "{}",
+            f.path
+        );
+    }
+    assert!(!out.path().join("data/old-only.txt").exists(), "removed file is gone");
+    assert!(!out.path().join("data/dropme").exists(), "emptied dir is pruned");
+    assert_eq!(
+        fs::metadata(out.path().join("data/keep.txt")).unwrap().modified().unwrap(),
+        keep_before,
+        "the unchanged file was not rewritten"
+    );
+
+    // Re-snapshotting the synced tree reproduces v2's identity.
+    let mut check = MemoryChunkStore::new();
+    let again = snapshot_dir(out.path(), "share", 2, &mut check).unwrap();
+    assert_eq!(again.manifest.id(), v2.manifest.id());
 }

@@ -1,4 +1,4 @@
-//! Milestone 3: a share announced on the Kademlia DHT is discovered by a peer
+//! A share announced on the Kademlia DHT is discovered by a peer
 //! that only knows the bootstrap node, and a peer reachable only through a relay
 //! circuit is still served (with an opportunistic dcutr upgrade to a direct
 //! connection).

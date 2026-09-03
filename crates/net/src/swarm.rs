@@ -1,4 +1,4 @@
-//! Milestone 4: pulling one share from many peers at once, rarest chunk first.
+//! Pulling one share from many peers at once, rarest chunk first.
 //!
 //! [`fetch_share_from_swarm`] is the multi-source counterpart of
 //! [`fetch_share`](crate::transfer::fetch_share). Given a set of source peers it
@@ -41,7 +41,7 @@ pub struct SwarmConfig {
     /// Sources to lean on first: while any preferred source that holds a chunk
     /// has spare capacity, the chunk is fetched from it rather than from an
     /// ordinary source. This is the NAS accelerator's "LAN-priority serving"
-    /// (milestone 6) — a downloader with a fast local replica in `prefer` pulls
+    /// — a downloader with a fast local replica in `prefer` pulls
     /// almost everything from it and only spills to other peers when it
     /// saturates.
     pub prefer: Vec<PeerId>,

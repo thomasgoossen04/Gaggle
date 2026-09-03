@@ -170,6 +170,7 @@ dependencies = [
  "anyhow",
  "base64",
  "gaggle-core",
+ "libc",
  "net",
  "serde",
  "serde_json",
@@ -3121,6 +3122,7 @@ dependencies = [
  "app-state",
  "gpui",
  "gpui-component",
+ "regex",
  "tokio",
 ]
 

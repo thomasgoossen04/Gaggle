@@ -15,7 +15,9 @@ is implemented and tested. `gaggle-core` ships three `ChunkStore`s: `MemoryChunk
 (a plain map), `LruChunkCache` (byte-budgeted, LRU eviction — the relay's hot cache),
 and `DiskChunkStore` (durable, one sharded file per chunk — the NAS replica).
 `snapshot::write_share` is `snapshot_dir`'s inverse: materialize a share's files from
-any store back onto disk.
+any store back onto disk. `snapshot::sync_share` is its delta form (milestone 10):
+given the old + new manifests it rebuilds only added/changed files, deletes removed
+ones, and prunes emptied dirs.
 
 Milestone 7 (private swarms) adds `identity` + `invite` to `gaggle-core`: a per-share
 Ed25519 `ShareKeypair` / `SharePublicKey`, and a bearer `Capability` (`Scope::All` or
@@ -85,33 +87,51 @@ round-trips an invite through a live server. Plus the
 Peer `Node`s deliberately do **not** `add_external_address` their own loopback addr —
 that would make the swarm swallow the identify address candidates dcutr needs.
 
-Milestone 8 (GUI v1) is implemented and tested:
+Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
 
 - **`app-state`** — the headless, UI-framework-agnostic transfer manager. `App` is a
   sync, thread-safe handle (callable from a GUI thread with no tokio runtime); all the
   async lives on a background task `App::new` spawns. It owns the `net` nodes: one
-  shared downloading `Node`, one serving `Node` per local share. `App::add_local_share`
-  snapshots a folder (off-thread) and seeds it; `App::subscribe(SubscribeRequest)`
+  shared downloading `Node`, one serving `Node` per local share (`Arc<Node>`, so a
+  rescan can re-`serve` in place). `App::add_local_share` snapshots a folder (off-thread)
+  and seeds it; `App::add_private_share` also mints a per-share `ShareKeypair` and calls
+  `restrict_to_invite_holders`, and `App::mint_invite(id, Scope, expiry)` hands back a
+  `gaggleshare1…` token in `AppState::minted_invite`. `App::subscribe(SubscribeRequest)`
   pulls a remote share into a `DiskChunkStore` under the download dir (so pause = abort,
   resume = top up), then `write_share`s the tree out. Progress rides
-  `Node::download_share_multi_with_progress` (new `SwarmProgress` per chunk). Callers
-  read `App::snapshot()` (a cloneable `AppState { transfers, settings, swarm }`) or
-  listen on `App::events()`. `Settings` persist to a JSON path. `ShareLink` is the
-  copy-paste `gaggleshare1…` token (addr(s) + manifest id + optional invite) that turns
-  into a `SubscribeRequest`.
-- **`gui`** — a gpui shell over `App`: a Shares view (add folder, copy link, remove), a
-  Transfers view (progress bars, pause/resume/remove, paste-a-link to subscribe), and a
-  Settings view. It polls `App::snapshot()` on a 200 ms `Timer` and re-renders; it never
-  touches `net`. Raw gpui for layout/interaction; `gpui_component::{init, v_flex}` only.
+  `Node::download_share_multi_with_progress` (`SwarmProgress` per chunk).
+- **Delta sync (milestone 10)** — `App::rescan_share(id)` re-snapshots a seeded folder,
+  bumps `Manifest::version`, and re-serves. `App::check_updates(id)` fetches just the
+  remote manifest (`Node::fetch_manifest`) and flags `TransferRow::update_available` when
+  it is newer; `App::resync(id)` re-chunks the existing output tree into a store, tops it
+  up with only the delta chunks, then applies `gaggle_core::sync_share` (writes
+  added/changed files, deletes removed ones, prunes emptied dirs). `Settings::auto_resync_secs`
+  turns on a background poll that only *flags* newer versions. A private share pins its
+  manifest id in every capability, so a rescanned private share needs a fresh invite.
+- **Accelerator control (milestone 9)** — `App::start_accelerator(AcceleratorRequest::{Relay,Nas})`
+  runs an in-process `RelayNode` (optionally read-through caching one `ShareLink`) or a
+  NAS replica (`DiskChunkStore` + `download_share_multi` + `serve`), surfaced as
+  `AppState::accelerator` (role, peer id, listen addr, live `CacheStats` / replica chunk
+  count). `App::benchmark()` measures sequential write throughput to the download volume
+  plus free space (`statvfs` on unix) and suggests a role.
+- **`gui`** — a gpui shell over `App`: Shares (add public / private folder, copy link,
+  rescan, per-row ▸ panel with the invite form), Transfers (progress bars,
+  pause/resume/remove, check-updates/resync, `update vN` badge, per-row ▸ swarm
+  inspector = per-source chunk/byte breakdown), Accelerator (benchmark → suggested role
+  → start relay / NAS → live status), and an editable Settings form. It polls
+  `App::snapshot()` on a 200 ms `Timer` and re-renders; it never touches `net`. Raw gpui
+  for layout/interaction, plus `gpui_component::{init, v_flex, window_border}` and
+  `gpui_component::input::{Input, InputState}` for the form fields.
 
 Tests: `app-state/tests/transfer_manager.rs` runs real loopback transfers through two
 `App`s — share→subscribe→complete with byte-exact output, incremental progress events,
 pause keeps partial + resume finishes, settings survive a restart, removing a seed makes
-later subscribers fail. `app-state` unit tests cover `Settings` persistence, `ShareLink`
-round trips, and name sanitizing.
-
-Milestone 9 (GUI v2 — accelerator setup wizard, swarm inspector, invite dialog, theming
-polish) and milestone 10 (delta sync) are next.
+later subscribers fail, **rescan→check_updates→resync applies only the delta** (added
+file arrives, removed file is deleted, `version` bumps), **a private share refuses a
+strangers then admits a minted invite**, **benchmark reports throughput + free space**,
+**a NAS accelerator replicates a share**. `app-state` unit tests cover `Settings`
+persistence, `ShareLink` round trips, and name sanitizing.
+`crates/core/tests/snapshot.rs` adds a `sync_share` delta-apply test.
 
 ## Commands
 
@@ -248,8 +268,10 @@ then ask the user to run it and confirm the result looks right. Don't drive `spe
 / `grim` / `cargo run -p gui` for verification.
 
 `gui` module layout: `main.rs` (window + module wiring only) · `app.rs` (the one gpui
-view — state snapshot, tab, actions) · `ui/` (`widgets.rs` themed primitives,
-`chrome.rs` title bar + status bar, `views.rs` the three tabs) · `theme.rs` (swappable
+view — state snapshot, tab, per-row expansion set, the Settings/Accelerator/invite
+`InputState` entities, actions) · `ui/` (`widgets.rs` themed primitives incl. `field()`
+over `gpui_component::input::Input`, `chrome.rs` title bar + status bar, `views.rs` the
+four tabs + expandable detail panels) · `theme.rs` (swappable
 `Palette`s — `DARK`, `LIGHT`; every widget paints from `theme::active()`, a
 thread-local) · `clipboard.rs` · `util.rs`. Add a theme = one more `static Palette` +
 a branch in `theme::activate`. The window is decorationless (`WindowDecorations::Client`

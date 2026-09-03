@@ -1,4 +1,4 @@
-//! Wire protocol for the milestone-2 chunk exchange.
+//! Wire protocol for the chunk exchange.
 //!
 //! A single libp2p request-response protocol carries three request kinds. Every
 //! answer a subscriber gets back is verifiable against the manifest it already
@@ -13,7 +13,7 @@ pub const PROTOCOL: &str = "/gaggle/chunk/1.0.0";
 /// What a subscriber asks the origin (or, later, an accelerator) for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Present a capability token for this connection (milestone 7). On a
+    /// Present a capability token for this connection. On a
     /// private share every other request is refused with
     /// [`Response::Unauthorized`] until a `Hello` carrying a valid token has
     /// been answered with [`Response::Welcome`]. Harmless on a public share.
@@ -26,7 +26,7 @@ pub enum Request {
     /// The bytes of one content-addressed chunk.
     GetChunk(Hash),
     /// Which of the share's chunks this peer can currently serve. Lets a
-    /// multi-peer downloader (milestone 4) compute per-chunk availability and
+    /// multi-peer downloader compute per-chunk availability and
     /// pull the rarest chunks first. A full seed answers with every chunk it
     /// holds; a peer still downloading answers with its partial set.
     GetInventory,

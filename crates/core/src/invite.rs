@@ -1,4 +1,4 @@
-//! Invites and capability tokens (milestone 7).
+//! Invites and capability tokens.
 //!
 //! A Gaggle swarm is private: peers only serve chunks to someone who presents a
 //! [`SignedCapability`] issued by the share's [`ShareKeypair`]. The capability

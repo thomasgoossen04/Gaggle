@@ -16,9 +16,10 @@ mod state;
 
 pub use gaggle_core::{Hash, Invite};
 pub use link::ShareLink;
-pub use manager::{App, AppEvent, SubscribeRequest};
-pub use net::{Multiaddr, PeerId};
+pub use manager::{App, AppEvent, AcceleratorRequest, SubscribeRequest};
+pub use net::{CacheStats, Multiaddr, PeerId, Scope};
 pub use settings::{Settings, Theme};
 pub use state::{
-    AppState, SourceStats, SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
+    AcceleratorRole, AcceleratorState, AppState, BenchmarkResult, MintedInvite, SourceStats,
+    SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
 };

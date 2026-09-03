@@ -1,4 +1,4 @@
-//! Milestones 5 & 6: the two accelerator roles.
+//! The two accelerator roles.
 //!
 //! * **Relay accelerator** — a hot-chunk cache in front of the chunk protocol.
 //!   A swarm of peers pulling from the relay costs the origin only one fetch per
@@ -81,7 +81,7 @@ fn reconstruct_and_check(share: &TempDir, manifest: &Manifest, store: &dyn Chunk
     }
 }
 
-// --- Milestone 5: relay accelerator hot-chunk cache -----------------------
+// --- Relay accelerator hot-chunk cache ----------------------------------
 
 #[tokio::test]
 async fn relay_cache_serves_a_share_and_shields_the_origin() {
@@ -171,7 +171,7 @@ async fn relay_cache_evicts_under_a_tight_budget() {
     relay.shutdown().await;
 }
 
-// --- Milestone 6: cache/NAS accelerator durable replica ------------------
+// --- Cache/NAS accelerator durable replica -----------------------------
 
 #[tokio::test]
 async fn nas_replica_is_durable_and_serves_after_restart() {

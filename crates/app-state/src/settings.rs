@@ -39,6 +39,11 @@ pub struct Settings {
     /// Storage ceiling for cache-accelerator mode, in bytes (`None` = no cap).
     pub storage_cap_bytes: Option<u64>,
     pub theme: Theme,
+    /// If set, subscribed shares are polled this often (seconds) for a newer
+    /// manifest version. A newer version is only *flagged* — never applied
+    /// without an explicit resync. `None` disables the background poll.
+    #[serde(default)]
+    pub auto_resync_secs: Option<u64>,
 }
 
 impl Default for Settings {
@@ -49,6 +54,7 @@ impl Default for Settings {
             upload_cap_bps: None,
             storage_cap_bytes: None,
             theme: Theme::System,
+            auto_resync_secs: None,
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Invite exchange over plain HTTP (milestone 7).
+//! Invite exchange over plain HTTP.
 //!
 //! The data plane is private, so an invite ([`gaggle_core::Invite`]) has to
 //! reach a new subscriber out of band. Copy-paste / QR is one channel; this is

@@ -1,14 +1,14 @@
 //! [`snapshot_dir`] — the one place in this crate that *reads* the filesystem to
 //! build a share, and [`write_share`] — its inverse, materializing a share's
 //! files from a [`ChunkStore`] back onto disk (the cache/NAS accelerator's
-//! replica, milestone 6).
+//! replica).
 //!
 //! `snapshot_dir` walks a folder, chunks every regular file (reading
 //! incrementally, so a 100 GB folder never needs 100 GB of RAM), pushes chunk
 //! bytes into a [`ChunkStore`], and returns the [`Manifest`] plus the per-file
 //! [`ChunkList`]s.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
@@ -20,7 +20,7 @@ use crate::hash::Hash;
 use crate::manifest::{FileEntry, Manifest};
 use crate::store::ChunkStore;
 
-/// Everything milestone 1 derives from a folder.
+/// Everything derived from a folder.
 pub struct Snapshot {
     /// The small, shareable document.
     pub manifest: Manifest,
@@ -112,38 +112,128 @@ pub fn write_share(
         let list = chunk_lists
             .get(&file.path)
             .ok_or_else(|| Error::Manifest(format!("no chunk list for {}", file.path)))?;
+        materialize_file(root, file, list, store)?;
+    }
+    Ok(())
+}
 
+/// What [`sync_share`] changed on disk.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SyncOutcome {
+    /// Manifest paths (re)built from the store (files added or with a new root).
+    pub written: Vec<String>,
+    /// Manifest paths deleted from disk because `new` no longer lists them.
+    pub removed: Vec<String>,
+}
+
+impl SyncOutcome {
+    /// Nothing on disk needed to change.
+    pub fn is_noop(&self) -> bool {
+        self.written.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Bring the tree under `root` from `old` to `new`, touching only what changed.
+///
+/// This is the delta-sync counterpart of [`write_share`]. It uses
+/// [`Manifest::diff`]: files that are new or whose Merkle root changed are
+/// rebuilt from `store` exactly as [`write_share`] would; files listed by `old`
+/// but not `new` are deleted; unchanged files are left untouched and their bytes
+/// are never read. Directories in `new.dirs` are created; directories `old`
+/// listed that `new` does not are removed when empty (deepest first).
+///
+/// `store` must hold every chunk of every file that needs rebuilding — top it up
+/// with a swarm download first. `new_chunk_lists` must have an entry for every
+/// added/changed file (as returned together by a download). `old` must describe
+/// what is actually on disk, or unchanged-but-stale files will be missed.
+pub fn sync_share(
+    root: &Path,
+    old: &Manifest,
+    new: &Manifest,
+    new_chunk_lists: &BTreeMap<String, ChunkList>,
+    store: &dyn ChunkStore,
+) -> Result<SyncOutcome> {
+    fs::create_dir_all(root)?;
+    for dir in &new.dirs {
+        fs::create_dir_all(root.join(dir))?;
+    }
+
+    let diff = Manifest::diff(old, new);
+    let mut outcome = SyncOutcome::default();
+
+    // Added + changed: rebuild from the (topped-up) store.
+    let rebuild = diff.added.iter().copied().chain(diff.changed.iter().map(|(_, n)| *n));
+    for file in rebuild {
+        let list = new_chunk_lists
+            .get(&file.path)
+            .ok_or_else(|| Error::Manifest(format!("no chunk list for {}", file.path)))?;
+        materialize_file(root, file, list, store)?;
+        outcome.written.push(file.path.clone());
+    }
+
+    // Removed files.
+    for file in &diff.removed {
         let dest = root.join(&file.path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+        match fs::remove_file(&dest) {
+            Ok(()) => outcome.removed.push(file.path.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e)),
         }
+    }
 
-        let mut written = 0u64;
-        let mut out = BufWriter::new(File::create(&dest)?);
-        for chunk in &list.chunks {
-            let bytes = store.get(&chunk.hash).ok_or_else(|| {
-                Error::Verify(format!("{}: missing chunk {}", file.path, chunk.hash))
-            })?;
-            if Hash::of(&bytes) != chunk.hash {
-                return Err(Error::Verify(format!(
-                    "{}: chunk {} in the store hashes wrong",
-                    file.path, chunk.hash
-                )));
-            }
-            out.write_all(&bytes)?;
-            written += bytes.len() as u64;
-        }
-        out.flush()?;
-        drop(out);
+    // Directories `old` had that `new` no longer lists — deepest first, only if
+    // now empty (best effort).
+    let new_dirs: BTreeSet<&str> = new.dirs.iter().map(String::as_str).collect();
+    let mut gone: Vec<&str> =
+        old.dirs.iter().map(String::as_str).filter(|d| !new_dirs.contains(d)).collect();
+    gone.sort_by(|a, b| b.cmp(a));
+    for dir in gone {
+        let _ = fs::remove_dir(root.join(dir));
+    }
 
-        if written != file.size {
+    outcome.written.sort();
+    outcome.removed.sort();
+    Ok(outcome)
+}
+
+/// Rebuild one file under `root` from `store`, verifying every chunk and the
+/// final size. Shared by [`write_share`] and [`sync_share`].
+fn materialize_file(
+    root: &Path,
+    file: &FileEntry,
+    list: &ChunkList,
+    store: &dyn ChunkStore,
+) -> Result<()> {
+    let dest = root.join(&file.path);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut written = 0u64;
+    let mut out = BufWriter::new(File::create(&dest)?);
+    for chunk in &list.chunks {
+        let bytes = store
+            .get(&chunk.hash)
+            .ok_or_else(|| Error::Verify(format!("{}: missing chunk {}", file.path, chunk.hash)))?;
+        if Hash::of(&bytes) != chunk.hash {
             return Err(Error::Verify(format!(
-                "{}: rebuilt {written} bytes but the manifest says {}",
-                file.path, file.size
+                "{}: chunk {} in the store hashes wrong",
+                file.path, chunk.hash
             )));
         }
-        apply_mode(&dest, file.mode)?;
+        out.write_all(&bytes)?;
+        written += bytes.len() as u64;
     }
+    out.flush()?;
+    drop(out);
+
+    if written != file.size {
+        return Err(Error::Verify(format!(
+            "{}: rebuilt {written} bytes but the manifest says {}",
+            file.path, file.size
+        )));
+    }
+    apply_mode(&dest, file.mode)?;
     Ok(())
 }
 

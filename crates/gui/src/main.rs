@@ -5,7 +5,7 @@
 //! - [`app`] — the single `gpui` view ([`app::Gaggle`]): state snapshot, tab,
 //!   actions. Delegates every pixel to [`ui`].
 //! - [`ui`] — stateless element builders: [`ui::widgets`] (themed primitives),
-//!   [`ui::chrome`] (title bar + status bar), [`ui::views`] (the three tabs).
+//!   [`ui::chrome`] (title bar + status bar), [`ui::views`] (the four tabs).
 //! - [`theme`] — swappable colour [`theme::Palette`]s (`DARK`, `LIGHT`); every
 //!   widget paints from [`theme::active()`].
 //! - [`clipboard`] — Linux clipboard writes that survive the click.
@@ -25,7 +25,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{Application, WindowBackgroundAppearance, WindowDecorations, WindowOptions};
+use gpui::{
+    Application, WindowBackgroundAppearance, WindowDecorations, WindowOptions, px, size,
+};
 
 fn config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -57,11 +59,19 @@ fn main() -> anyhow::Result<()> {
             window_decorations: Some(WindowDecorations::Client),
             // Transparent so `window_border`'s drop shadow has somewhere to fall.
             window_background: WindowBackgroundAppearance::Transparent,
+            // Keep the header (tabs + window controls) from being clipped.
+            window_min_size: Some(size(px(820.0), px(560.0))),
             app_id: Some("gaggle".into()),
             ..Default::default()
         };
-        cx.open_window(opts, |_, cx| cx.new(|cx| app::Gaggle::new(app, cx)))
-            .expect("failed to open window");
+        cx.open_window(opts, |window, cx| {
+            // gpui-component's `Input` (and other stateful widgets) look the
+            // window's first layer up as a `gpui_component::Root`; without it
+            // they panic on focus. Root also draws the `window_border` frame.
+            let view = cx.new(|cx| app::Gaggle::new(app, window, cx));
+            cx.new(|cx| gpui_component::Root::new(view, window, cx))
+        })
+        .expect("failed to open window");
         cx.activate(true);
     });
     Ok(())

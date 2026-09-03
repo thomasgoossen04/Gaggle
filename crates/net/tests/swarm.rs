@@ -1,4 +1,4 @@
-//! Milestone 4: one subscriber pulls a share from several peers at once.
+//! One subscriber pulls a share from several peers at once.
 //!
 //! Covers the three things the swarm downloader has to get right — spreading
 //! load across full seeds, stitching a share together from peers that each hold

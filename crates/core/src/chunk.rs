@@ -2,7 +2,7 @@
 //!
 //! Boundaries are chosen from local content, so inserting or removing bytes only
 //! disturbs the chunks around the edit — the rest keep their identity. That is
-//! what makes cross-file dedup and delta sync (milestone 10) effective; a
+//! what makes cross-file dedup and delta sync effective; a
 //! fixed-size split would re-hash everything after any insertion.
 
 use std::io::Read;

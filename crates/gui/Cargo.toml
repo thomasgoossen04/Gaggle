@@ -11,3 +11,4 @@ anyhow.workspace = true
 # so pulling both from crates.io avoids the old git-rev pinning dance.
 gpui = "0.2.2"
 gpui-component = "0.5"
+regex = "1"

@@ -18,7 +18,7 @@ use crate::proto::{Request, Response};
 /// reports exactly the subset present so a multi-peer downloader can route
 /// around the gaps.
 ///
-/// For a private share (milestone 7) the serving node also consults
+/// For a private share the serving node also consults
 /// [`path_for_root`](Self::path_for_root) / [`paths_for_chunk`](Self::paths_for_chunk)
 /// to enforce a capability's per-file [`Scope`].
 pub struct Catalog {

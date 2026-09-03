@@ -1,11 +1,14 @@
-//! Milestone 8: the headless transfer manager drives a real loopback swarm
+//! The headless transfer manager drives a real loopback swarm
 //! transfer and reports it through [`AppState`].
 
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use app_state::{App, AppEvent, AppState, Settings, SubscribeRequest, TransferStatus};
+use app_state::{
+    AcceleratorRequest, AcceleratorRole, App, AppEvent, AppState, Scope, Settings, ShareLink,
+    SubscribeRequest, TransferStatus,
+};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -315,4 +318,170 @@ async fn removing_a_seed_makes_later_subscribers_fail() {
     })
     .await;
     assert!(failed.downloads().next().unwrap().error.is_some());
+}
+
+// --- Delta sync ------------------------------------------------------------
+
+#[tokio::test]
+async fn rescan_then_resync_pulls_only_the_delta() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let (addr, manifest_id, seed_id) = (seed.share_addr.clone().unwrap(), seed.manifest_id, seed.id);
+    assert_eq!(seed.version, 1);
+
+    // Subscribe and complete v1.
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![addr],
+        credential: None,
+    });
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let dl_id = done.downloads().next().unwrap().id;
+    let output = done.downloads().next().unwrap().output_dir.clone().unwrap();
+    dir_matches(folder.path(), &output);
+
+    // Edit the shared folder: append to pack.bin, drop readme.txt, add a file.
+    let mut grown = fs::read(folder.path().join("pack.bin")).unwrap();
+    grown.extend_from_slice(&vec![0xABu8; 2 * 1024 * 1024]);
+    fs::write(folder.path().join("pack.bin"), &grown).unwrap();
+    fs::remove_file(folder.path().join("readme.txt")).unwrap();
+    fs::write(folder.path().join("cfg/extra.ini"), b"added=1\n").unwrap();
+
+    seeder.rescan_share(seed_id);
+    let rescanned = wait_for(&seeder, 20, |s| {
+        s.get(seed_id).is_some_and(|r| r.version == 2 && r.status == TransferStatus::Complete)
+    })
+    .await;
+    assert_eq!(rescanned.get(seed_id).unwrap().files, 3); // game.ini, extra.ini, pack.bin
+
+    // Subscriber notices the newer version.
+    leech.check_updates(dl_id);
+    wait_for(&leech, 20, |s| {
+        s.get(dl_id).is_some_and(|r| r.update_available == Some(2))
+    })
+    .await;
+
+    // Resync applies the delta on top of the existing tree.
+    leech.resync(dl_id);
+    let synced = wait_for(&leech, 60, |s| {
+        s.get(dl_id)
+            .is_some_and(|r| r.status == TransferStatus::Complete && r.version == 2)
+    })
+    .await;
+    let row = synced.get(dl_id).unwrap();
+    assert_eq!(row.update_available, None);
+    assert_eq!(row.done_bytes, row.total_bytes);
+
+    dir_matches(folder.path(), &output);
+    assert!(!output.join("readme.txt").exists(), "removed file is gone after resync");
+    assert!(output.join("cfg/extra.ini").is_file(), "added file arrived");
+}
+
+// --- Private shares, benchmark, accelerator ------------------------------
+
+#[tokio::test]
+async fn private_share_needs_a_minted_invite() {
+    let folder = sample_folder();
+    let origin = App::new(None).await.unwrap();
+    origin.add_private_share(folder.path());
+    let up = wait_for(&origin, 20, |s| {
+        s.seeds().next().is_some_and(|r| {
+            r.status == TransferStatus::Complete && r.private && r.share_addr.is_some()
+        })
+    })
+    .await;
+    let seed = up.seeds().next().unwrap();
+    let (addr, manifest_id, seed_id) = (seed.share_addr.clone().unwrap(), seed.manifest_id, seed.id);
+
+    // Without an invite the download is refused.
+    let out_no = TempDir::new().unwrap();
+    let stranger = app_downloading_into(out_no.path()).await;
+    stranger.subscribe(SubscribeRequest {
+        name: "mp".into(),
+        manifest_id,
+        sources: vec![addr.clone()],
+        credential: None,
+    });
+    let refused = wait_for(&stranger, 30, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Failed)
+    })
+    .await;
+    assert!(refused.downloads().next().unwrap().error.is_some());
+
+    // Mint an invite and hand it over.
+    origin.mint_invite(seed_id, Scope::All, None);
+    let minted = wait_for(&origin, 10, |s| {
+        s.minted_invite.as_ref().is_some_and(|m| m.transfer == seed_id)
+    })
+    .await;
+    let token = minted.minted_invite.unwrap().token;
+    let link = ShareLink::parse(&token).unwrap();
+    assert!(link.invite.is_some());
+
+    let out_ok = TempDir::new().unwrap();
+    let guest = app_downloading_into(out_ok.path()).await;
+    guest.subscribe(link.into_request());
+    let done = wait_for(&guest, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    dir_matches(folder.path(), done.downloads().next().unwrap().output_dir.as_deref().unwrap());
+}
+
+#[tokio::test]
+async fn benchmark_reports_disk_throughput_and_free_space() {
+    let out = TempDir::new().unwrap();
+    let app = app_downloading_into(out.path()).await;
+    app.benchmark();
+    let s = wait_for(&app, 30, |s| s.benchmark.is_some()).await;
+    let b = s.benchmark.unwrap();
+    assert!(b.disk_write_bps > 0, "measured a write rate");
+    assert!(b.free_bytes > 0, "measured free space");
+    assert!(matches!(b.suggested, AcceleratorRole::Relay | AcceleratorRole::Nas));
+}
+
+#[tokio::test]
+async fn nas_accelerator_replicates_a_share() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let link = ShareLink::new(seed.name.clone(), seed.manifest_id, vec![seed.share_addr.clone().unwrap()]);
+
+    let replica_dir = TempDir::new().unwrap();
+    let node = App::new(None).await.unwrap();
+    node.start_accelerator(AcceleratorRequest::Nas {
+        dir: replica_dir.path().to_path_buf(),
+        source: link,
+        materialize: None,
+    });
+
+    let up = wait_for(&node, 60, |s| {
+        s.accelerator
+            .as_ref()
+            .is_some_and(|a| a.replica_chunks.unwrap_or(0) > 0)
+    })
+    .await;
+    let acc = up.accelerator.unwrap();
+    assert_eq!(acc.role, AcceleratorRole::Nas);
+    assert!(!acc.listen_addrs.is_empty());
+
+    node.stop_accelerator();
+    wait_for(&node, 10, |s| s.accelerator.is_none()).await;
 }

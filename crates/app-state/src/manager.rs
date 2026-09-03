@@ -1,26 +1,34 @@
 //! The transfer manager: a background task that owns the `net` nodes and turns
-//! high-level commands ("share this folder", "subscribe to that one", "pause")
-//! into swarm activity, publishing an [`AppState`] snapshot after every change.
+//! high-level commands ("share this folder", "subscribe to that one", "pause",
+//! "rescan", "run an accelerator") into swarm activity, publishing an
+//! [`AppState`] snapshot after every change.
 //!
 //! The GUI never touches `net`. It calls the sync methods on [`App`], reads
 //! [`App::snapshot`], and optionally listens on [`App::events`]. All the async
 //! lives here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gaggle_core::{
-    DiskChunkStore, Hash, MemoryChunkStore, SignedCapability, snapshot_dir, write_share,
+    ChunkList, ChunkStore, DiskChunkStore, Hash, Manifest, MemoryChunkStore, SignedCapability,
+    SyncOutcome, snapshot_dir, sync_share, write_share,
 };
-use net::{Catalog, Multiaddr, Node, PeerId, SwarmConfig, SwarmProgress};
+use net::{
+    CacheStats, Capability, Catalog, Invite, Multiaddr, Node, PeerId, RelayConfig, RelayNode, Scope,
+    ShareKeypair, SwarmConfig, SwarmProgress,
+};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
+use crate::link::ShareLink;
 use crate::settings::Settings;
 use crate::state::{
-    AppState, SourceStats, SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
+    AcceleratorRole, AcceleratorState, AppState, BenchmarkResult, MintedInvite, SourceStats,
+    SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
 };
 
 /// A discrete thing that happened, for callers that would rather react than poll.
@@ -32,6 +40,16 @@ pub enum AppEvent {
     TransferProgress(TransferId),
     TransferCompleted(TransferId),
     TransferFailed(TransferId, String),
+    /// An update check found a newer manifest version for a subscription.
+    UpdateAvailable(TransferId, u64),
+    /// [`App::mint_invite`] produced a token — read `snapshot().minted_invite`.
+    InviteMinted(TransferId),
+    /// [`App::benchmark`] finished — read `snapshot().benchmark`.
+    BenchmarkReady,
+    /// The in-process accelerator started, stopped, or refreshed its stats.
+    AcceleratorChanged,
+    /// The in-process accelerator could not start / crashed.
+    AcceleratorFailed(String),
 }
 
 /// Everything needed to start pulling a remote share.
@@ -59,20 +77,45 @@ impl SubscribeRequest {
     }
 }
 
+/// Ask the node to opt this machine in as an accelerator.
+#[derive(Debug, Clone)]
+pub enum AcceleratorRequest {
+    /// High-bandwidth relay + Kademlia bootstrap, optionally read-through
+    /// caching one share pulled from `upstream`.
+    Relay { cache_bytes: u64, upstream: Option<ShareLink> },
+    /// Durable full replica of `source`, kept under `dir` and re-served.
+    Nas { dir: PathBuf, source: ShareLink, materialize: Option<PathBuf> },
+}
+
 enum Command {
-    AddLocalShare { dir: PathBuf },
+    AddLocalShare { dir: PathBuf, private: bool },
     Subscribe(SubscribeRequest),
     Pause(TransferId),
     Resume(TransferId),
     Remove(TransferId),
+    RescanShare(TransferId),
+    CheckUpdates(TransferId),
+    Resync(TransferId),
+    MintInvite { id: TransferId, scope: Scope, expires_at: Option<u64> },
+    Benchmark,
+    StartAccelerator(Box<AcceleratorRequest>),
+    StopAccelerator,
     UpdateSettings(Box<Settings>),
     Shutdown,
 
     // Internal, from worker tasks.
-    LocalShareReady { id: TransferId, node: Box<Node>, addr: Multiaddr, info: ShareInfo },
+    LocalShareReady { id: TransferId, node: Arc<Node>, addr: Multiaddr, info: ShareInfo },
+    RescanDone { id: TransferId, manifest_id: Hash, version: u64, files: usize, bytes: u64 },
     WorkerFailed { id: TransferId, error: String },
     DownloadProgress { id: TransferId, p: SwarmProgress, base_bytes: u64 },
     DownloadDone { id: TransferId, outcome: Box<DownloadOutcome> },
+    UpdateSeen { id: TransferId, version: u64 },
+    ResyncProgress { id: TransferId, p: SwarmProgress },
+    ResyncDone { id: TransferId, outcome: Box<ResyncOutcome> },
+    BenchmarkDone(BenchmarkResult),
+    AcceleratorReady { handle: Box<AccelHandle>, state: Box<AcceleratorState> },
+    AcceleratorStartFailed(String),
+    AcceleratorStatsRefresh(CacheStats),
 }
 
 struct ShareInfo {
@@ -80,6 +123,10 @@ struct ShareInfo {
     manifest_id: Hash,
     files: usize,
     bytes: u64,
+    version: u64,
+    dir: PathBuf,
+    /// `Some` for a private (invite-only) share — the per-share signing seed.
+    share_seed: Option<[u8; 32]>,
 }
 
 struct DownloadOutcome {
@@ -88,6 +135,17 @@ struct DownloadOutcome {
     output_dir: PathBuf,
     /// Authoritative chunk-count-per-source from the finished swarm download.
     sources: HashMap<PeerId, usize>,
+    manifest: Manifest,
+    chunk_lists: BTreeMap<String, ChunkList>,
+    version: u64,
+}
+
+struct ResyncOutcome {
+    manifest: Manifest,
+    chunk_lists: BTreeMap<String, ChunkList>,
+    synced: SyncOutcome,
+    files: usize,
+    total_bytes: u64,
 }
 
 /// Handle to the running transfer manager. Sync, safe to call from any thread
@@ -119,6 +177,9 @@ impl App {
                 seeding: 0,
                 downloading: 0,
             },
+            accelerator: None,
+            benchmark: None,
+            minted_invite: None,
         };
 
         let (commands_tx, commands_rx) = mpsc::channel(128);
@@ -135,7 +196,11 @@ impl App {
             next_id: 1,
             download_node: Arc::new(download_node),
             seeds: HashMap::new(),
+            subs: HashMap::new(),
             downloads: HashMap::new(),
+            resync_samples: HashMap::new(),
+            accel: None,
+            last_resync_poll: Instant::now(),
         };
         tokio::spawn(manager.run());
 
@@ -157,15 +222,45 @@ impl App {
         self.events.subscribe()
     }
 
-    /// Snapshot `dir` and start seeding it. A row appears immediately and flips
-    /// to `Complete` once the snapshot finishes.
+    /// Snapshot `dir` and start seeding it publicly.
     pub fn add_local_share(&self, dir: impl Into<PathBuf>) {
-        self.send(Command::AddLocalShare { dir: dir.into() });
+        self.send(Command::AddLocalShare { dir: dir.into(), private: false });
+    }
+
+    /// Snapshot `dir` and start seeding it as an invite-only share. Hand out
+    /// access with [`mint_invite`](Self::mint_invite).
+    pub fn add_private_share(&self, dir: impl Into<PathBuf>) {
+        self.send(Command::AddLocalShare { dir: dir.into(), private: true });
+    }
+
+    /// Re-read a seeded folder from disk, bump its manifest version, and re-serve
+    /// it. Subscribers pick up the delta via [`resync`](Self::resync).
+    pub fn rescan_share(&self, id: TransferId) {
+        self.send(Command::RescanShare(id));
+    }
+
+    /// Mint a `gaggleshare1…` token granting `scope` (optionally expiring at a
+    /// unix timestamp) for the private seed `id`. The token lands in
+    /// `snapshot().minted_invite`.
+    pub fn mint_invite(&self, id: TransferId, scope: Scope, expires_at: Option<u64>) {
+        self.send(Command::MintInvite { id, scope, expires_at });
     }
 
     /// Start pulling a remote share.
     pub fn subscribe(&self, request: SubscribeRequest) {
         self.send(Command::Subscribe(request));
+    }
+
+    /// Check a completed subscription for a newer manifest version. A newer
+    /// version is only flagged (`row.update_available`), never applied.
+    pub fn check_updates(&self, id: TransferId) {
+        self.send(Command::CheckUpdates(id));
+    }
+
+    /// Pull the delta for a subscription whose share has a newer version and
+    /// apply it to the already-materialized output tree.
+    pub fn resync(&self, id: TransferId) {
+        self.send(Command::Resync(id));
     }
 
     pub fn pause(&self, id: TransferId) {
@@ -180,6 +275,21 @@ impl App {
     /// chunks are discarded).
     pub fn remove(&self, id: TransferId) {
         self.send(Command::Remove(id));
+    }
+
+    /// Measure disk write throughput + free space on the download volume and
+    /// suggest an accelerator role. Result lands in `snapshot().benchmark`.
+    pub fn benchmark(&self) {
+        self.send(Command::Benchmark);
+    }
+
+    /// Opt this machine in as an accelerator. Only one runs at a time.
+    pub fn start_accelerator(&self, request: AcceleratorRequest) {
+        self.send(Command::StartAccelerator(Box::new(request)));
+    }
+
+    pub fn stop_accelerator(&self) {
+        self.send(Command::StopAccelerator);
     }
 
     pub fn update_settings(&self, settings: Settings) {
@@ -199,12 +309,42 @@ impl Drop for App {
     }
 }
 
+/// A seeded local folder: the serving node plus what a rescan / invite needs.
+struct SeedEntry {
+    node: Arc<Node>,
+    dir: PathBuf,
+    version: u64,
+    name: String,
+    manifest_id: Hash,
+    addr: Multiaddr,
+    /// `Some` for a private share — the per-share Ed25519 seed.
+    share_seed: Option<[u8; 32]>,
+}
+
+/// A completed subscription, retained so it can be re-synced later.
+struct SubEntry {
+    request: SubscribeRequest,
+    output_dir: PathBuf,
+    manifest: Manifest,
+    chunk_lists: BTreeMap<String, ChunkList>,
+    version: u64,
+}
+
 struct DownloadJob {
     task: JoinHandle<()>,
     request: SubscribeRequest,
     chunk_dir: PathBuf,
     /// For the rolling speed estimate.
     last_sample: Option<(Instant, u64)>,
+}
+
+/// Keeps an in-process accelerator alive; drop stops it.
+struct AccelHandle {
+    #[allow(dead_code)]
+    role: AcceleratorRole,
+    relay: Option<Arc<RelayNode>>,
+    #[allow(dead_code)]
+    node: Option<Node>,
 }
 
 struct Manager {
@@ -217,17 +357,26 @@ struct Manager {
     state: AppState,
     next_id: TransferId,
     download_node: Arc<Node>,
-    seeds: HashMap<TransferId, Node>,
+    seeds: HashMap<TransferId, SeedEntry>,
+    subs: HashMap<TransferId, SubEntry>,
     downloads: HashMap<TransferId, DownloadJob>,
+    resync_samples: HashMap<TransferId, Option<(Instant, u64)>>,
+    accel: Option<AccelHandle>,
+    last_resync_poll: Instant,
 }
 
 impl Manager {
     async fn run(mut self) {
-        while let Some(command) = self.rx.recv().await {
-            if matches!(command, Command::Shutdown) {
-                break;
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                command = self.rx.recv() => match command {
+                    None | Some(Command::Shutdown) => break,
+                    Some(command) => self.handle(command),
+                },
+                _ = ticker.tick() => self.tick(),
             }
-            self.handle(command);
         }
         // Dropping `self` drops every `Node`, which aborts its swarm task.
         for job in self.downloads.values() {
@@ -235,13 +384,46 @@ impl Manager {
         }
     }
 
+    fn tick(&mut self) {
+        // Relay hot-cache stats refresh.
+        if let Some(relay) = self.accel.as_ref().and_then(|a| a.relay.clone()) {
+            let tx = self.self_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(s) = relay.cache_stats().await {
+                    let _ = tx.send(Command::AcceleratorStatsRefresh(s)).await;
+                }
+            });
+        }
+        // Background update poll for subscriptions.
+        if let Some(secs) = self.state.settings.auto_resync_secs
+            && self.last_resync_poll.elapsed() >= Duration::from_secs(secs.max(5))
+        {
+            self.last_resync_poll = Instant::now();
+            for id in self.subs.keys().copied().collect::<Vec<_>>() {
+                let _ = self.self_tx.try_send(Command::CheckUpdates(id));
+            }
+        }
+    }
+
     fn handle(&mut self, command: Command) {
         match command {
-            Command::AddLocalShare { dir } => self.add_local_share(dir),
+            Command::AddLocalShare { dir, private } => self.add_share(dir, private),
             Command::Subscribe(req) => self.subscribe(req),
             Command::Pause(id) => self.pause(id),
             Command::Resume(id) => self.resume(id),
             Command::Remove(id) => self.remove(id),
+            Command::RescanShare(id) => self.rescan_share(id),
+            Command::CheckUpdates(id) => self.check_updates(id),
+            Command::Resync(id) => self.resync(id),
+            Command::MintInvite { id, scope, expires_at } => self.mint_invite(id, scope, expires_at),
+            Command::Benchmark => self.benchmark(),
+            Command::StartAccelerator(req) => self.start_accelerator(*req),
+            Command::StopAccelerator => {
+                self.accel = None;
+                self.state.accelerator = None;
+                self.publish();
+                let _ = self.events.send(AppEvent::AcceleratorChanged);
+            }
             Command::UpdateSettings(s) => {
                 self.state.settings = *s;
                 if let Some(path) = &self.config_path
@@ -254,13 +436,27 @@ impl Manager {
             Command::Shutdown => {}
 
             Command::LocalShareReady { id, node, addr, info } => {
-                self.seeds.insert(id, *node);
+                self.seeds.insert(
+                    id,
+                    SeedEntry {
+                        node,
+                        dir: info.dir.clone(),
+                        version: info.version,
+                        name: info.name.clone(),
+                        manifest_id: info.manifest_id,
+                        addr: addr.clone(),
+                        share_seed: info.share_seed,
+                    },
+                );
                 if let Some(row) = self.state.transfers.get_mut(&id) {
                     row.name = info.name;
                     row.manifest_id = info.manifest_id;
                     row.files = info.files;
                     row.total_bytes = info.bytes;
                     row.done_bytes = info.bytes;
+                    row.version = info.version;
+                    row.private = info.share_seed.is_some();
+                    row.source_dir = Some(info.dir);
                     row.status = TransferStatus::Complete;
                     row.share_addr = Some(addr);
                 }
@@ -268,8 +464,26 @@ impl Manager {
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
             }
+            Command::RescanDone { id, manifest_id, version, files, bytes } => {
+                if let Some(seed) = self.seeds.get_mut(&id) {
+                    seed.version = version;
+                    seed.manifest_id = manifest_id;
+                }
+                if let Some(row) = self.state.transfers.get_mut(&id) {
+                    row.manifest_id = manifest_id;
+                    row.version = version;
+                    row.files = files;
+                    row.total_bytes = bytes;
+                    row.done_bytes = bytes;
+                    row.status = TransferStatus::Complete;
+                    row.error = None;
+                }
+                self.publish();
+                let _ = self.events.send(AppEvent::TransferCompleted(id));
+            }
             Command::WorkerFailed { id, error } => {
                 self.downloads.remove(&id);
+                self.resync_samples.remove(&id);
                 if let Some(row) = self.state.transfers.get_mut(&id) {
                     row.status = TransferStatus::Failed;
                     row.error = Some(error.clone());
@@ -298,7 +512,6 @@ impl Manager {
                         row.status = TransferStatus::Active;
                         row.total_bytes = base_bytes + p.bytes_total;
                         row.done_bytes = done;
-                        // Blend with the previous estimate to smooth spikes.
                         row.speed_bps = if row.speed_bps == 0 {
                             speed
                         } else {
@@ -311,21 +524,30 @@ impl Manager {
                 }
             }
             Command::DownloadDone { id, outcome } => {
-                // The scratch chunk store has served its purpose — the files are
-                // now materialised in the output dir and a `Complete` transfer is
-                // never resumed. Drop it so it doesn't sit around forever.
-                if let Some(job) = self.downloads.remove(&id) {
+                let request = self.downloads.remove(&id).map(|job| {
                     clear_partial(job.chunk_dir);
+                    job.request
+                });
+                if let Some(request) = request {
+                    self.subs.insert(
+                        id,
+                        SubEntry {
+                            request,
+                            output_dir: outcome.output_dir.clone(),
+                            manifest: outcome.manifest.clone(),
+                            chunk_lists: outcome.chunk_lists.clone(),
+                            version: outcome.version,
+                        },
+                    );
                 }
                 if let Some(row) = self.state.transfers.get_mut(&id) {
                     row.status = TransferStatus::Complete;
                     row.files = outcome.files;
                     row.total_bytes = outcome.total_bytes;
                     row.done_bytes = outcome.total_bytes;
+                    row.version = outcome.version;
                     row.speed_bps = 0;
                     row.output_dir = Some(outcome.output_dir);
-                    // Reconcile chunk counts with the authoritative tally; keep
-                    // the byte figures accumulated from progress events.
                     for (peer, chunks) in &outcome.sources {
                         match row.sources.iter_mut().find(|s| s.peer == *peer) {
                             Some(s) => s.chunks = s.chunks.max(*chunks),
@@ -342,36 +564,115 @@ impl Manager {
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
             }
+            Command::UpdateSeen { id, version } => {
+                if let Some(row) = self.state.transfers.get_mut(&id) {
+                    if version == 0 {
+                        row.update_available = None;
+                    } else {
+                        row.update_available = Some(version);
+                        let _ = self.events.send(AppEvent::UpdateAvailable(id, version));
+                    }
+                    self.publish();
+                }
+            }
+            Command::ResyncProgress { id, p } => {
+                let now = Instant::now();
+                if let Some(slot) = self.resync_samples.get_mut(&id) {
+                    let speed = match slot.replace((now, p.bytes_done)) {
+                        Some((t0, b0)) => {
+                            let dt = now.duration_since(t0).as_secs_f64();
+                            if dt > 0.0 {
+                                (p.bytes_done.saturating_sub(b0) as f64 / dt) as u64
+                            } else {
+                                0
+                            }
+                        }
+                        None => 0,
+                    };
+                    if let Some(row) = self.state.transfers.get_mut(&id) {
+                        row.status = TransferStatus::Active;
+                        row.total_bytes = p.bytes_total.max(1);
+                        row.done_bytes = p.bytes_done;
+                        row.speed_bps = if row.speed_bps == 0 {
+                            speed
+                        } else {
+                            (row.speed_bps * 3 + speed) / 4
+                        };
+                        bump_source(&mut row.sources, p.from, p.chunk_len);
+                    }
+                    self.publish();
+                    let _ = self.events.send(AppEvent::TransferProgress(id));
+                }
+            }
+            Command::ResyncDone { id, outcome } => {
+                self.resync_samples.remove(&id);
+                if let Some(sub) = self.subs.get_mut(&id) {
+                    sub.manifest = outcome.manifest.clone();
+                    sub.chunk_lists = outcome.chunk_lists.clone();
+                    sub.version = outcome.manifest.version;
+                }
+                tracing::info!(
+                    id,
+                    written = outcome.synced.written.len(),
+                    removed = outcome.synced.removed.len(),
+                    "resync applied"
+                );
+                if let Some(row) = self.state.transfers.get_mut(&id) {
+                    row.status = TransferStatus::Complete;
+                    row.version = outcome.manifest.version;
+                    row.manifest_id = outcome.manifest.id();
+                    row.files = outcome.files;
+                    row.total_bytes = outcome.total_bytes;
+                    row.done_bytes = outcome.total_bytes;
+                    row.speed_bps = 0;
+                    row.update_available = None;
+                    row.error = None;
+                }
+                self.recount();
+                self.publish();
+                let _ = self.events.send(AppEvent::TransferCompleted(id));
+            }
+            Command::BenchmarkDone(result) => {
+                self.state.benchmark = Some(result);
+                self.publish();
+                let _ = self.events.send(AppEvent::BenchmarkReady);
+            }
+            Command::AcceleratorReady { handle, state } => {
+                self.accel = Some(*handle);
+                self.state.accelerator = Some(*state);
+                self.publish();
+                let _ = self.events.send(AppEvent::AcceleratorChanged);
+            }
+            Command::AcceleratorStartFailed(error) => {
+                self.accel = None;
+                self.state.accelerator = None;
+                self.publish();
+                let _ = self.events.send(AppEvent::AcceleratorFailed(error));
+            }
+            Command::AcceleratorStatsRefresh(stats) => {
+                if let Some(a) = &mut self.state.accelerator {
+                    a.cache = Some(stats);
+                    self.publish();
+                }
+            }
         }
     }
 
-    fn add_local_share(&mut self, dir: PathBuf) {
+    fn add_share(&mut self, dir: PathBuf, private: bool) {
         let id = self.alloc_id();
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string());
-        self.insert_row(TransferRow {
-            id,
-            name: name.clone(),
-            kind: TransferKind::Seeding,
-            status: TransferStatus::Connecting,
-            manifest_id: Hash::of(b""),
-            files: 0,
-            total_bytes: 0,
-            done_bytes: 0,
-            speed_bps: 0,
-            sources: Vec::new(),
-            share_addr: None,
-            output_dir: None,
-            error: None,
-        });
+        self.insert_row(new_row(id, name.clone(), TransferKind::Seeding));
 
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
+            let scan_dir = dir.clone();
+            let scan_name = name.clone();
             let built = tokio::task::spawn_blocking(move || {
                 let mut store = MemoryChunkStore::new();
-                let snap = snapshot_dir(&dir, name, 1, &mut store)?;
+                let snap = snapshot_dir(&scan_dir, scan_name, 1, &mut store)?;
                 anyhow::Ok((snap, store))
             })
             .await;
@@ -382,44 +683,215 @@ impl Manager {
                 Err(e) => return fail(&tx, id, format!("snapshot task panicked: {e}")).await,
             };
 
+            let share_seed = private.then(|| ShareKeypair::generate().to_seed());
             let info = ShareInfo {
                 name: snap.manifest.name.clone(),
                 manifest_id: snap.manifest.id(),
                 files: snap.manifest.files.len(),
                 bytes: snap.manifest.total_size(),
+                version: snap.manifest.version,
+                dir,
+                share_seed,
             };
             let catalog = Catalog::new(snap.manifest, snap.chunk_lists, store);
             let node = match Node::spawn_serving(catalog).await {
                 Ok(n) => n,
                 Err(e) => return fail(&tx, id, format!("could not start serving: {e:#}")).await,
             };
+            if let Some(seed) = share_seed {
+                let pubkey = ShareKeypair::from_seed(seed).public();
+                if let Err(e) = node.restrict_to_invite_holders(pubkey).await {
+                    return fail(&tx, id, format!("could not make the share private: {e:#}")).await;
+                }
+            }
             let addr = match node.listen_addr().await {
                 Ok(a) => a,
                 Err(e) => return fail(&tx, id, format!("no listen address: {e:#}")).await,
             };
             let _ = tx
-                .send(Command::LocalShareReady { id, node: Box::new(node), addr, info })
+                .send(Command::LocalShareReady { id, node: Arc::new(node), addr, info })
                 .await;
+        });
+    }
+
+    fn rescan_share(&mut self, id: TransferId) {
+        let Some(seed) = self.seeds.get(&id) else {
+            tracing::warn!(id, "rescan: no such seed");
+            return;
+        };
+        let node = Arc::clone(&seed.node);
+        let dir = seed.dir.clone();
+        let name = seed.name.clone();
+        let next_version = seed.version + 1;
+        let share_seed = seed.share_seed;
+
+        if let Some(row) = self.state.transfers.get_mut(&id) {
+            row.status = TransferStatus::Connecting;
+            row.error = None;
+        }
+        self.publish();
+
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let built = tokio::task::spawn_blocking(move || {
+                let mut store = MemoryChunkStore::new();
+                let snap = snapshot_dir(&dir, name, next_version, &mut store)?;
+                anyhow::Ok((snap, store))
+            })
+            .await;
+            let (snap, store) = match built {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return fail(&tx, id, format!("rescan snapshot failed: {e:#}")).await,
+                Err(e) => return fail(&tx, id, format!("rescan task panicked: {e}")).await,
+            };
+            let manifest_id = snap.manifest.id();
+            let files = snap.manifest.files.len();
+            let bytes = snap.manifest.total_size();
+            let catalog = Catalog::new(snap.manifest, snap.chunk_lists, store);
+            if let Err(e) = node.serve(catalog).await {
+                return fail(&tx, id, format!("re-serve failed: {e:#}")).await;
+            }
+            if let Some(seed) = share_seed {
+                let pubkey = ShareKeypair::from_seed(seed).public();
+                if let Err(e) = node.restrict_to_invite_holders(pubkey).await {
+                    return fail(&tx, id, format!("re-restrict failed: {e:#}")).await;
+                }
+            }
+            let _ = tx
+                .send(Command::RescanDone { id, manifest_id, version: next_version, files, bytes })
+                .await;
+        });
+    }
+
+    fn mint_invite(&mut self, id: TransferId, scope: Scope, expires_at: Option<u64>) {
+        let Some(seed) = self.seeds.get(&id) else {
+            tracing::warn!(id, "mint_invite: no such seed");
+            return;
+        };
+        let Some(seed_bytes) = seed.share_seed else {
+            tracing::warn!(id, "mint_invite: share is not private");
+            return;
+        };
+        let kp = ShareKeypair::from_seed(seed_bytes);
+        let mut cap = Capability::new(kp.public(), seed.manifest_id).with_scope(scope);
+        if let Some(exp) = expires_at {
+            cap = cap.expiring_at(exp);
+        }
+        let invite = Invite::new(kp.public(), seed.manifest_id, seed.name.clone(), kp.issue(cap));
+        let token = ShareLink::new(seed.name.clone(), seed.manifest_id, vec![seed.addr.clone()])
+            .with_invite(invite)
+            .encode();
+        self.state.minted_invite = Some(MintedInvite { transfer: id, token });
+        self.publish();
+        let _ = self.events.send(AppEvent::InviteMinted(id));
+    }
+
+    fn check_updates(&mut self, id: TransferId) {
+        let Some(sub) = self.subs.get(&id) else { return };
+        let node = Arc::clone(&self.download_node);
+        let req = sub.request.clone();
+        let have_version = sub.version;
+        let have_id = sub.manifest.id();
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            match check_remote_version(&node, &req).await {
+                Ok((version, mid)) => {
+                    let newer = version > have_version
+                        || (mid != have_id && version >= have_version && have_version != 0);
+                    let _ = tx
+                        .send(Command::UpdateSeen { id, version: if newer { version } else { 0 } })
+                        .await;
+                }
+                Err(e) => tracing::warn!(id, error = %e, "update check failed"),
+            }
+        });
+    }
+
+    fn resync(&mut self, id: TransferId) {
+        if self.downloads.contains_key(&id) || self.resync_samples.contains_key(&id) {
+            return; // already busy
+        }
+        let Some(sub) = self.subs.get(&id) else {
+            tracing::warn!(id, "resync: no such subscription");
+            return;
+        };
+        let node = Arc::clone(&self.download_node);
+        let req = sub.request.clone();
+        let output_dir = sub.output_dir.clone();
+        let old_manifest = sub.manifest.clone();
+        let name = sanitize(&req.name).unwrap_or_else(|| hex(&req.manifest_id));
+
+        if let Some(row) = self.state.transfers.get_mut(&id) {
+            row.status = TransferStatus::Connecting;
+            row.error = None;
+            row.speed_bps = 0;
+            row.sources.clear();
+        }
+        self.resync_samples.insert(id, None);
+        self.publish();
+
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_resync(node.as_ref(), id, req, output_dir, old_manifest, name, tx.clone()).await
+            {
+                let _ = tx.send(Command::WorkerFailed { id, error: format!("{e:#}") }).await;
+            }
+        });
+    }
+
+    fn benchmark(&mut self) {
+        let dir = self.state.settings.download_dir.clone();
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || run_benchmark(&dir)).await {
+                Ok(Ok(result)) => {
+                    let _ = tx.send(Command::BenchmarkDone(result)).await;
+                }
+                Ok(Err(e)) => tracing::warn!(error = %e, "benchmark failed"),
+                Err(e) => tracing::warn!(error = %e, "benchmark task panicked"),
+            }
+        });
+    }
+
+    fn start_accelerator(&mut self, request: AcceleratorRequest) {
+        if self.accel.is_some() {
+            let _ = self
+                .events
+                .send(AppEvent::AcceleratorFailed("an accelerator is already running".into()));
+            return;
+        }
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let result = match request {
+                AcceleratorRequest::Relay { cache_bytes, upstream } => {
+                    start_relay_accel(cache_bytes, upstream).await
+                }
+                AcceleratorRequest::Nas { dir, source, materialize } => {
+                    start_nas_accel(dir, source, materialize).await
+                }
+            };
+            match result {
+                Ok((handle, state)) => {
+                    let _ = tx
+                        .send(Command::AcceleratorReady {
+                            handle: Box::new(handle),
+                            state: Box::new(state),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx.send(Command::AcceleratorStartFailed(format!("{e:#}"))).await;
+                }
+            }
         });
     }
 
     fn subscribe(&mut self, request: SubscribeRequest) {
         let id = self.alloc_id();
-        self.insert_row(TransferRow {
-            id,
-            name: request.name.clone(),
-            kind: TransferKind::Downloading,
-            status: TransferStatus::Connecting,
-            manifest_id: request.manifest_id,
-            files: 0,
-            total_bytes: 0,
-            done_bytes: 0,
-            speed_bps: 0,
-            sources: Vec::new(),
-            share_addr: None,
-            output_dir: None,
-            error: None,
-        });
+        let mut row = new_row(id, request.name.clone(), TransferKind::Downloading);
+        row.manifest_id = request.manifest_id;
+        self.insert_row(row);
         let chunk_dir = self.partial_dir(request.manifest_id);
         self.spawn_download(id, request, chunk_dir);
         self.recount();
@@ -480,6 +952,8 @@ impl Manager {
 
     fn remove(&mut self, id: TransferId) {
         self.seeds.remove(&id);
+        self.subs.remove(&id);
+        self.resync_samples.remove(&id);
         if let Some(job) = self.downloads.remove(&id) {
             job.task.abort();
             clear_partial(job.chunk_dir);
@@ -490,7 +964,6 @@ impl Manager {
             .filter(|r| r.kind == TransferKind::Downloading)
             .map(|r| r.manifest_id)
         {
-            // Job already finished or failed; its scratch dir may still be here.
             clear_partial(self.partial_dir(mid));
         }
         self.state.transfers.remove(&id);
@@ -538,13 +1011,34 @@ impl Manager {
     }
 }
 
+fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
+    TransferRow {
+        id,
+        name,
+        kind,
+        status: TransferStatus::Connecting,
+        manifest_id: Hash::of(b""),
+        files: 0,
+        total_bytes: 0,
+        done_bytes: 0,
+        speed_bps: 0,
+        sources: Vec::new(),
+        share_addr: None,
+        output_dir: None,
+        error: None,
+        version: 0,
+        private: false,
+        source_dir: None,
+        update_available: None,
+    }
+}
+
 async fn fail(tx: &mpsc::Sender<Command>, id: TransferId, error: String) {
     let _ = tx.send(Command::WorkerFailed { id, error }).await;
 }
 
 /// Delete a download's scratch chunk store off-thread, and the shared
-/// `.gaggle-partial` parent once it's left empty. Best-effort — any error
-/// (already gone, another download still using the parent) is ignored.
+/// `.gaggle-partial` parent once it's left empty. Best-effort.
 fn clear_partial(dir: PathBuf) {
     tokio::task::spawn_blocking(move || {
         let _ = std::fs::remove_dir_all(&dir);
@@ -592,9 +1086,12 @@ async fn run_download(
     let chunk_lists = dl.share.chunk_lists.clone();
     let total_bytes = manifest.total_size();
     let files = manifest.files.len();
+    let version = manifest.version;
 
     let out = output_dir.clone();
-    tokio::task::spawn_blocking(move || write_share(&out, &manifest, &chunk_lists, &disk)).await??;
+    let m2 = manifest.clone();
+    let l2 = chunk_lists.clone();
+    tokio::task::spawn_blocking(move || write_share(&out, &m2, &l2, &disk)).await??;
 
     let _ = tx
         .send(Command::DownloadDone {
@@ -604,10 +1101,278 @@ async fn run_download(
                 total_bytes,
                 output_dir,
                 sources: dl.chunks_per_source,
+                manifest,
+                chunk_lists,
+                version,
             }),
         })
         .await;
     Ok(())
+}
+
+async fn run_resync(
+    node: &Node,
+    id: TransferId,
+    req: SubscribeRequest,
+    output_dir: PathBuf,
+    old_manifest: Manifest,
+    name: String,
+    tx: mpsc::Sender<Command>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
+
+    let mut peers = Vec::with_capacity(req.sources.len());
+    for addr in &req.sources {
+        peers.push(node.connect(addr.clone()).await?);
+    }
+    if let Some(cred) = &req.credential {
+        node.authenticate_all(&peers, cred).await?;
+    }
+
+    // Recover chunks that still live in the materialized output tree, so only
+    // genuinely new bytes are pulled.
+    let scan_dir = output_dir.clone();
+    let scan_name = name.clone();
+    let old_v = old_manifest.version;
+    let mut mem = tokio::task::spawn_blocking(move || {
+        let mut mem = MemoryChunkStore::new();
+        let _ = snapshot_dir(&scan_dir, scan_name, old_v, &mut mem);
+        mem
+    })
+    .await?;
+
+    let progress_tx = tx.clone();
+    let dl = node
+        .download_share_multi_with_progress(
+            &peers,
+            &mut mem,
+            SwarmConfig::default(),
+            move |p: SwarmProgress| {
+                let _ = progress_tx.try_send(Command::ResyncProgress { id, p });
+            },
+        )
+        .await?;
+
+    let new_manifest = dl.share.manifest.clone();
+    let new_lists = dl.share.chunk_lists.clone();
+    let files = new_manifest.files.len();
+    let total_bytes = new_manifest.total_size();
+
+    let out2 = output_dir.clone();
+    let om = old_manifest.clone();
+    let nm = new_manifest.clone();
+    let nl = new_lists.clone();
+    let synced =
+        tokio::task::spawn_blocking(move || sync_share(&out2, &om, &nm, &nl, &mem)).await??;
+
+    let _ = tx
+        .send(Command::ResyncDone {
+            id,
+            outcome: Box::new(ResyncOutcome {
+                manifest: new_manifest,
+                chunk_lists: new_lists,
+                synced,
+                files,
+                total_bytes,
+            }),
+        })
+        .await;
+    Ok(())
+}
+
+/// Fetch the current manifest version + id from the first source that answers.
+async fn check_remote_version(
+    node: &Node,
+    req: &SubscribeRequest,
+) -> anyhow::Result<(u64, Hash)> {
+    anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
+    let mut last_err = None;
+    for addr in &req.sources {
+        let attempt = async {
+            let peer = node.connect(addr.clone()).await?;
+            if let Some(cred) = &req.credential {
+                node.authenticate(peer, cred).await?;
+            }
+            let manifest = node.fetch_manifest(peer).await?;
+            anyhow::Ok((manifest.version, manifest.id()))
+        };
+        match attempt.await {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no sources to ask")))
+}
+
+async fn start_relay_accel(
+    cache_bytes: u64,
+    upstream: Option<ShareLink>,
+) -> anyhow::Result<(AccelHandle, AcceleratorState)> {
+    let relay = RelayNode::spawn_with(RelayConfig { cache_capacity_bytes: cache_bytes }).await?;
+    let peer_id = relay.peer_id();
+    let mut detail = "relay + Kademlia bootstrap".to_string();
+
+    if let Some(link) = &upstream {
+        let request = link.clone().into_request();
+        let meta_node = Node::spawn().await?;
+        let mut upstream_ids = Vec::new();
+        for addr in &link.sources {
+            relay.add_upstream(addr.clone()).await?;
+            upstream_ids.push(meta_node.connect(addr.clone()).await?);
+        }
+        if let Some(cred) = &request.credential {
+            meta_node.authenticate_all(&upstream_ids, cred).await?;
+        }
+        let mut meta = None;
+        for &peer in &upstream_ids {
+            if let Ok(m) = meta_node.fetch_share_meta(peer).await {
+                meta = Some(m);
+                break;
+            }
+        }
+        let (manifest, chunk_lists) =
+            meta.ok_or_else(|| anyhow::anyhow!("no upstream returned the share metadata"))?;
+        let file_count = manifest.files.len();
+        relay.cache_share(manifest, chunk_lists.into_values(), upstream_ids).await?;
+        meta_node.shutdown().await;
+        if let Some(invite) = &link.invite {
+            relay.restrict_to_invite_holders(invite.share).await?;
+        }
+        detail = format!(
+            "caching “{}” ({} files) from {} upstream(s)",
+            link.name,
+            file_count,
+            link.sources.len()
+        );
+    }
+
+    let listen_addrs = match relay.listen_addr().await {
+        Ok(a) => vec![a],
+        Err(_) => Vec::new(),
+    };
+    let cache = relay.cache_stats().await.ok();
+    let state = AcceleratorState {
+        role: AcceleratorRole::Relay,
+        peer_id,
+        listen_addrs,
+        detail,
+        cache,
+        replica_chunks: None,
+    };
+    let handle = AccelHandle {
+        role: AcceleratorRole::Relay,
+        relay: Some(Arc::new(relay)),
+        node: None,
+    };
+    Ok((handle, state))
+}
+
+async fn start_nas_accel(
+    dir: PathBuf,
+    source: ShareLink,
+    materialize: Option<PathBuf>,
+) -> anyhow::Result<(AccelHandle, AcceleratorState)> {
+    let open_dir = dir.clone();
+    let mut disk =
+        tokio::task::spawn_blocking(move || DiskChunkStore::open(&open_dir)).await??;
+
+    let node = Node::spawn().await?;
+    let request = source.clone().into_request();
+    let mut peers = Vec::new();
+    for addr in &source.sources {
+        peers.push(node.connect(addr.clone()).await?);
+    }
+    if let Some(cred) = &request.credential {
+        node.authenticate_all(&peers, cred).await?;
+    }
+
+    let pulled = node.download_share_multi(&peers, &mut disk).await?;
+    let manifest = pulled.share.manifest.clone();
+    let chunk_lists = pulled.share.chunk_lists.clone();
+    let chunks = disk.len();
+
+    let disk = if let Some(out) = materialize {
+        let m = manifest.clone();
+        let l = chunk_lists.clone();
+        tokio::task::spawn_blocking(move || {
+            write_share(&out, &m, &l, &disk)?;
+            anyhow::Ok(disk)
+        })
+        .await??
+    } else {
+        disk
+    };
+
+    node.serve(Catalog::new(manifest.clone(), chunk_lists, disk)).await?;
+    if let Some(invite) = &source.invite {
+        node.restrict_to_invite_holders(invite.share).await?;
+    }
+
+    let listen_addrs = match node.listen_addr().await {
+        Ok(a) => vec![a],
+        Err(_) => Vec::new(),
+    };
+    let state = AcceleratorState {
+        role: AcceleratorRole::Nas,
+        peer_id: node.peer_id(),
+        listen_addrs,
+        detail: format!("replica of “{}”: {} chunks on disk", source.name, chunks),
+        cache: None,
+        replica_chunks: Some(chunks),
+    };
+    let handle = AccelHandle {
+        role: AcceleratorRole::Nas,
+        relay: None,
+        node: Some(node),
+    };
+    Ok((handle, state))
+}
+
+/// Sequential-write throughput to `dir` + free space, and a role suggestion.
+fn run_benchmark(dir: &std::path::Path) -> anyhow::Result<BenchmarkResult> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(".gaggle-benchmark.tmp");
+    let payload = vec![0u8; 1 << 20];
+    let total: u64 = 64 << 20;
+
+    let started = Instant::now();
+    {
+        let mut f = std::fs::File::create(&probe)?;
+        for _ in 0..(total >> 20) {
+            f.write_all(&payload)?;
+        }
+        f.sync_all()?;
+    }
+    let secs = started.elapsed().as_secs_f64().max(1e-3);
+    let _ = std::fs::remove_file(&probe);
+
+    let disk_write_bps = (total as f64 / secs) as u64;
+    let free_bytes = free_space(dir).unwrap_or(0);
+    let suggested = if free_bytes >= 50 << 30 && disk_write_bps >= 20 << 20 {
+        AcceleratorRole::Nas
+    } else {
+        AcceleratorRole::Relay
+    };
+    Ok(BenchmarkResult { disk_write_bps, free_bytes, suggested })
+}
+
+#[cfg(unix)]
+fn free_space(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("path has an interior NUL"))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_space(_path: &std::path::Path) -> std::io::Result<u64> {
+    Ok(0)
 }
 
 /// Credit one chunk to a source in a row's per-source breakdown.
