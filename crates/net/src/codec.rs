@@ -26,11 +26,16 @@ mod tag {
     pub const REQ_MANIFEST: u8 = 1;
     pub const REQ_CHUNK_LIST: u8 = 2;
     pub const REQ_CHUNK: u8 = 3;
+    pub const REQ_INVENTORY: u8 = 4;
+    pub const REQ_HELLO: u8 = 5;
 
     pub const RES_NOT_FOUND: u8 = 0;
     pub const RES_MANIFEST: u8 = 1;
     pub const RES_CHUNK_LIST: u8 = 2;
     pub const RES_CHUNK: u8 = 3;
+    pub const RES_INVENTORY: u8 = 4;
+    pub const RES_WELCOME: u8 = 5;
+    pub const RES_UNAUTHORIZED: u8 = 6;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,6 +115,8 @@ fn encode_request(req: &Request) -> Vec<u8> {
         Request::GetManifest => vec![tag::REQ_MANIFEST],
         Request::GetChunkList(h) => hash_frame(tag::REQ_CHUNK_LIST, h),
         Request::GetChunk(h) => hash_frame(tag::REQ_CHUNK, h),
+        Request::GetInventory => vec![tag::REQ_INVENTORY],
+        Request::Hello(cred) => json_frame(tag::REQ_HELLO, cred).expect("SignedCapability serializes"),
     }
 }
 
@@ -119,6 +126,8 @@ fn decode_request(bytes: &[u8]) -> io::Result<Request> {
         tag::REQ_MANIFEST => Ok(Request::GetManifest),
         tag::REQ_CHUNK_LIST => Ok(Request::GetChunkList(read_hash(rest)?)),
         tag::REQ_CHUNK => Ok(Request::GetChunk(read_hash(rest)?)),
+        tag::REQ_INVENTORY => Ok(Request::GetInventory),
+        tag::REQ_HELLO => Ok(Request::Hello(serde_json::from_slice(rest)?)),
         other => Err(bad(format!("unknown request tag {other}"))),
     }
 }
@@ -134,6 +143,13 @@ fn encode_response(res: &Response) -> io::Result<Vec<u8>> {
             v.extend_from_slice(data);
             v
         }
+        Response::Inventory(hashes) => json_frame(tag::RES_INVENTORY, hashes)?,
+        Response::Welcome => vec![tag::RES_WELCOME],
+        Response::Unauthorized(why) => {
+            let mut v = vec![tag::RES_UNAUTHORIZED];
+            v.extend_from_slice(why.as_bytes());
+            v
+        }
     })
 }
 
@@ -144,6 +160,11 @@ fn decode_response(bytes: &[u8]) -> io::Result<Response> {
         tag::RES_MANIFEST => Ok(Response::Manifest(serde_json::from_slice(rest)?)),
         tag::RES_CHUNK_LIST => Ok(Response::ChunkList(serde_json::from_slice(rest)?)),
         tag::RES_CHUNK => Ok(Response::Chunk(rest.to_vec())),
+        tag::RES_INVENTORY => Ok(Response::Inventory(serde_json::from_slice(rest)?)),
+        tag::RES_WELCOME => Ok(Response::Welcome),
+        tag::RES_UNAUTHORIZED => Ok(Response::Unauthorized(
+            String::from_utf8(rest.to_vec()).map_err(|e| bad(format!("bad reason string: {e}")))?,
+        )),
         other => Err(bad(format!("unknown response tag {other}"))),
     }
 }
@@ -174,12 +195,23 @@ fn bad(msg: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaggle_core::Manifest;
+    use gaggle_core::{Capability, Manifest, ShareKeypair};
+
+    fn sample_credential() -> gaggle_core::SignedCapability {
+        let kp = ShareKeypair::from_seed([5u8; 32]);
+        kp.issue(Capability::new(kp.public(), Hash::of(b"m")))
+    }
 
     #[test]
     fn request_frames_round_trip() {
         let h = Hash::of(b"x");
-        for req in [Request::GetManifest, Request::GetChunkList(h), Request::GetChunk(h)] {
+        for req in [
+            Request::GetManifest,
+            Request::GetChunkList(h),
+            Request::GetChunk(h),
+            Request::GetInventory,
+            Request::Hello(sample_credential()),
+        ] {
             assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
         }
     }
@@ -191,6 +223,9 @@ mod tests {
             Response::NotFound,
             Response::Manifest(manifest),
             Response::Chunk(vec![7u8; 1024]),
+            Response::Inventory(vec![Hash::of(b"a"), Hash::of(b"b"), Hash::of(b"c")]),
+            Response::Welcome,
+            Response::Unauthorized("present an invite first".into()),
         ];
         for res in cases {
             let bytes = encode_response(&res).unwrap();

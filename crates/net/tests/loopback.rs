@@ -1,11 +1,11 @@
-//! Milestone 2 end-to-end: snapshot a folder on one side, pull it back over a
-//! loopback QUIC connection on the other, and prove every file reconstructs
-//! byte-for-byte from the downloaded chunks.
+//! Milestone 2 end-to-end, on the milestone-3 [`Node`]: snapshot a folder on one
+//! side, hand its address over directly (no DHT), pull it back over loopback
+//! QUIC on the other, and prove every file reconstructs byte-for-byte.
 
 use std::fs;
 
 use gaggle_core::{ChunkStore, Hash, MemoryChunkStore, snapshot_dir};
-use net::{Catalog, Client, Request, Response, ServerHandle, download_share};
+use net::{Catalog, Node, Request, Response};
 use tempfile::TempDir;
 
 /// A small share with an empty dir, a couple of tiny files, and one file large
@@ -30,22 +30,29 @@ fn sample_share() -> TempDir {
     dir
 }
 
-async fn serve(share: &TempDir) -> (ServerHandle, gaggle_core::Manifest) {
+async fn serve(share: &TempDir) -> (Node, gaggle_core::Manifest) {
     let mut store = MemoryChunkStore::new();
     let snapshot = snapshot_dir(share.path(), "loopback-share", 1, &mut store).unwrap();
     let manifest = snapshot.manifest.clone();
     let catalog = Catalog::new(snapshot.manifest, snapshot.chunk_lists, store);
-    (ServerHandle::spawn(catalog).await.unwrap(), manifest)
+    (Node::spawn_serving(catalog).await.unwrap(), manifest)
+}
+
+async fn connect_to(origin: &Node) -> Node {
+    let addr = origin.listen_addrs().await.unwrap().into_iter().next().expect("origin is listening");
+    let subscriber = Node::spawn().await.unwrap();
+    subscriber.add_peer_address(origin.peer_id(), addr).await.unwrap();
+    subscriber
 }
 
 #[tokio::test]
 async fn loopback_quic_transfer_reconstructs_the_share() {
     let share = sample_share();
-    let (server, origin_manifest) = serve(&share).await;
+    let (origin, origin_manifest) = serve(&share).await;
+    let subscriber = connect_to(&origin).await;
 
-    let client = Client::connect(server.listen_addr.clone()).await.unwrap();
     let mut store = MemoryChunkStore::new();
-    let got = download_share(&client, &mut store).await.unwrap();
+    let got = subscriber.download_share(origin.peer_id(), &mut store).await.unwrap();
 
     assert_eq!(got.manifest, origin_manifest, "manifest survived the round trip");
     assert_eq!(got.chunk_lists.len(), origin_manifest.files.len());
@@ -67,46 +74,43 @@ async fn loopback_quic_transfer_reconstructs_the_share() {
         assert_eq!(rebuilt, original, "{} did not reconstruct byte-for-byte", file.path);
     }
 
-    client.shutdown().await;
-    server.shutdown().await;
+    subscriber.shutdown().await;
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn a_second_download_reuses_the_local_store() {
     let share = sample_share();
-    let (server, _) = serve(&share).await;
-
-    let client = Client::connect(server.listen_addr.clone()).await.unwrap();
+    let (origin, _) = serve(&share).await;
+    let subscriber = connect_to(&origin).await;
 
     let mut store = MemoryChunkStore::new();
-    download_share(&client, &mut store).await.unwrap();
+    subscriber.download_share(origin.peer_id(), &mut store).await.unwrap();
     let after_first = store.stats().total_puts;
 
-    // Nothing new to fetch: every chunk is already content-addressed locally.
-    download_share(&client, &mut store).await.unwrap();
+    subscriber.download_share(origin.peer_id(), &mut store).await.unwrap();
     assert_eq!(store.stats().total_puts, after_first, "second pass re-fetched chunks");
 
-    client.shutdown().await;
-    server.shutdown().await;
+    subscriber.shutdown().await;
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn unknown_content_comes_back_as_not_found() {
     let share = sample_share();
-    let (server, _) = serve(&share).await;
+    let (origin, _) = serve(&share).await;
+    let subscriber = connect_to(&origin).await;
 
-    let client = Client::connect(server.listen_addr.clone()).await.unwrap();
     let missing = Hash::of(b"this address is not in the share");
-
     assert!(matches!(
-        client.request(Request::GetChunk(missing)).await.unwrap(),
+        subscriber.request(origin.peer_id(), Request::GetChunk(missing)).await.unwrap(),
         Response::NotFound
     ));
     assert!(matches!(
-        client.request(Request::GetChunkList(missing)).await.unwrap(),
+        subscriber.request(origin.peer_id(), Request::GetChunkList(missing)).await.unwrap(),
         Response::NotFound
     ));
 
-    client.shutdown().await;
-    server.shutdown().await;
+    subscriber.shutdown().await;
+    origin.shutdown().await;
 }

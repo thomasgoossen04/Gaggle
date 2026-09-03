@@ -23,4 +23,7 @@ pub enum Error {
 
     #[error("verification failed: {0}")]
     Verify(String),
+
+    #[error("invite / capability: {0}")]
+    Invite(String),
 }

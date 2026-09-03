@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::Path;
 
-use gaggle_core::{Manifest, MemoryChunkStore, snapshot_dir};
+use gaggle_core::{DiskChunkStore, Manifest, MemoryChunkStore, snapshot_dir, write_share};
 
 /// Deterministic pseudo-random bytes (splitmix64).
 fn pattern(len: usize, mut seed: u64) -> Vec<u8> {
@@ -114,4 +114,36 @@ fn re_snapshotting_an_edited_folder_only_stores_the_delta() {
         "content-defined chunking should have re-used most of the archive; stored {newly_stored} new bytes"
     );
     assert!(after.duplicate_bytes > before.duplicate_bytes);
+}
+
+#[test]
+fn write_share_reconstructs_a_folder_from_a_disk_store() {
+    let src = tempfile::tempdir().unwrap();
+    let root = src.path();
+    write(root, "mods/a.bin", &pattern(5 * 1024 * 1024, 3));
+    write(root, "mods/loose/readme.txt", b"hello replica\n");
+    write(root, "top.txt", b"root file");
+    fs::create_dir_all(root.join("empty-dir")).unwrap();
+
+    // Snapshot into a durable on-disk store, as the NAS accelerator would.
+    let chunk_dir = tempfile::tempdir().unwrap();
+    let mut store = DiskChunkStore::open(chunk_dir.path()).unwrap();
+    let snap = snapshot_dir(root, "replica", 1, &mut store).unwrap();
+
+    // A fresh process re-opens the same chunk directory and materializes the tree.
+    let reopened = DiskChunkStore::open(chunk_dir.path()).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    write_share(out.path(), &snap.manifest, &snap.chunk_lists, &reopened).unwrap();
+
+    for f in &snap.manifest.files {
+        let original = fs::read(root.join(&f.path)).unwrap();
+        let rebuilt = fs::read(out.path().join(&f.path)).unwrap();
+        assert_eq!(original, rebuilt, "{} did not round-trip through the disk store", f.path);
+    }
+    assert!(out.path().join("empty-dir").is_dir(), "empty dirs are recreated");
+
+    // Re-snapshotting the materialized copy yields the same manifest identity.
+    let mut check = MemoryChunkStore::new();
+    let again = snapshot_dir(out.path(), "replica", 1, &mut check).unwrap();
+    assert_eq!(again.manifest.id(), snap.manifest.id());
 }

@@ -11,13 +11,107 @@ throughput. The full design and the milestone roadmap live in `notes/plan.md` (t
 directory is git-ignored — read it, don't rely on it being present for others).
 
 Milestone 1 (the `gaggle-core` data model — chunking, Merkle trees, manifest, dedup)
-is implemented and tested. Milestone 2 (loopback QUIC transfer) is implemented: `net`
-runs a libp2p **request-response over QUIC** protocol where one process serves a share
-(`Catalog` + `ServerHandle`) and another pulls and verifies it (`Client` +
-`download_share`); see `crates/net/tests/loopback.rs` and the
-`cargo run -p net --example loopback_transfer` two-process demo. `control-plane`,
-`app-state`, and the GUI views are still stubs; milestone 3 (DHT + NAT traversal) is
-next.
+is implemented and tested. `gaggle-core` ships three `ChunkStore`s: `MemoryChunkStore`
+(a plain map), `LruChunkCache` (byte-budgeted, LRU eviction — the relay's hot cache),
+and `DiskChunkStore` (durable, one sharded file per chunk — the NAS replica).
+`snapshot::write_share` is `snapshot_dir`'s inverse: materialize a share's files from
+any store back onto disk.
+
+Milestone 7 (private swarms) adds `identity` + `invite` to `gaggle-core`: a per-share
+Ed25519 `ShareKeypair` / `SharePublicKey`, and a bearer `Capability` (`Scope::All` or
+`Scope::Files`, optional expiry) the origin signs into a `SignedCapability`. An `Invite`
+bundles the share key, manifest id, name and credential and round-trips through a
+`gaggle1<base64url>` string.
+
+Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and tested:
+
+- **Chunk transfer** — a libp2p **request-response over QUIC** protocol (`proto`,
+  `codec`, `transfer::fetch_share`) that pulls a share and verifies every chunk
+  against the manifest root. `transfer::fetch_manifest_and_lists` fetches just the
+  metadata. The serving side is `Catalog` (store type-erased, so a peer serves from
+  RAM and a NAS from disk through the same type); it may hold a *partial* store and
+  reports what it has via `Request::GetInventory`.
+- **`Node`** — a standard peer: the chunk protocol wired together with a **Kademlia**
+  DHT (`ShareKey` = `Manifest::id`; `provide` / `find_providers`), **identify**, a
+  **relay client** and **dcutr**. It resolves a route to a discovered peer (routing
+  table → learned addresses → `get_closest_peers`) before requesting, and reaches
+  NAT'd peers through a relay circuit, upgrading to a direct connection when dcutr's
+  hole-punch lands.
+- **Multi-peer swarming** (`swarm::fetch_share_from_swarm`, `Node::download_share_multi`)
+  — pulls one share from several sources at once. Queries each source's inventory,
+  builds a per-chunk availability map, and schedules chunk requests **rarest-first**
+  (fewest holders first) with a per-peer concurrency cap so load spreads across
+  sources. Every chunk is still verified against the manifest; a failed or
+  chunk-less source is re-routed around (transport failures drop the source
+  entirely, a `NotFound` only for that chunk). `SwarmConfig::prefer` /
+  `Node::download_share_multi_preferring` biases the scheduler toward given sources
+  first — the NAS's "LAN-priority" knob. `SwarmDownload` reports per-source chunk
+  counts and fetch order. `pick_next` / `requeue` are pure and unit-tested.
+- **`RelayNode`** — the accelerator's relay role (milestones 3 & 5): a libp2p relay
+  server + a Kademlia bootstrap server, **plus a read-through hot-chunk cache**. After
+  `cache_share(manifest, lists, upstreams)` it answers `GetChunk` from an
+  `LruChunkCache`; on a miss it fetches from an upstream seed, verifies, caches
+  (evicting the coldest chunk if over `RelayConfig::cache_capacity_bytes`), and
+  forwards — so N downloaders cost the origin one fetch per hot chunk. `cache_stats()`
+  exposes hits/misses/evictions/bytes.
+- **NAS replica** (milestone 6) — no new node type: `Node::download_share_multi` into a
+  `DiskChunkStore`, then `Node::serve(Catalog::new(manifest, lists, disk))`. The disk
+  store dedups and skips chunks already present, so replication resumes after a
+  restart, and the replica keeps serving with the origin offline.
+- **Private swarms** (milestone 7) — a new `Request::Hello(SignedCapability)` /
+  `Response::Welcome` / `Response::Unauthorized`. `Node::restrict_to_invite_holders` /
+  `RelayNode::restrict_to_invite_holders` flip a served share private: every request is
+  refused until a connection has presented a valid capability (checked against the
+  share key + current manifest id + expiry), and `GetChunkList` / `GetChunk` /
+  `GetInventory` are then filtered by the capability's `Scope`. The downloader side is
+  `Node::authenticate` / `authenticate_all` before a `download_*`. Grants are
+  per-connection and dropped on disconnect.
+- **`control-plane`** gets its first real code: `invite::{InviteRegistry, router,
+  InviteClient}` — an in-memory HTTP service to `POST /invites` (rejecting
+  bad-signature invites) and `GET /invites/{code}`.
+- **`accelerator` binary** wires everything: `--role relay [--upstream <addr>]...
+  [--cache-mib N] [--restrict <sharepub-hex>]` and `--role nas --dir <path>
+  --source <addr>... [--materialize <path>] [--invite <gaggle1…>]`.
+
+Tests: `crates/net/tests/loopback.rs` (direct transfer), `discovery.rs` (DHT +
+relay/dcutr), `swarm.rs` (multi-seed load spread, partial-seed stitching, dead-source
+re-routing, re-seeding), `accelerator.rs` (relay cache shields the origin / evicts under
+budget; NAS durability across restart, resumed replication, LAN priority),
+`private.rs` (no-invite refusal, whole-share download, per-file scope, expiry, wrong
+key, invite-URL round trip, private relay). `control-plane/tests/invite_exchange.rs`
+round-trips an invite through a live server. Plus the
+`cargo run -p net --example loopback_transfer` demo
+(`serve [seed]` / `mint-invite` / `fetch [invite]` / `fetch-swarm`).
+Peer `Node`s deliberately do **not** `add_external_address` their own loopback addr —
+that would make the swarm swallow the identify address candidates dcutr needs.
+
+Milestone 8 (GUI v1) is implemented and tested:
+
+- **`app-state`** — the headless, UI-framework-agnostic transfer manager. `App` is a
+  sync, thread-safe handle (callable from a GUI thread with no tokio runtime); all the
+  async lives on a background task `App::new` spawns. It owns the `net` nodes: one
+  shared downloading `Node`, one serving `Node` per local share. `App::add_local_share`
+  snapshots a folder (off-thread) and seeds it; `App::subscribe(SubscribeRequest)`
+  pulls a remote share into a `DiskChunkStore` under the download dir (so pause = abort,
+  resume = top up), then `write_share`s the tree out. Progress rides
+  `Node::download_share_multi_with_progress` (new `SwarmProgress` per chunk). Callers
+  read `App::snapshot()` (a cloneable `AppState { transfers, settings, swarm }`) or
+  listen on `App::events()`. `Settings` persist to a JSON path. `ShareLink` is the
+  copy-paste `gaggleshare1…` token (addr(s) + manifest id + optional invite) that turns
+  into a `SubscribeRequest`.
+- **`gui`** — a gpui shell over `App`: a Shares view (add folder, copy link, remove), a
+  Transfers view (progress bars, pause/resume/remove, paste-a-link to subscribe), and a
+  Settings view. It polls `App::snapshot()` on a 200 ms `Timer` and re-renders; it never
+  touches `net`. Raw gpui for layout/interaction; `gpui_component::{init, v_flex}` only.
+
+Tests: `app-state/tests/transfer_manager.rs` runs real loopback transfers through two
+`App`s — share→subscribe→complete with byte-exact output, incremental progress events,
+pause keeps partial + resume finishes, settings survive a restart, removing a seed makes
+later subscribers fail. `app-state` unit tests cover `Settings` persistence, `ShareLink`
+round trips, and name sanitizing.
+
+Milestone 9 (GUI v2 — accelerator setup wizard, swarm inspector, invite dialog, theming
+polish) and milestone 10 (delta sync) are next.
 
 ## Commands
 
@@ -116,20 +210,44 @@ reads. Module layout and how the pieces chain:
   root per file, no embedded chunk lists**. `canonicalize` (sort + dedup) before
   serializing; `validate` rejects unsafe paths and unsorted entries. `Manifest::diff`
   classifies files added/removed/changed/unchanged by comparing roots.
-- **`store`** — `ChunkStore` trait + `MemoryChunkStore`. Dedup is just content
-  addressing: `put` is a no-op if the hash is already present. `DedupStats` tracks
-  unique vs. duplicate bytes.
-- **`snapshot`** — ties it together: walk dir → chunk each file into a `ChunkStore` →
-  `Snapshot { manifest, chunk_lists, skipped }`.
+- **`store`** — `ChunkStore` trait + three impls: `MemoryChunkStore` (plain map,
+  `DedupStats`), `LruChunkCache` (byte-budgeted, LRU eviction, `CacheStats` — relay
+  hot cache), `DiskChunkStore` (durable, sharded one-file-per-chunk, `try_get` /
+  `try_put` for explicit `io::Result` — NAS replica). Dedup is just content
+  addressing: `put` is a no-op if the hash is already present.
+- **`snapshot`** — ties it together: `snapshot_dir` walks a dir → chunks each file into
+  a `ChunkStore` → `Snapshot { manifest, chunk_lists, skipped }`. `write_share` is the
+  inverse: rebuild the files under a root dir from a store (used by the NAS accelerator
+  and the loopback demo).
+- **`identity`** — per-share Ed25519 keypair. `ShareKeypair` (origin-only secret) /
+  `SharePublicKey` (the share's authority, distinct from `Manifest::id`) / `Signature`,
+  all with hex/base64url serde. `verify` uses `verify_strict` (no malleable sigs).
+- **`invite`** — `Scope` (`All` | canonicalized `Files`), `Capability`
+  (`share` + `manifest_id` + `scope` + optional `expires_at` + random `nonce`), signed
+  by `ShareKeypair::issue` into a `SignedCapability` (`verify` / `verify_for` check sig,
+  expiry, share, manifest). `Invite` wraps it with the manifest id + name and encodes
+  to a `gaggle1<base64url>` token. Signing bytes are domain-tagged canonical JSON.
 
-Trust flow: the manifest is authenticated out of band (invite token, milestone 7);
-everything else — chunk lists, chunk bytes — is verified against the manifest root, so
-it can come from any untrusted peer or accelerator.
+Trust flow: the manifest id is authenticated by the `Invite`'s signed `Capability`
+(milestone 7); everything else — chunk lists, chunk bytes — is verified against the
+manifest root, so it can come from any untrusted peer or accelerator. On a private
+share the serving node also requires that signed capability per connection and enforces
+its per-file `Scope`.
+
+## The GUI / core split
+
+`app-state` is where the testable logic lives: `App` + the transfer manager, headless,
+driven by real `net` calls, covered by `app-state/tests/transfer_manager.rs`. `gui` is a
+thin gpui renderer that only ever calls `App`'s sync methods and reads `App::snapshot()`
+— it holds no `net` types and has no automated tests (a windowed GPU app can't run in
+CI). Put behaviour in `app-state`, pixels in `gui`.
 
 ## GUI dependency note
 
 `gpui` and `gpui-component` are pulled from **crates.io** (`gpui = "0.2"`,
 `gpui-component = "0.5"`), not from the `zed-industries/zed` git repo. `gpui` now
 publishes releases and `gpui-component` tracks a matching `gpui` version, so no git-rev
-pinning is needed. A future-incompat warning from `proc-macro-error2` (transitive via
-`gpui-component`'s macros) is expected and not actionable here.
+pinning is needed. `gpui::hsla` is **not** `const` — build palette constants with a
+`const fn` wrapping the `Hsla { h, s, l, a }` literal. A future-incompat warning from
+`proc-macro-error2` (transitive via `gpui-component`'s macros) is expected and not
+actionable here.

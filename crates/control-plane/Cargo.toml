@@ -11,4 +11,8 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 axum = "0.8"
+getrandom = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "http2", "charset", "rustls"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

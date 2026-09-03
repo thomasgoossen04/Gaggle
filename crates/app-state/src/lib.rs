@@ -1,16 +1,24 @@
-//! Shared application state and the transfer manager. UI-framework-agnostic so it
-//! stays testable headless; the GUI's entities wrap the types defined here.
+//! UI-framework-agnostic application state and the transfer manager.
+//!
+//! [`App`] is the single handle a frontend holds. Its methods are synchronous
+//! and thread-safe (callable from a GUI thread with no tokio runtime); all the
+//! async work — snapshotting folders, running swarm downloads, materializing
+//! results — happens on a background task [`App::new`] spawns. The frontend
+//! reads [`App::snapshot`] (a cloneable [`AppState`]) and re-renders on change,
+//! or listens on [`App::events`].
+//!
+//! Nothing here depends on `gpui`; the `gui` crate is a thin renderer on top.
 
-pub use gaggle_core::manifest;
+mod link;
+mod manager;
+mod settings;
+mod state;
 
-/// High-level snapshot the GUI subscribes to. Fleshed out in milestone 8.
-#[derive(Debug, Default)]
-pub struct AppState {
-    pub shares: Vec<manifest::Manifest>,
-}
-
-impl AppState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
+pub use gaggle_core::{Hash, Invite};
+pub use link::ShareLink;
+pub use manager::{App, AppEvent, SubscribeRequest};
+pub use net::{Multiaddr, PeerId};
+pub use settings::{Settings, Theme};
+pub use state::{
+    AppState, SourceStats, SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
+};

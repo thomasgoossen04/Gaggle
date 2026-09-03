@@ -80,6 +80,19 @@ impl Manifest {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
+    /// Content address of the manifest itself: `blake3` over its compact JSON.
+    ///
+    /// This is the "manifest hash" an invite link carries (milestone 7) and the
+    /// key a share is announced and discovered under on the DHT (milestone 3).
+    /// [`canonicalize`](Self::canonicalize) first — the hash is only stable for
+    /// sorted, de-duplicated entries.
+    pub fn id(&self) -> Hash {
+        // `serde_json` serializes struct fields in declaration order and this
+        // manifest's collections are pre-sorted, so the bytes are deterministic.
+        let bytes = serde_json::to_vec(self).expect("a Manifest always serializes");
+        Hash::of(&bytes)
+    }
+
     /// Parse and [`validate`](Self::validate).
     pub fn from_json(s: &str) -> Result<Self> {
         let m: Manifest = serde_json::from_str(s)?;
@@ -202,6 +215,29 @@ mod tests {
         assert_eq!(m.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["a.txt", "b.txt"]);
         assert_eq!(m.dirs, ["a", "z"]);
         m.validate().unwrap();
+    }
+
+    #[test]
+    fn id_is_stable_and_content_sensitive() {
+        let mut a = Manifest::new("modpack", 1);
+        a.files.push(file("b.jar", b"bbb"));
+        a.files.push(file("a.jar", b"aaa"));
+        a.canonicalize();
+
+        // Insertion order does not matter once canonicalized.
+        let mut b = Manifest::new("modpack", 1);
+        b.files.push(file("a.jar", b"aaa"));
+        b.files.push(file("b.jar", b"bbb"));
+        b.canonicalize();
+        assert_eq!(a.id(), b.id());
+
+        // Any content change moves the id.
+        let mut c = a.clone();
+        c.version = 2;
+        assert_ne!(a.id(), c.id());
+        let mut d = a.clone();
+        d.files[0].root = Hash::of(b"different");
+        assert_ne!(a.id(), d.id());
     }
 
     #[test]

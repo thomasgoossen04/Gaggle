@@ -168,8 +168,12 @@ name = "app-state"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "gaggle-core",
  "net",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1427,6 +1431,7 @@ dependencies = [
  "anyhow",
  "axum",
  "gaggle-core",
+ "getrandom 0.2.17",
  "reqwest",
  "serde",
  "serde_json",
@@ -2618,8 +2623,11 @@ dependencies = [
 name = "gaggle-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
+ "ed25519-dalek",
  "fastcdc",
+ "getrandom 0.2.17",
  "serde",
  "serde_json",
  "tempfile",

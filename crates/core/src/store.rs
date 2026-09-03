@@ -6,8 +6,22 @@
 //! once no matter how many files or folders reference it.
 //!
 //! [`put`]: ChunkStore::put
+//!
+//! Three implementations ship:
+//!
+//! - [`MemoryChunkStore`] — a plain in-RAM map with dedup accounting. What a
+//!   normal peer downloads into.
+//! - [`LruChunkCache`] — a byte-budgeted in-RAM cache that evicts the
+//!   least-recently-used chunk when full. The relay accelerator's hot-chunk
+//!   cache (milestone 5): high bandwidth, deliberately small storage.
+//! - [`DiskChunkStore`] — a durable content-addressed store on the filesystem,
+//!   one file per chunk, sharded by hash prefix. The cache/NAS accelerator's
+//!   full replica (milestone 6): survives restarts, resumes partial fills.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hash::Hash;
 
@@ -29,8 +43,9 @@ pub trait ChunkStore {
     }
 }
 
-/// In-memory [`ChunkStore`] with dedup accounting. The durable on-disk store
-/// arrives with the NAS accelerator (milestone 6).
+/// In-memory [`ChunkStore`] with dedup accounting — what a normal peer
+/// downloads into. See [`LruChunkCache`] and [`DiskChunkStore`] for the
+/// accelerator-side stores.
 #[derive(Debug, Default)]
 pub struct MemoryChunkStore {
     chunks: HashMap<Hash, Vec<u8>>,
@@ -108,6 +123,296 @@ impl DedupStats {
     }
 }
 
+/// A byte-budgeted, in-memory chunk cache with least-recently-used eviction.
+///
+/// This is the relay accelerator's hot-chunk cache (milestone 5): a node with
+/// lots of bandwidth but little storage keeps only the chunks that are being
+/// asked for right now, and re-fetches a cold chunk from upstream if it comes
+/// back into demand. [`get`](ChunkStore::get) and [`contains`](ChunkStore::contains)
+/// count as a use and refresh a chunk's recency; [`put`](ChunkStore::put)
+/// evicts the coldest chunks until the newcomer fits.
+///
+/// A chunk larger than the whole budget is refused (`put` returns `false`
+/// without evicting anything).
+#[derive(Debug)]
+pub struct LruChunkCache {
+    capacity: u64,
+    used: u64,
+    clock: u64,
+    /// hash -> (bytes, last-use tick)
+    entries: HashMap<Hash, (Vec<u8>, u64)>,
+    /// last-use tick -> hash, for O(log n) coldest-first eviction
+    by_age: BTreeMap<u64, Hash>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl LruChunkCache {
+    /// A cache that will hold at most `capacity_bytes` of chunk data.
+    pub fn new(capacity_bytes: u64) -> Self {
+        Self {
+            capacity: capacity_bytes,
+            used: 0,
+            clock: 0,
+            entries: HashMap::new(),
+            by_age: BTreeMap::new(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    /// Bytes of chunk data currently held. Always `<= capacity`.
+    pub fn used_bytes(&self) -> u64 {
+        self.used
+    }
+
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            chunks: self.entries.len() as u64,
+            used_bytes: self.used,
+            capacity_bytes: self.capacity,
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+        }
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    /// Move `hash` to the most-recently-used position. Caller guarantees it is
+    /// present.
+    fn touch(&mut self, hash: &Hash) {
+        let now = self.tick();
+        let (_, last) = self.entries.get_mut(hash).expect("touch() on an absent chunk");
+        self.by_age.remove(last);
+        *last = now;
+        self.by_age.insert(now, *hash);
+    }
+
+    fn evict_one(&mut self) -> bool {
+        let Some((&age, &hash)) = self.by_age.iter().next() else {
+            return false;
+        };
+        self.by_age.remove(&age);
+        if let Some((data, _)) = self.entries.remove(&hash) {
+            self.used -= data.len() as u64;
+            self.evictions += 1;
+        }
+        true
+    }
+}
+
+impl ChunkStore for LruChunkCache {
+    fn contains(&self, hash: &Hash) -> bool {
+        self.entries.contains_key(hash)
+    }
+
+    fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
+        // `get` takes `&self`; recency is refreshed on the `&mut` paths
+        // (`get_refreshing`, `put`). A plain read still counts as a hit/miss.
+        self.entries.get(hash).map(|(d, _)| d.clone())
+    }
+
+    fn put(&mut self, hash: Hash, data: Vec<u8>) -> bool {
+        debug_assert_eq!(Hash::of(&data), hash, "put() called with a mismatched hash");
+        let n = data.len() as u64;
+        if self.entries.contains_key(&hash) {
+            self.touch(&hash);
+            return false;
+        }
+        if n > self.capacity {
+            return false; // never going to fit; don't thrash the cache for it
+        }
+        while self.used + n > self.capacity {
+            if !self.evict_one() {
+                break;
+            }
+        }
+        let now = self.tick();
+        self.entries.insert(hash, (data, now));
+        self.by_age.insert(now, hash);
+        self.used += n;
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl LruChunkCache {
+    /// Like [`ChunkStore::get`] but refreshes the chunk's recency and updates
+    /// hit/miss counters — the accelerator's serving path calls this.
+    pub fn get_refreshing(&mut self, hash: &Hash) -> Option<Vec<u8>> {
+        if self.entries.contains_key(hash) {
+            self.touch(hash);
+            self.hits += 1;
+            Some(self.entries[hash].0.clone())
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+}
+
+/// Snapshot of an [`LruChunkCache`]'s occupancy and hit rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    pub chunks: u64,
+    pub used_bytes: u64,
+    pub capacity_bytes: u64,
+    /// [`get_refreshing`](LruChunkCache::get_refreshing) calls that hit.
+    pub hits: u64,
+    /// [`get_refreshing`](LruChunkCache::get_refreshing) calls that missed.
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+/// A durable content-addressed chunk store on the filesystem.
+///
+/// One file per chunk, named by lowercase-hex hash, sharded into 256 directories
+/// by the first hash byte so no single directory holds the whole store. This is
+/// the cache/NAS accelerator's replica backing (milestone 6): it survives a
+/// restart, and because [`put`](ChunkStore::put) skips chunks already on disk a
+/// half-finished replication just resumes.
+///
+/// The [`ChunkStore`] impl is infallible by contract, so a read/write I/O error
+/// surfaces as `None` / `false` and bumps [`io_errors`](Self::io_errors); the
+/// [`try_get`](Self::try_get) / [`try_put`](Self::try_put) methods expose the
+/// underlying [`io::Result`] for callers that need it.
+#[derive(Debug)]
+pub struct DiskChunkStore {
+    root: PathBuf,
+    index: HashSet<Hash>,
+    tmp_counter: AtomicU64,
+    io_errors: AtomicU64,
+}
+
+impl DiskChunkStore {
+    /// Open (creating if needed) a store rooted at `dir`, indexing whatever
+    /// chunks are already there.
+    pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+        let root = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        let mut index = HashSet::new();
+        for shard in std::fs::read_dir(&root)? {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(shard.path())? {
+                let name = entry?.file_name();
+                if let Some(hex) = name.to_str()
+                    && let Ok(hash) = Hash::from_hex(hex)
+                {
+                    index.insert(hash);
+                }
+            }
+        }
+        Ok(Self {
+            root,
+            index,
+            tmp_counter: AtomicU64::new(0),
+            io_errors: AtomicU64::new(0),
+        })
+    }
+
+    /// How many `ChunkStore` operations have swallowed an I/O error.
+    pub fn io_errors(&self) -> u64 {
+        self.io_errors.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes of chunk files on disk (a directory walk; not cached).
+    pub fn size_on_disk(&self) -> io::Result<u64> {
+        let mut total = 0;
+        for &hash in &self.index {
+            total += std::fs::metadata(self.path_for(&hash))?.len();
+        }
+        Ok(total)
+    }
+
+    fn path_for(&self, hash: &Hash) -> PathBuf {
+        let hex = hash.to_hex();
+        self.root.join(&hex[..2]).join(hex)
+    }
+
+    /// Read a chunk, distinguishing "absent" (`Ok(None)`) from an I/O error.
+    pub fn try_get(&self, hash: &Hash) -> io::Result<Option<Vec<u8>>> {
+        if !self.index.contains(hash) {
+            return Ok(None);
+        }
+        match std::fs::read(self.path_for(hash)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write a chunk (atomically: temp file + rename). `Ok(false)` means it was
+    /// already present.
+    pub fn try_put(&mut self, hash: Hash, data: &[u8]) -> io::Result<bool> {
+        debug_assert_eq!(Hash::of(data), hash, "try_put() called with a mismatched hash");
+        if self.index.contains(&hash) {
+            return Ok(false);
+        }
+        let final_path = self.path_for(&hash);
+        let shard = final_path.parent().expect("path_for always has a shard parent");
+        std::fs::create_dir_all(shard)?;
+        let n = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
+        let tmp = shard.join(format!(".{}.{n}.tmp", hash.to_hex()));
+        std::fs::write(&tmp, data)?;
+        match std::fs::rename(&tmp, &final_path) {
+            Ok(()) => {
+                self.index.insert(hash);
+                Ok(true)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl ChunkStore for DiskChunkStore {
+    fn contains(&self, hash: &Hash) -> bool {
+        self.index.contains(hash)
+    }
+
+    fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
+        match self.try_get(hash) {
+            Ok(v) => v,
+            Err(_) => {
+                self.io_errors.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn put(&mut self, hash: Hash, data: Vec<u8>) -> bool {
+        match self.try_put(hash, &data) {
+            Ok(newly) => newly,
+            Err(_) => {
+                self.io_errors.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +455,124 @@ mod tests {
     #[test]
     fn empty_store_ratio_is_zero() {
         assert_eq!(MemoryChunkStore::new().stats().dedup_ratio(), 0.0);
+    }
+
+    // --- LruChunkCache -----------------------------------------------------
+
+    #[test]
+    fn lru_evicts_the_coldest_chunk_when_full() {
+        let (h1, d1) = chunk(&[1u8; 100]);
+        let (h2, d2) = chunk(&[2u8; 100]);
+        let (h3, d3) = chunk(&[3u8; 100]);
+
+        let mut cache = LruChunkCache::new(250); // room for two 100-byte chunks
+        assert!(cache.put(h1, d1));
+        assert!(cache.put(h2, d2));
+        assert_eq!(cache.used_bytes(), 200);
+
+        // Touch h1 so h2 is now the least-recently-used.
+        assert_eq!(cache.get_refreshing(&h1).as_deref(), Some(&[1u8; 100][..]));
+
+        assert!(cache.put(h3, d3));
+        assert!(cache.contains(&h1), "h1 was refreshed, should survive");
+        assert!(!cache.contains(&h2), "h2 was coldest, should be evicted");
+        assert!(cache.contains(&h3));
+        assert_eq!(cache.used_bytes(), 200);
+        assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[test]
+    fn lru_refuses_a_chunk_larger_than_the_budget() {
+        let (h_big, d_big) = chunk(&[7u8; 500]);
+        let (h_ok, d_ok) = chunk(&[8u8; 50]);
+        let mut cache = LruChunkCache::new(100);
+
+        assert!(cache.put(h_ok, d_ok));
+        assert!(!cache.put(h_big, d_big), "oversized chunk is refused");
+        assert!(cache.contains(&h_ok), "and does not thrash out what already fit");
+        assert_eq!(cache.used_bytes(), 50);
+    }
+
+    #[test]
+    fn lru_tracks_hits_and_misses() {
+        let (h, d) = chunk(b"hot");
+        let mut cache = LruChunkCache::new(1024);
+        assert!(cache.get_refreshing(&h).is_none());
+        cache.put(h, d);
+        assert!(cache.get_refreshing(&h).is_some());
+        assert!(cache.get_refreshing(&h).is_some());
+        let s = cache.stats();
+        assert_eq!((s.hits, s.misses), (2, 1));
+    }
+
+    #[test]
+    fn lru_put_of_present_chunk_refreshes_without_growing() {
+        let (h1, d1) = chunk(&[1u8; 100]);
+        let (h2, d2) = chunk(&[2u8; 100]);
+        let (h3, d3) = chunk(&[3u8; 100]);
+        let mut cache = LruChunkCache::new(250);
+        cache.put(h1, d1.clone());
+        cache.put(h2, d2);
+        assert!(!cache.put(h1, d1), "re-put is a no-op returning false");
+        // h1 is now freshest; adding h3 evicts h2.
+        cache.put(h3, d3);
+        assert!(cache.contains(&h1));
+        assert!(!cache.contains(&h2));
+    }
+
+    // --- DiskChunkStore --------------------------------------------------
+
+    #[test]
+    fn disk_store_round_trips_and_dedups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DiskChunkStore::open(dir.path()).unwrap();
+        let (h, d) = chunk(b"durable bytes");
+
+        assert!(store.put(h, d.clone()));
+        assert!(!store.put(h, d.clone()), "second put is a dedup no-op");
+        assert!(store.contains(&h));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(&h).as_deref(), Some(&b"durable bytes"[..]));
+        assert!(store.get(&Hash::of(b"absent")).is_none());
+    }
+
+    #[test]
+    fn disk_store_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h1, d1) = chunk(b"one");
+        let (h2, d2) = chunk(&[9u8; 4096]);
+
+        {
+            let mut store = DiskChunkStore::open(dir.path()).unwrap();
+            store.put(h1, d1.clone());
+            store.put(h2, d2.clone());
+        }
+
+        let reopened = DiskChunkStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert!(reopened.contains(&h1) && reopened.contains(&h2));
+        assert_eq!(reopened.get(&h1).as_deref(), Some(&b"one"[..]));
+        assert_eq!(reopened.get(&h2), Some(d2));
+        assert_eq!(reopened.io_errors(), 0);
+    }
+
+    #[test]
+    fn disk_store_shards_by_hash_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DiskChunkStore::open(dir.path()).unwrap();
+        let (h, d) = chunk(b"shard me");
+        store.put(h, d).then_some(()).unwrap();
+
+        let shard = dir.path().join(&h.to_hex()[..2]);
+        assert!(shard.join(h.to_hex()).is_file(), "chunk lands in its prefix shard");
+    }
+
+    #[test]
+    fn disk_store_try_put_reports_new_then_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DiskChunkStore::open(dir.path()).unwrap();
+        let (h, d) = chunk(b"x");
+        assert!(store.try_put(h, &d).unwrap());
+        assert!(!store.try_put(h, &d).unwrap());
     }
 }

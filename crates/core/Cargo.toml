@@ -9,6 +9,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 blake3 = "1.8"
 fastcdc = "5"
+ed25519-dalek = "2"
+getrandom = "0.2"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

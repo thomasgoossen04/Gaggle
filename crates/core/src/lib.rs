@@ -24,6 +24,8 @@ pub mod chunk;
 pub mod chunklist;
 pub mod error;
 pub mod hash;
+pub mod identity;
+pub mod invite;
 pub mod manifest;
 pub mod merkle;
 pub mod snapshot;
@@ -33,7 +35,11 @@ pub use chunk::{Chunk, ChunkWithData, ChunkerConfig, chunk_reader, chunk_slice};
 pub use chunklist::{ChunkList, ChunkRef};
 pub use error::{Error, Result};
 pub use hash::Hash;
+pub use identity::{ShareKeypair, SharePublicKey, Signature};
+pub use invite::{Capability, Invite, Scope, SignedCapability};
 pub use manifest::{FileEntry, Manifest, ManifestDiff};
 pub use merkle::{MerkleProof, MerkleTree, Side, merkle_root};
-pub use snapshot::{Snapshot, snapshot_dir};
-pub use store::{ChunkStore, DedupStats, MemoryChunkStore};
+pub use snapshot::{Snapshot, snapshot_dir, write_share};
+pub use store::{
+    CacheStats, ChunkStore, DedupStats, DiskChunkStore, LruChunkCache, MemoryChunkStore,
+};
