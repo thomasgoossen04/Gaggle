@@ -53,8 +53,13 @@ pub fn bracket(top: bool, left: bool) -> Div {
     d
 }
 
-/// Hollow high-viz action button (uppercase, sharp, accent outline → accent fill
-/// on hover).
+/// Hollow high-viz action button (uppercase, sharp; the outline brightens and the
+/// surface lifts on hover).
+///
+/// Note: gpui shapes a plain-string child's colour at *layout* time, before
+/// hover state is known, so `.hover(|s| s.text_color(..))` can't recolour the
+/// label. Every hover here changes only `bg` / `border`, and the text colour is
+/// picked to stay legible against both the resting and hovered surface.
 pub fn btn(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
     let t = theme::active();
     div()
@@ -71,11 +76,12 @@ pub fn btn(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
         .font_weight(FontWeight::BOLD)
         .text_color(t.accent)
         .cursor_pointer()
-        .hover(|s| s.bg(t.accent).text_color(t.on_accent).border_color(t.accent))
+        .hover(|s| s.bg(t.panel).border_color(t.accent))
         .child(label.to_uppercase())
 }
 
-/// Filled primary button — the one call to action per view.
+/// Filled primary button — the one call to action per view. Same height as
+/// [`btn`] / [`danger_btn`] so they line up in a row.
 pub fn primary_btn(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
     let t = theme::active();
     div()
@@ -84,7 +90,7 @@ pub fn primary_btn(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .px_3()
-        .py_2()
+        .py_1()
         .bg(t.accent)
         .border_1()
         .border_color(t.accent)
@@ -92,11 +98,14 @@ pub fn primary_btn(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
         .font_weight(FontWeight::BLACK)
         .text_color(t.on_accent)
         .cursor_pointer()
-        .hover(|s| s.bg(t.accent_dim).border_color(t.accent_dim))
+        // Keep the accent fill (so `on_accent` text stays readable) and cue the
+        // hover with a dark ring instead of darkening the fill.
+        .hover(|s| s.border_color(t.on_accent))
         .child(label.to_uppercase())
 }
 
-/// Destructive variant of [`btn`] — red outline → red fill.
+/// Destructive variant of [`btn`] — red outline, red label; surface lifts on
+/// hover (see the note on [`btn`] about hovered text colour).
 pub fn danger_btn(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
     let t = theme::active();
     div()
@@ -113,7 +122,7 @@ pub fn danger_btn(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
         .font_weight(FontWeight::BOLD)
         .text_color(t.bad)
         .cursor_pointer()
-        .hover(|s| s.bg(t.bad).text_color(t.on_accent))
+        .hover(|s| s.bg(t.panel))
         .child(label.to_uppercase())
 }
 
@@ -129,12 +138,11 @@ pub fn win_btn(id: impl Into<ElementId>, glyph: &str, danger: bool) -> Stateful<
         .w(px(28.0))
         .h(px(22.0))
         .text_xs()
-        .text_color(t.muted)
+        // `danger` gets `fg` at rest so the glyph stays legible on the red hover
+        // fill (the label colour can't change on hover — see [`btn`]).
+        .text_color(if danger { t.fg } else { t.muted })
         .cursor_pointer()
-        .hover(|s| {
-            s.bg(if danger { t.bad } else { t.panel_hi })
-                .text_color(if danger { t.on_accent } else { t.accent })
-        })
+        .hover(|s| s.bg(if danger { t.bad } else { t.panel_hi }))
         // Swallow the press so the title bar never reads it as a drag.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(glyph.to_string())
@@ -190,6 +198,36 @@ pub fn kv(key: &str, value: String) -> Div {
         .child(div().text_color(t.fg).child(value))
 }
 
+/// Tri-state selection mark for the invite file tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tri {
+    On,
+    Off,
+    Partial,
+}
+
+/// A 15px checkbox rendering a [`Tri`] state.
+pub fn checkmark(state: Tri) -> Div {
+    let t = theme::active();
+    let (bg, border, glyph) = match state {
+        Tri::On => (t.accent, t.accent, "✓"),
+        Tri::Partial => (t.accent_dim, t.accent_dim, "–"),
+        Tri::Off => (t.panel_hi, t.line, ""),
+    };
+    div()
+        .w(px(15.0))
+        .h(px(15.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .text_color(t.on_accent)
+        .text_size(px(10.0))
+        .child(glyph.to_string())
+}
+
 /// A small outlined chip — used for the "UPDATE" badge and role tags.
 pub fn chip(text: &str, color: gpui::Hsla) -> Div {
     div()
@@ -229,9 +267,9 @@ pub fn suffix_btn(id: impl Into<ElementId>, label: &str) -> Stateful<Div> {
         .h_full()
         .text_xs()
         .font_weight(FontWeight::BOLD)
-        .text_color(t.muted)
+        .text_color(t.accent)
         .cursor_pointer()
-        .hover(|s| s.text_color(t.accent))
+        .hover(|s| s.bg(t.panel))
         .child(label.to_uppercase())
 }
 

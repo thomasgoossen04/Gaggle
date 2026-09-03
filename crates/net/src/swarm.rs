@@ -45,11 +45,17 @@ pub struct SwarmConfig {
     /// almost everything from it and only spills to other peers when it
     /// saturates.
     pub prefer: Vec<PeerId>,
+    /// Restrict the download to these manifest paths (a scoped invite). `None`
+    /// pulls the whole share; `Some(paths)` fetches chunk lists and chunks only
+    /// for those files, and the returned [`DownloadedShare::manifest`] is
+    /// narrowed to them — so a request for a file the capability excludes is
+    /// never made.
+    pub allowed_paths: Option<Vec<String>>,
 }
 
 impl Default for SwarmConfig {
     fn default() -> Self {
-        Self { per_peer_parallelism: 4, prefer: Vec::new() }
+        Self { per_peer_parallelism: 4, prefer: Vec::new(), allowed_paths: None }
     }
 }
 
@@ -131,11 +137,21 @@ where
     let prefer: HashSet<PeerId> = config.prefer.iter().copied().collect();
 
     // 1. Manifest and chunk lists, from whichever source answers.
-    let manifest = match from_any(sources, &request, Request::GetManifest).await? {
+    let mut manifest = match from_any(sources, &request, Request::GetManifest).await? {
         Response::Manifest(m) => m,
         other => anyhow::bail!("asked for the manifest, got {}", other.kind()),
     };
     manifest.validate().context("a source sent an invalid manifest")?;
+
+    // A scoped invite: narrow the manifest to the files it grants, so we never
+    // ask a source for a file it will refuse.
+    if let Some(allowed) = &config.allowed_paths {
+        let allow: HashSet<&str> = allowed.iter().map(String::as_str).collect();
+        manifest.files.retain(|f| allow.contains(f.path.as_str()));
+        manifest
+            .dirs
+            .retain(|d| manifest.files.iter().any(|f| f.path.starts_with(&format!("{d}/"))));
+    }
 
     let mut chunk_lists: BTreeMap<String, ChunkList> = BTreeMap::new();
     for file in &manifest.files {

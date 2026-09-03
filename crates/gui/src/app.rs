@@ -4,11 +4,13 @@
 //! [`crate::ui`]; all behaviour is a thin wrapper over [`app_state::App`].
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_state::{
-    AcceleratorRequest, App, AppState, Scope, Settings, ShareLink, Theme, TransferId, TransferRow,
+    AcceleratorRequest, App, AppState, Scope, Settings, ShareLink, Theme, TransferId, TransferKind,
+    TransferRow,
 };
 use gpui::prelude::*;
 use gpui::{ClipboardItem, Entity, PathPromptOptions, SharedString, Timer, Window, div};
@@ -72,6 +74,20 @@ impl ExpiryChoice {
     }
 }
 
+/// A pending "are you sure?" for a Remove button.
+pub struct Confirm {
+    pub id: TransferId,
+    pub name: String,
+    pub kind: ConfirmKind,
+}
+
+pub enum ConfirmKind {
+    /// A seeded folder — stop serving; local files untouched.
+    Share,
+    /// A download — discard it, optionally deleting `output_dir`.
+    Transfer { output_dir: Option<PathBuf> },
+}
+
 pub struct Gaggle {
     pub(crate) app: Arc<App>,
     pub(crate) state: AppState,
@@ -80,6 +96,14 @@ pub struct Gaggle {
     /// Rows whose detail panel (swarm inspector / invite form) is open.
     pub(crate) expanded: HashSet<TransferId>,
     pub(crate) invite_expiry: ExpiryChoice,
+    /// The private seed whose invite file-picker is currently populated.
+    pub(crate) invite_for: Option<TransferId>,
+    /// Manifest paths ticked for the next minted invite.
+    pub(crate) invite_sel: HashSet<String>,
+    /// Expanded folders in the invite file tree.
+    pub(crate) tree_expanded: HashSet<String>,
+    /// A Remove button is awaiting confirmation.
+    pub(crate) confirm: Option<Confirm>,
     /// The Settings theme dropdown is open.
     pub(crate) theme_menu_open: bool,
     /// Last `ThemeMode` pushed into gpui-component, so `render` can re-sync it
@@ -95,8 +119,6 @@ pub struct Gaggle {
     pub(crate) set_ul: Entity<InputState>,
     pub(crate) set_store: Entity<InputState>,
     pub(crate) set_resync: Entity<InputState>,
-    // Invite form (one open at a time).
-    pub(crate) invite_paths: Entity<InputState>,
     // Accelerator form.
     pub(crate) accel_cache: Entity<InputState>,
     pub(crate) accel_link: Entity<InputState>,
@@ -131,7 +153,6 @@ impl Gaggle {
         let set_ul = num(cx, window, fmt_rate_mib(s.upload_cap_bps), decimal.clone());
         let set_store = num(cx, window, fmt_size_gib(s.storage_cap_bytes), decimal);
         let set_resync = num(cx, window, fmt_minutes(s.auto_resync_secs), integer.clone());
-        let invite_paths = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(1, 4));
         let accel_cache = num(cx, window, "256".into(), integer);
         let accel_link = text(cx, window, String::new());
         let accel_dir = text(cx, window, String::new());
@@ -160,6 +181,10 @@ impl Gaggle {
             notice: None,
             expanded: HashSet::new(),
             invite_expiry: ExpiryChoice::Never,
+            invite_for: None,
+            invite_sel: HashSet::new(),
+            tree_expanded: HashSet::new(),
+            confirm: None,
             theme_menu_open: false,
             theme_mode: Some(initial_mode),
             dragging: false,
@@ -168,7 +193,6 @@ impl Gaggle {
             set_ul,
             set_store,
             set_resync,
-            invite_paths,
             accel_cache,
             accel_link,
             accel_dir,
@@ -180,9 +204,85 @@ impl Gaggle {
         cx.notify();
     }
 
+    /// Arm the Remove confirmation for row `id`.
+    pub(crate) fn ask_remove(&mut self, id: TransferId, cx: &mut Context<Self>) {
+        let Some(row) = self.state.get(id) else { return };
+        let kind = match row.kind {
+            TransferKind::Seeding => ConfirmKind::Share,
+            TransferKind::Downloading => {
+                ConfirmKind::Transfer { output_dir: row.output_dir.clone() }
+            }
+        };
+        self.confirm = Some(Confirm { id, name: row.name.clone(), kind });
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_cancel(&mut self, cx: &mut Context<Self>) {
+        self.confirm = None;
+        cx.notify();
+    }
+
+    /// Act on the armed confirmation. `delete_files` only applies to a download.
+    pub(crate) fn confirm_go(&mut self, delete_files: bool, cx: &mut Context<Self>) {
+        if let Some(c) = self.confirm.take() {
+            if delete_files {
+                self.app.remove_and_delete(c.id);
+            } else {
+                self.app.remove(c.id);
+            }
+            self.set_notice(format!("Removed “{}”", c.name), cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn toggle_expand(&mut self, id: TransferId, cx: &mut Context<Self>) {
-        if !self.expanded.remove(&id) {
-            self.expanded.insert(id);
+        if self.expanded.remove(&id) {
+            cx.notify();
+            return;
+        }
+        self.expanded.insert(id);
+        // Opening a private seed's panel: seed the invite file picker with
+        // everything ticked (whole folder) and all folders collapsed.
+        if let Some(paths) =
+            self.state.get(id).filter(|r| r.private).map(|r| r.file_paths.clone())
+        {
+            self.invite_for = Some(id);
+            self.invite_sel = paths.iter().cloned().collect();
+            self.tree_expanded.clear();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_tree_dir(&mut self, dir: String, cx: &mut Context<Self>) {
+        if !self.tree_expanded.remove(&dir) {
+            self.tree_expanded.insert(dir);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_invite_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.invite_sel.remove(&path) {
+            self.invite_sel.insert(path);
+        }
+        cx.notify();
+    }
+
+    /// Tick / untick every file under `dir` (all-or-nothing).
+    pub(crate) fn toggle_invite_dir(&mut self, dir: String, cx: &mut Context<Self>) {
+        let Some(files) =
+            self.invite_for.and_then(|id| self.state.get(id)).map(|r| r.file_paths.clone())
+        else {
+            return;
+        };
+        let prefix = format!("{dir}/");
+        let under: Vec<&String> = files.iter().filter(|p| p.starts_with(&prefix)).collect();
+        let all_on = !under.is_empty() && under.iter().all(|p| self.invite_sel.contains(*p));
+        for p in under {
+            if all_on {
+                self.invite_sel.remove(p);
+            } else {
+                self.invite_sel.insert(p.clone());
+            }
         }
         cx.notify();
     }
@@ -288,6 +388,17 @@ impl Gaggle {
         self.set_notice("Rescanning folder…", cx);
     }
 
+    /// Open a completed download's folder in the system file manager.
+    pub(crate) fn open_output_dir(&mut self, id: TransferId, cx: &mut Context<Self>) {
+        match self.state.get(id).and_then(|r| r.output_dir.clone()) {
+            Some(dir) => {
+                cx.open_with_system(&dir);
+                self.set_notice("Opening download folder…", cx);
+            }
+            None => self.set_notice("This transfer has no folder yet", cx),
+        }
+    }
+
     pub(crate) fn check_updates(&mut self, id: TransferId, cx: &mut Context<Self>) {
         self.app.check_updates(id);
         self.set_notice("Checking for a newer version…", cx);
@@ -304,14 +415,17 @@ impl Gaggle {
     }
 
     pub(crate) fn mint_invite(&mut self, seed_id: TransferId, cx: &mut Context<Self>) {
-        let raw = self.invite_paths.read(cx).value().to_string();
-        let paths: Vec<String> = raw
-            .split(['\n', ','])
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        let scope = if paths.is_empty() { Scope::All } else { Scope::files(paths) };
+        let all: Vec<String> = self
+            .state
+            .get(seed_id)
+            .map(|r| r.file_paths.as_ref().clone())
+            .unwrap_or_default();
+        // Everything ticked ⇒ a whole-folder grant; otherwise a per-file scope.
+        let scope = if !all.is_empty() && all.iter().all(|p| self.invite_sel.contains(p)) {
+            Scope::All
+        } else {
+            Scope::files(self.invite_sel.iter().cloned())
+        };
         self.app.mint_invite(seed_id, scope, self.invite_expiry.as_unix());
         self.set_notice("Minting invite…", cx);
     }
@@ -407,6 +521,7 @@ impl Render for Gaggle {
 
         // The `window_border` frame is drawn by the wrapping `gpui_component::Root`.
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -423,5 +538,6 @@ impl Render for Gaggle {
                     .child(ui::views::body(self.tab, self, cx)),
             )
             .child(ui::chrome::status_bar(self))
+            .children(ui::views::confirm_modal(self, cx))
     }
 }

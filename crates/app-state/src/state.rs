@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gaggle_core::Hash;
 use net::{CacheStats, Multiaddr, PeerId};
@@ -92,6 +93,9 @@ pub struct TransferRow {
     /// Seed only: the local folder this share snapshots — the source a rescan
     /// re-reads.
     pub source_dir: Option<PathBuf>,
+    /// Seed only: the manifest's file paths, `/`-separated and sorted — the GUI
+    /// builds the invite's file picker from this. Cheap to clone (`Arc`).
+    pub file_paths: Arc<Vec<String>>,
     /// Download only: a newer manifest version seen by the last update check.
     /// Cleared by a successful resync.
     pub update_available: Option<u64>,

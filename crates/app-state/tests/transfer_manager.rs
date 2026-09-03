@@ -441,6 +441,89 @@ async fn private_share_needs_a_minted_invite() {
 }
 
 #[tokio::test]
+async fn remove_and_delete_wipes_the_output_folder() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let (addr, manifest_id) = (seed.share_addr.clone().unwrap(), seed.manifest_id);
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![addr],
+        credential: None,
+    });
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    let (dl_id, output) = (row.id, row.output_dir.clone().unwrap());
+    assert!(output.is_dir());
+
+    leech.remove_and_delete(dl_id);
+    wait_for(&leech, 10, |s| s.get(dl_id).is_none()).await;
+
+    let gone = timeout(Duration::from_secs(5), async {
+        while output.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "{} still present after remove_and_delete", output.display());
+}
+
+#[tokio::test]
+async fn a_scoped_invite_downloads_only_its_files() {
+    let folder = sample_folder(); // cfg/game.ini, readme.txt, pack.bin
+    let origin = App::new(None).await.unwrap();
+    origin.add_private_share(folder.path());
+    let up = wait_for(&origin, 20, |s| {
+        s.seeds().next().is_some_and(|r| {
+            r.status == TransferStatus::Complete && r.private && !r.file_paths.is_empty()
+        })
+    })
+    .await;
+    let seed = up.seeds().next().unwrap();
+    let seed_id = seed.id;
+    assert!(seed.file_paths.iter().any(|p| p == "pack.bin"));
+
+    // Grant only the two small files — the big pack.bin is excluded.
+    origin.mint_invite(seed_id, Scope::files(["cfg/game.ini", "readme.txt"]), None);
+    let minted = wait_for(&origin, 10, |s| {
+        s.minted_invite.as_ref().is_some_and(|m| m.transfer == seed_id)
+    })
+    .await;
+    let link = ShareLink::parse(&minted.minted_invite.unwrap().token).unwrap();
+
+    let out = TempDir::new().unwrap();
+    let guest = app_downloading_into(out.path()).await;
+    guest.subscribe(link.into_request());
+    let done = wait_for(&guest, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    assert!(row.error.is_none(), "excluded file must not fault the download: {:?}", row.error);
+    assert_eq!(row.files, 2, "only the two granted files are pulled");
+
+    let output = row.output_dir.clone().unwrap();
+    assert_eq!(
+        fs::read(output.join("readme.txt")).unwrap(),
+        fs::read(folder.path().join("readme.txt")).unwrap()
+    );
+    assert!(output.join("cfg/game.ini").is_file());
+    assert!(!output.join("pack.bin").exists(), "the excluded file is not materialized");
+}
+
+#[tokio::test]
 async fn benchmark_reports_disk_throughput_and_free_space() {
     let out = TempDir::new().unwrap();
     let app = app_downloading_into(out.path()).await;

@@ -273,7 +273,11 @@ async fn nas_lan_priority_pulls_from_the_replica_first() {
 
     // High parallelism so the preferred (LAN) replica never saturates and the
     // WAN origin is never needed.
-    let cfg = SwarmConfig { per_peer_parallelism: 64, prefer: vec![nas.peer_id()] };
+    let cfg = SwarmConfig {
+        per_peer_parallelism: 64,
+        prefer: vec![nas.peer_id()],
+        ..SwarmConfig::default()
+    };
     let mut store = MemoryChunkStore::new();
     let out = timeout(
         Duration::from_secs(30),

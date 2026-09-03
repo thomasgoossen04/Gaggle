@@ -92,7 +92,7 @@ enum Command {
     Subscribe(SubscribeRequest),
     Pause(TransferId),
     Resume(TransferId),
-    Remove(TransferId),
+    Remove { id: TransferId, delete_files: bool },
     RescanShare(TransferId),
     CheckUpdates(TransferId),
     Resync(TransferId),
@@ -105,7 +105,14 @@ enum Command {
 
     // Internal, from worker tasks.
     LocalShareReady { id: TransferId, node: Arc<Node>, addr: Multiaddr, info: ShareInfo },
-    RescanDone { id: TransferId, manifest_id: Hash, version: u64, files: usize, bytes: u64 },
+    RescanDone {
+        id: TransferId,
+        manifest_id: Hash,
+        version: u64,
+        files: usize,
+        bytes: u64,
+        file_paths: Vec<String>,
+    },
     WorkerFailed { id: TransferId, error: String },
     DownloadProgress { id: TransferId, p: SwarmProgress, base_bytes: u64 },
     DownloadDone { id: TransferId, outcome: Box<DownloadOutcome> },
@@ -125,6 +132,8 @@ struct ShareInfo {
     bytes: u64,
     version: u64,
     dir: PathBuf,
+    /// Manifest file paths, sorted.
+    file_paths: Vec<String>,
     /// `Some` for a private (invite-only) share — the per-share signing seed.
     share_seed: Option<[u8; 32]>,
 }
@@ -272,9 +281,15 @@ impl App {
     }
 
     /// Stop and forget a transfer (a seed stops serving; a download's partial
-    /// chunks are discarded).
+    /// chunks are discarded). Any materialized output folder is left on disk.
     pub fn remove(&self, id: TransferId) {
-        self.send(Command::Remove(id));
+        self.send(Command::Remove { id, delete_files: false });
+    }
+
+    /// Like [`remove`](Self::remove) but also deletes a completed download's
+    /// output folder. Never touches a seed's source folder.
+    pub fn remove_and_delete(&self, id: TransferId) {
+        self.send(Command::Remove { id, delete_files: true });
     }
 
     /// Measure disk write throughput + free space on the download volume and
@@ -411,7 +426,7 @@ impl Manager {
             Command::Subscribe(req) => self.subscribe(req),
             Command::Pause(id) => self.pause(id),
             Command::Resume(id) => self.resume(id),
-            Command::Remove(id) => self.remove(id),
+            Command::Remove { id, delete_files } => self.remove(id, delete_files),
             Command::RescanShare(id) => self.rescan_share(id),
             Command::CheckUpdates(id) => self.check_updates(id),
             Command::Resync(id) => self.resync(id),
@@ -457,6 +472,7 @@ impl Manager {
                     row.version = info.version;
                     row.private = info.share_seed.is_some();
                     row.source_dir = Some(info.dir);
+                    row.file_paths = Arc::new(info.file_paths);
                     row.status = TransferStatus::Complete;
                     row.share_addr = Some(addr);
                 }
@@ -464,7 +480,7 @@ impl Manager {
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
             }
-            Command::RescanDone { id, manifest_id, version, files, bytes } => {
+            Command::RescanDone { id, manifest_id, version, files, bytes, file_paths } => {
                 if let Some(seed) = self.seeds.get_mut(&id) {
                     seed.version = version;
                     seed.manifest_id = manifest_id;
@@ -475,6 +491,7 @@ impl Manager {
                     row.files = files;
                     row.total_bytes = bytes;
                     row.done_bytes = bytes;
+                    row.file_paths = Arc::new(file_paths);
                     row.status = TransferStatus::Complete;
                     row.error = None;
                 }
@@ -691,6 +708,7 @@ impl Manager {
                 bytes: snap.manifest.total_size(),
                 version: snap.manifest.version,
                 dir,
+                file_paths: snap.manifest.files.iter().map(|f| f.path.clone()).collect(),
                 share_seed,
             };
             let catalog = Catalog::new(snap.manifest, snap.chunk_lists, store);
@@ -747,6 +765,8 @@ impl Manager {
             let manifest_id = snap.manifest.id();
             let files = snap.manifest.files.len();
             let bytes = snap.manifest.total_size();
+            let file_paths: Vec<String> =
+                snap.manifest.files.iter().map(|f| f.path.clone()).collect();
             let catalog = Catalog::new(snap.manifest, snap.chunk_lists, store);
             if let Err(e) = node.serve(catalog).await {
                 return fail(&tx, id, format!("re-serve failed: {e:#}")).await;
@@ -758,7 +778,14 @@ impl Manager {
                 }
             }
             let _ = tx
-                .send(Command::RescanDone { id, manifest_id, version: next_version, files, bytes })
+                .send(Command::RescanDone {
+                    id,
+                    manifest_id,
+                    version: next_version,
+                    files,
+                    bytes,
+                    file_paths,
+                })
                 .await;
         });
     }
@@ -791,16 +818,14 @@ impl Manager {
         let node = Arc::clone(&self.download_node);
         let req = sub.request.clone();
         let have_version = sub.version;
-        let have_id = sub.manifest.id();
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
             match check_remote_version(&node, &req).await {
-                Ok((version, mid)) => {
-                    let newer = version > have_version
-                        || (mid != have_id && version >= have_version && have_version != 0);
-                    let _ = tx
-                        .send(Command::UpdateSeen { id, version: if newer { version } else { 0 } })
-                        .await;
+                Ok(version) => {
+                    // Compare by manifest version only — a scoped download stores
+                    // a narrowed manifest whose id never equals the seed's.
+                    let flag = if version > have_version { version } else { 0 };
+                    let _ = tx.send(Command::UpdateSeen { id, version: flag }).await;
                 }
                 Err(e) => tracing::warn!(id, error = %e, "update check failed"),
             }
@@ -950,7 +975,7 @@ impl Manager {
         self.publish();
     }
 
-    fn remove(&mut self, id: TransferId) {
+    fn remove(&mut self, id: TransferId, delete_files: bool) {
         self.seeds.remove(&id);
         self.subs.remove(&id);
         self.resync_samples.remove(&id);
@@ -966,6 +991,24 @@ impl Manager {
         {
             clear_partial(self.partial_dir(mid));
         }
+
+        // Only a completed *download* has an output folder we may delete — a
+        // seed's `source_dir` is the user's own folder and is never touched.
+        if delete_files
+            && let Some(dir) = self
+                .state
+                .transfers
+                .get(&id)
+                .filter(|r| r.kind == TransferKind::Downloading)
+                .and_then(|r| r.output_dir.clone())
+        {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    tracing::warn!(dir = %dir.display(), error = %e, "could not delete output folder");
+                }
+            });
+        }
+
         self.state.transfers.remove(&id);
         self.recount();
         self.publish();
@@ -1029,6 +1072,7 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
         version: 0,
         private: false,
         source_dir: None,
+        file_paths: Arc::new(Vec::new()),
         update_available: None,
     }
 }
@@ -1075,7 +1119,7 @@ async fn run_download(
         .download_share_multi_with_progress(
             &peers,
             &mut disk,
-            SwarmConfig::default(),
+            swarm_config_for(&req),
             move |p: SwarmProgress| {
                 let _ = progress_tx.try_send(Command::DownloadProgress { id, p, base_bytes });
             },
@@ -1146,7 +1190,7 @@ async fn run_resync(
         .download_share_multi_with_progress(
             &peers,
             &mut mem,
-            SwarmConfig::default(),
+            swarm_config_for(&req),
             move |p: SwarmProgress| {
                 let _ = progress_tx.try_send(Command::ResyncProgress { id, p });
             },
@@ -1180,11 +1224,8 @@ async fn run_resync(
     Ok(())
 }
 
-/// Fetch the current manifest version + id from the first source that answers.
-async fn check_remote_version(
-    node: &Node,
-    req: &SubscribeRequest,
-) -> anyhow::Result<(u64, Hash)> {
+/// Fetch the current manifest version from the first source that answers.
+async fn check_remote_version(node: &Node, req: &SubscribeRequest) -> anyhow::Result<u64> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
     let mut last_err = None;
     for addr in &req.sources {
@@ -1193,8 +1234,7 @@ async fn check_remote_version(
             if let Some(cred) = &req.credential {
                 node.authenticate(peer, cred).await?;
             }
-            let manifest = node.fetch_manifest(peer).await?;
-            anyhow::Ok((manifest.version, manifest.id()))
+            anyhow::Ok(node.fetch_manifest(peer).await?.version)
         };
         match attempt.await {
             Ok(v) => return Ok(v),
@@ -1202,6 +1242,15 @@ async fn check_remote_version(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no sources to ask")))
+}
+
+/// A [`SwarmConfig`] honouring the subscription's per-file scope, if any.
+fn swarm_config_for(req: &SubscribeRequest) -> SwarmConfig {
+    let allowed_paths = req.credential.as_ref().and_then(|c| match &c.capability.scope {
+        Scope::All => None,
+        Scope::Files(paths) => Some(paths.clone()),
+    });
+    SwarmConfig { allowed_paths, ..SwarmConfig::default() }
 }
 
 async fn start_relay_accel(

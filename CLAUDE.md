@@ -67,7 +67,10 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   share key + current manifest id + expiry), and `GetChunkList` / `GetChunk` /
   `GetInventory` are then filtered by the capability's `Scope`. The downloader side is
   `Node::authenticate` / `authenticate_all` before a `download_*`. Grants are
-  per-connection and dropped on disconnect.
+  per-connection and dropped on disconnect. A scoped download passes
+  `SwarmConfig::allowed_paths` so `fetch_share_from_swarm` narrows the manifest to the
+  granted files up front and never asks a source for one it would refuse; `app-state`
+  derives it from the subscription's credential.
 - **`control-plane`** gets its first real code: `invite::{InviteRegistry, router,
   InviteClient}` — an in-memory HTTP service to `POST /invites` (rejecting
   bad-signature invites) and `GET /invites/{code}`.

@@ -3,13 +3,16 @@
 
 use app_state::{AcceleratorState, SourceStats, Theme, TransferRow, TransferStatus};
 use gpui::prelude::*;
-use gpui::{AnyElement, ClickEvent, Context, FontWeight, deferred, div, px, relative};
+use gpui::{
+    AnyElement, ClickEvent, Context, FontWeight, MouseButton, SharedString, deferred, div, hsla,
+    px, relative,
+};
 
-use crate::app::{Gaggle, Tab};
+use crate::app::{ConfirmKind, Gaggle, Tab};
 use crate::theme;
 use crate::ui::widgets::{
-    btn, card, chip, danger_btn, field, field_suffixed, hint, kv, primary_btn, section_title,
-    status_pill, suffix_btn,
+    Tri, btn, card, checkmark, chip, danger_btn, field, field_suffixed, hint, kv, primary_btn,
+    section_title, status_pill, suffix_btn,
 };
 use crate::util::{cap, human_bytes, human_rate};
 
@@ -89,10 +92,7 @@ fn share_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl 
                     )),
                 )
                 .child(danger_btn(("rm", id as usize), "Remove").on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| {
-                        this.app.remove(id);
-                        cx.notify();
-                    },
+                    move |this, _: &ClickEvent, _, cx| this.ask_remove(id, cx),
                 ))),
         );
 
@@ -138,15 +138,13 @@ fn seed_detail(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> Any
                     .text_xs()
                     .font_family("monospace")
                     .text_color(t.muted)
-                    .child(
-                        "PATHS — one per line for a per-file invite; blank = whole folder"
-                            .to_string(),
-                    ),
+                    .child("Tick the files & folders this invite may access."),
             )
-            .child(field("Files", &app.invite_paths))
+            .child(invite_tree(app, row, cx))
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .items_center()
                     .child(
@@ -193,6 +191,166 @@ fn seed_detail(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> Any
         }
     }
     panel.into_any_element()
+}
+
+/// The invite's file/folder picker: a collapsible tree of checkboxes over the
+/// seed's manifest paths.
+fn invite_tree(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    if row.file_paths.is_empty() {
+        return hint("reading files…").into_any_element();
+    }
+    // Very large trees would make the 200 ms redraw sluggish — offer whole-folder
+    // only past a sane cap.
+    if row.file_paths.len() > 4000 {
+        return hint(&format!(
+            "{} files — this invite covers the whole folder",
+            row.file_paths.len()
+        ))
+        .into_any_element();
+    }
+    div()
+        .id(SharedString::from(format!("invite-tree-{}", row.id)))
+        .max_h(px(240.0))
+        .overflow_y_scroll()
+        .p_1()
+        .border_1()
+        .border_color(t.line)
+        .flex()
+        .flex_col()
+        .children(tree_rows(&row.file_paths, "", 0, app, cx))
+        .into_any_element()
+}
+
+/// Rows for the children of `prefix` (`""` = root), recursing into expanded
+/// folders. `files` is the sorted manifest path list.
+fn tree_rows(
+    files: &[String],
+    prefix: &str,
+    depth: usize,
+    app: &Gaggle,
+    cx: &mut Context<Gaggle>,
+) -> Vec<AnyElement> {
+    let t = theme::active();
+    let indent = px(depth as f32 * 14.0);
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut here: Vec<&String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in files {
+        let Some(rest) = p.strip_prefix(prefix) else { continue };
+        if rest.is_empty() {
+            continue;
+        }
+        match rest.split_once('/') {
+            Some((seg, _)) => {
+                let full = format!("{prefix}{seg}");
+                if seen.insert(full.clone()) {
+                    dirs.push(full);
+                }
+            }
+            None => here.push(p),
+        }
+    }
+
+    let mut out: Vec<AnyElement> = Vec::new();
+
+    for dir in dirs {
+        let child_prefix = format!("{dir}/");
+        let (sel, total) = files
+            .iter()
+            .filter(|p| p.starts_with(&child_prefix))
+            .fold((0usize, 0usize), |(s, n), p| {
+                (s + usize::from(app.invite_sel.contains(p)), n + 1)
+            });
+        let state = if total == 0 || sel == 0 {
+            Tri::Off
+        } else if sel == total {
+            Tri::On
+        } else {
+            Tri::Partial
+        };
+        let open = app.tree_expanded.contains(&dir);
+        let name = dir.rsplit('/').next().unwrap_or(&dir).to_string();
+
+        out.push(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .py(px(1.0))
+                .pl(indent)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("tc:{dir}")))
+                        .w(px(12.0))
+                        .text_xs()
+                        .text_color(t.muted)
+                        .cursor_pointer()
+                        .child(if open { "▾" } else { "▸" })
+                        .on_click(cx.listener({
+                            let d = dir.clone();
+                            move |this, _: &ClickEvent, _, cx| this.toggle_tree_dir(d.clone(), cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("tb:{dir}")))
+                        .cursor_pointer()
+                        .child(checkmark(state))
+                        .on_click(cx.listener({
+                            let d = dir.clone();
+                            move |this, _: &ClickEvent, _, cx| this.toggle_invite_dir(d.clone(), cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.fg)
+                        .child(format!("{name}/")),
+                )
+                .into_any_element(),
+        );
+
+        if open {
+            out.extend(tree_rows(files, &child_prefix, depth + 1, app, cx));
+        }
+    }
+
+    for f in here {
+        let on = app.invite_sel.contains(f);
+        let name = f.rsplit('/').next().unwrap_or(f).to_string();
+        out.push(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .py(px(1.0))
+                .pl(indent)
+                .child(div().w(px(12.0)))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("tf:{f}")))
+                        .cursor_pointer()
+                        .child(checkmark(if on { Tri::On } else { Tri::Off }))
+                        .on_click(cx.listener({
+                            let p = f.clone();
+                            move |this, _: &ClickEvent, _, cx| this.toggle_invite_file(p.clone(), cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family("monospace")
+                        .text_color(if on { t.fg } else { t.muted })
+                        .child(name),
+                )
+                .into_any_element(),
+        );
+    }
+
+    out
 }
 
 /// Remote shares this node is pulling down.
@@ -282,6 +440,7 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .gap_2()
                 .when(can_pause, |el| {
                     el.child(btn(("pause", id as usize), "Pause").on_click(cx.listener(
@@ -299,6 +458,11 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                         },
                     )))
                 })
+                .when(row.output_dir.is_some(), |el| {
+                    el.child(btn(("open", id as usize), "Open folder").on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| this.open_output_dir(id, cx),
+                    )))
+                })
                 .when(row.status == TransferStatus::Complete, |el| {
                     el.child(btn(("chk", id as usize), "Check updates").on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| this.check_updates(id, cx),
@@ -310,10 +474,7 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                     )))
                 })
                 .child(danger_btn(("drm", id as usize), "Remove").on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| {
-                        this.app.remove(id);
-                        cx.notify();
-                    },
+                    move |this, _: &ClickEvent, _, cx| this.ask_remove(id, cx),
                 ))),
         );
 
@@ -651,6 +812,74 @@ fn elide(s: &str, keep: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// The "are you sure?" overlay for a Remove button, or `None` when nothing is
+/// armed. Rendered on top of everything via `deferred`.
+pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElement> {
+    let c = app.confirm.as_ref()?;
+    let t = theme::active();
+
+    let mut actions = div().flex().flex_wrap().gap_2().justify_end().child(
+        btn("cf-cancel", "Cancel")
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_cancel(cx))),
+    );
+    let body: String = match &c.kind {
+        ConfirmKind::Share => {
+            actions = actions.child(danger_btn("cf-rm", "Remove").on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_go(false, cx)),
+            ));
+            "Stops seeding this folder. Your local files are left untouched.".into()
+        }
+        ConfirmKind::Transfer { output_dir: Some(dir) } => {
+            actions = actions
+                .child(btn("cf-keep", "Remove, keep files").on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| this.confirm_go(false, cx),
+                )))
+                .child(danger_btn("cf-del", "Remove + delete files").on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| this.confirm_go(true, cx),
+                )));
+            format!("Downloaded files are at {}", dir.display())
+        }
+        ConfirmKind::Transfer { output_dir: None } => {
+            actions = actions.child(danger_btn("cf-rm", "Remove").on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_go(false, cx)),
+            ));
+            "Any partial download data is discarded.".into()
+        }
+    };
+
+    let card = div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_4()
+        .min_w(px(340.0))
+        .max_w(px(520.0))
+        .bg(t.panel)
+        .border_1()
+        .border_color(t.accent)
+        .child(section_title(&format!("Remove “{}”?", c.name)))
+        .child(div().text_xs().font_family("monospace").text_color(t.muted).child(body))
+        .child(actions)
+        // Clicks inside the card must not fall through to the backdrop.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+    let overlay = div()
+        .id("confirm-overlay")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(hsla(0.0, 0.0, 0.0, 0.55))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.confirm_cancel(cx)),
+        )
+        .child(card);
+
+    Some(deferred(overlay).into_any_element())
 }
 
 /// Dispatch to the body for `tab`.
