@@ -1,0 +1,11 @@
+# build artifacts
+/target
+
+# OS cruft
+.DS_Store
+
+# notes folder containing dev .md files
+notes/
+
+# Cargo.lock is intentionally committed — this workspace produces distributable
+# binaries (accelerator, gui), not a library.

@@ -1,0 +1,29 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gaggle-core = { path = "../core" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait = "0.1"
+libp2p = { version = "0.56", features = [
+    "quic",
+    "dns",
+    "kad",
+    "relay",
+    "dcutr",
+    "identify",
+    "noise",
+    "yamux",
+    "request-response",
+    "tokio",
+    "macros",
+] }
+
+[dev-dependencies]
+tempfile = "3"

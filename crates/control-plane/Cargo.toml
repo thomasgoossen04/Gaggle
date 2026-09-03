@@ -1,0 +1,14 @@
+[package]
+name = "control-plane"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gaggle-core = { path = "../core" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "http2", "charset", "rustls"] }

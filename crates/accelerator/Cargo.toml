@@ -1,0 +1,14 @@
+[package]
+name = "accelerator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gaggle-core = { path = "../core" }
+net = { path = "../net" }
+control-plane = { path = "../control-plane" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4.6", features = ["derive"] }
