@@ -97,18 +97,54 @@ pub struct Node {
 impl Node {
     /// Start a peer that only downloads.
     pub async fn spawn() -> anyhow::Result<Self> {
-        Self::spawn_inner(None).await
+        Self::spawn_inner(None, None, None).await
     }
 
     /// Start a peer that also serves `catalog` over the chunk-exchange protocol.
     pub async fn spawn_serving(catalog: Catalog) -> anyhow::Result<Self> {
-        Self::spawn_inner(Some(catalog)).await
+        Self::spawn_inner(Some(catalog), None, None).await
     }
 
-    async fn spawn_inner(catalog: Option<Catalog>) -> anyhow::Result<Self> {
-        let mut swarm = build_peer_swarm()?;
+    /// [`spawn`](Self::spawn) with a persistent libp2p identity, so the peer
+    /// keeps the same [`PeerId`] across restarts.
+    pub async fn spawn_with_identity(keypair: crate::Keypair) -> anyhow::Result<Self> {
+        Self::spawn_inner(None, Some(keypair), None).await
+    }
+
+    /// [`spawn_serving`](Self::spawn_serving) with a persistent libp2p identity.
+    pub async fn spawn_serving_with_identity(
+        catalog: Catalog,
+        keypair: crate::Keypair,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(Some(catalog), Some(keypair), None).await
+    }
+
+    /// [`spawn_serving`](Self::spawn_serving) with an optional persistent
+    /// identity and an optional explicit listen [`Multiaddr`] (e.g.
+    /// `/ip4/0.0.0.0/udp/4001/quic-v1` for a public daemon). `None` for either
+    /// keeps the default (fresh key / ephemeral loopback).
+    pub async fn spawn_serving_with(
+        catalog: Catalog,
+        keypair: Option<crate::Keypair>,
+        listen: Option<Multiaddr>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(Some(catalog), keypair, listen).await
+    }
+
+    async fn spawn_inner(
+        catalog: Option<Catalog>,
+        keypair: Option<crate::Keypair>,
+        listen: Option<Multiaddr>,
+    ) -> anyhow::Result<Self> {
+        let mut swarm = match keypair {
+            Some(kp) => crate::build_peer_swarm_with(kp)?,
+            None => build_peer_swarm()?,
+        };
         let peer_id = *swarm.local_peer_id();
-        swarm.listen_on(LISTEN_QUIC.parse()?)?;
+        match listen {
+            Some(addr) => swarm.listen_on(addr)?,
+            None => swarm.listen_on(LISTEN_QUIC.parse()?)?,
+        };
 
         // Wait until the OS has assigned us a port so `listen_addrs()` is useful
         // straight away. We deliberately do *not* `add_external_address` our own
@@ -268,11 +304,22 @@ impl Node {
     }
 
     /// Fetch just `peer`'s manifest — the small document, no chunk lists. Used
-    /// to cheaply check a subscribed share for a newer version.
-    pub async fn fetch_manifest(&self, peer: PeerId) -> anyhow::Result<gaggle_core::Manifest> {
-        match self.request(peer, Request::GetManifest).await? {
+    /// to cheaply check a subscribed share for a newer version. `want` selects a
+    /// share by manifest id when `peer` serves several (a multi-share relay);
+    /// pass `None` for a peer or single-share relay.
+    pub async fn fetch_manifest(
+        &self,
+        peer: PeerId,
+        want: Option<gaggle_core::Hash>,
+    ) -> anyhow::Result<gaggle_core::Manifest> {
+        match self.request(peer, Request::GetManifest(want)).await? {
             Response::Manifest(m) => {
                 m.validate().map_err(|e| anyhow::anyhow!("peer sent an invalid manifest: {e}"))?;
+                if let Some(want) = want
+                    && m.id() != want
+                {
+                    anyhow::bail!("peer returned a different manifest than the one requested");
+                }
                 Ok(m)
             }
             other => anyhow::bail!("asked for the manifest, got {}", other.kind()),
@@ -280,13 +327,15 @@ impl Node {
     }
 
     /// Fetch and verify just `peer`'s share metadata — the manifest and every
-    /// file's chunk list — without pulling any chunk data.
+    /// file's chunk list — without pulling any chunk data. `want` selects a
+    /// share on a multi-share relay; pass `None` otherwise.
     pub async fn fetch_share_meta(
         &self,
         peer: PeerId,
+        want: Option<gaggle_core::Hash>,
     ) -> anyhow::Result<(gaggle_core::Manifest, std::collections::BTreeMap<String, gaggle_core::ChunkList>)>
     {
-        fetch_manifest_and_lists(|request| self.request(peer, request)).await
+        fetch_manifest_and_lists(|request| self.request(peer, request), want).await
     }
 
     /// Pull `peer`'s whole share into `store`, verifying every piece. `store`
@@ -297,7 +346,19 @@ impl Node {
         peer: PeerId,
         store: &mut S,
     ) -> anyhow::Result<DownloadedShare> {
-        fetch_share(|request| self.request(peer, request), store).await
+        fetch_share(|request| self.request(peer, request), store, None).await
+    }
+
+    /// [`download_share`](Self::download_share) selecting one share by manifest
+    /// id — for pulling a single share from a source that serves several, such
+    /// as a multi-share relay accelerator.
+    pub async fn download_share_selecting<S: ChunkStore + ?Sized>(
+        &self,
+        peer: PeerId,
+        want: gaggle_core::Hash,
+        store: &mut S,
+    ) -> anyhow::Result<DownloadedShare> {
+        fetch_share(|request| self.request(peer, request), store, Some(want)).await
     }
 
     /// Pull one share from several `sources` at once into `store`, fetching the
@@ -576,7 +637,7 @@ impl EventLoop {
 
         let Some(catalog) = &self.catalog else { return Response::NotFound };
         match (request, &scope) {
-            (_, None) | (Request::GetManifest, _) => catalog.answer(request),
+            (_, None) | (Request::GetManifest(_), _) => catalog.answer(request),
             (Request::GetInventory, Some(scope)) => {
                 Response::Inventory(catalog.inventory_scoped(scope))
             }

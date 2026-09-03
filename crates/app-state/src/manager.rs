@@ -12,23 +12,25 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use control_plane::AdminClient;
 use gaggle_core::{
-    ChunkList, ChunkStore, DiskChunkStore, Hash, Manifest, MemoryChunkStore, SignedCapability,
-    SyncOutcome, snapshot_dir, sync_share, write_share,
+    AgentId, AgentKeypair, ChunkList, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
+    SignedCapability, SyncOutcome, snapshot_dir, sync_share, write_share,
 };
+use net::accel::{nas_add_share, relay_add_share};
 use net::{
     CacheStats, Capability, Catalog, Invite, Multiaddr, Node, PeerId, RelayConfig, RelayNode, Scope,
-    ShareKeypair, SwarmConfig, SwarmProgress,
+    ShareKeypair, ShareLink, SwarmConfig, SwarmProgress,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::link::ShareLink;
 use crate::settings::Settings;
 use crate::state::{
-    AcceleratorRole, AcceleratorState, AppState, BenchmarkResult, MintedInvite, SourceStats,
-    SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
+    AccelShareRow, AcceleratorRole, AcceleratorState, AppState, BenchmarkResult, MintedInvite,
+    RemoteAccelState, SourceStats, SwarmStatus, TransferId, TransferKind, TransferRow,
+    TransferStatus,
 };
 
 /// A discrete thing that happened, for callers that would rather react than poll.
@@ -77,14 +79,27 @@ impl SubscribeRequest {
     }
 }
 
-/// Ask the node to opt this machine in as an accelerator.
+impl From<ShareLink> for SubscribeRequest {
+    fn from(link: ShareLink) -> Self {
+        Self {
+            name: link.name,
+            manifest_id: link.manifest_id,
+            sources: link.sources,
+            credential: link.invite.map(|i| i.credential),
+        }
+    }
+}
+
+/// Ask the node to opt this machine in as an accelerator. Each role takes a
+/// *list* of shares to carry — an accelerator is not bound to one.
 #[derive(Debug, Clone)]
 pub enum AcceleratorRequest {
-    /// High-bandwidth relay + Kademlia bootstrap, optionally read-through
-    /// caching one share pulled from `upstream`.
-    Relay { cache_bytes: u64, upstream: Option<ShareLink> },
-    /// Durable full replica of `source`, kept under `dir` and re-served.
-    Nas { dir: PathBuf, source: ShareLink, materialize: Option<PathBuf> },
+    /// High-bandwidth relay + Kademlia bootstrap, read-through caching every
+    /// share in `shares`.
+    Relay { cache_bytes: u64, shares: Vec<ShareLink> },
+    /// Durable on-disk replica of every share in `shares`, kept under `dir`
+    /// (one serving node per share).
+    Nas { dir: PathBuf, shares: Vec<ShareLink> },
 }
 
 enum Command {
@@ -100,6 +115,12 @@ enum Command {
     Benchmark,
     StartAccelerator(Box<AcceleratorRequest>),
     StopAccelerator,
+    AccelAddShare(String),
+    AccelRemoveShare(String),
+    AddRemoteAccelerator { label: String, admin_url: String },
+    RemoveRemoteAccelerator(String),
+    RemoteAddShare { label: String, token: String },
+    RemoteRemoveShare { label: String, manifest_id: String },
     UpdateSettings(Box<Settings>),
     Shutdown,
 
@@ -123,6 +144,10 @@ enum Command {
     AcceleratorReady { handle: Box<AccelHandle>, state: Box<AcceleratorState> },
     AcceleratorStartFailed(String),
     AcceleratorStatsRefresh(CacheStats),
+    AccelSharesRefresh(Vec<AccelShareRow>),
+    AccelShareAdded { node: Option<Box<Node>>, row: Box<AccelShareRow>, token: String },
+    RemoteStatusRefresh { label: String, state: Box<RemoteAccelState> },
+    RepollRemote(String),
 }
 
 struct ShareInfo {
@@ -178,6 +203,27 @@ impl App {
             .unwrap_or(None)
             .unwrap_or_default();
 
+        // A persistent operator identity next to the settings file, so it is
+        // stable across restarts (the key an accelerator daemon authorises).
+        let operator = Arc::new(load_or_create_operator(config_path.as_deref()));
+
+        let mut remotes = HashMap::new();
+        let mut remote_states = Vec::new();
+        for r in &settings.remote_accelerators {
+            let pinned = r.daemon_key.as_deref().and_then(|k| AgentId::from_hex(k).ok());
+            remotes.insert(r.label.clone(), pinned);
+            remote_states.push(RemoteAccelState {
+                label: r.label.clone(),
+                admin_url: r.admin_url.clone(),
+                reachable: false,
+                peer_id: None,
+                daemon_key: r.daemon_key.clone(),
+                role: None,
+                shares: Vec::new(),
+                error: None,
+            });
+        }
+
         let state = AppState {
             settings,
             transfers: Default::default(),
@@ -187,8 +233,10 @@ impl App {
                 downloading: 0,
             },
             accelerator: None,
+            remote_accelerators: remote_states,
             benchmark: None,
             minted_invite: None,
+            operator_key: operator.public().to_hex(),
         };
 
         let (commands_tx, commands_rx) = mpsc::channel(128);
@@ -204,12 +252,17 @@ impl App {
             state,
             next_id: 1,
             download_node: Arc::new(download_node),
+            operator,
             seeds: HashMap::new(),
             subs: HashMap::new(),
             downloads: HashMap::new(),
             resync_samples: HashMap::new(),
             accel: None,
+            remotes,
             last_resync_poll: Instant::now(),
+            last_remote_poll: Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now),
         };
         tokio::spawn(manager.run());
 
@@ -307,6 +360,48 @@ impl App {
         self.send(Command::StopAccelerator);
     }
 
+    /// Add a share (a `gaggleshare1…` token) to the running local accelerator.
+    pub fn accel_add_share(&self, token: impl Into<String>) {
+        self.send(Command::AccelAddShare(token.into()));
+    }
+
+    /// Drop a share (by manifest-id hex) from the running local accelerator.
+    pub fn accel_remove_share(&self, manifest_id: impl Into<String>) {
+        self.send(Command::AccelRemoveShare(manifest_id.into()));
+    }
+
+    /// This node's operator public key (hex). Authorise it on a daemon with
+    /// `accelerator authorize <key>`.
+    pub fn operator_public_key(&self) -> String {
+        self.snapshot().operator_key
+    }
+
+    /// Register a remote accelerator daemon by its admin URL. Its identity is
+    /// pinned on the first successful status call.
+    pub fn add_remote_accelerator(&self, label: impl Into<String>, admin_url: impl Into<String>) {
+        self.send(Command::AddRemoteAccelerator {
+            label: label.into(),
+            admin_url: admin_url.into(),
+        });
+    }
+
+    pub fn remove_remote_accelerator(&self, label: impl Into<String>) {
+        self.send(Command::RemoveRemoteAccelerator(label.into()));
+    }
+
+    /// Tell a registered remote accelerator to start carrying a share.
+    pub fn remote_add_share(&self, label: impl Into<String>, token: impl Into<String>) {
+        self.send(Command::RemoteAddShare { label: label.into(), token: token.into() });
+    }
+
+    /// Tell a registered remote accelerator to stop carrying a share.
+    pub fn remote_remove_share(&self, label: impl Into<String>, manifest_id: impl Into<String>) {
+        self.send(Command::RemoteRemoveShare {
+            label: label.into(),
+            manifest_id: manifest_id.into(),
+        });
+    }
+
     pub fn update_settings(&self, settings: Settings) {
         self.send(Command::UpdateSettings(Box::new(settings)));
     }
@@ -353,13 +448,19 @@ struct DownloadJob {
     last_sample: Option<(Instant, u64)>,
 }
 
-/// Keeps an in-process accelerator alive; drop stops it.
+/// Keeps an in-process accelerator alive; drop stops it. Carries any number of
+/// shares — relay caches them all through one node, NAS serves one node each.
 struct AccelHandle {
-    #[allow(dead_code)]
     role: AcceleratorRole,
     relay: Option<Arc<RelayNode>>,
-    #[allow(dead_code)]
-    node: Option<Node>,
+    /// Relay role: a long-lived downloading node used to learn share metadata.
+    meta: Option<Arc<Node>>,
+    /// NAS role: replica root, and one serving node per share (drop = stop it).
+    nas_dir: Option<PathBuf>,
+    nas_nodes: Vec<(Hash, Node)>,
+    /// Per-share status rows and the `gaggleshare1…` token behind each.
+    rows: Vec<AccelShareRow>,
+    tokens: Vec<String>,
 }
 
 struct Manager {
@@ -372,12 +473,53 @@ struct Manager {
     state: AppState,
     next_id: TransferId,
     download_node: Arc<Node>,
+    operator: Arc<AgentKeypair>,
     seeds: HashMap<TransferId, SeedEntry>,
     subs: HashMap<TransferId, SubEntry>,
     downloads: HashMap<TransferId, DownloadJob>,
     resync_samples: HashMap<TransferId, Option<(Instant, u64)>>,
     accel: Option<AccelHandle>,
+    /// Registered remote accelerators: label → pinned daemon identity (if known).
+    remotes: HashMap<String, Option<AgentId>>,
     last_resync_poll: Instant,
+    last_remote_poll: Instant,
+}
+
+/// Load a persistent operator [`AgentKeypair`] from `operator.key` next to the
+/// settings file, creating it on first run. Ephemeral if there is no config dir.
+fn load_or_create_operator(config_path: Option<&std::path::Path>) -> AgentKeypair {
+    let Some(dir) = config_path.and_then(|p| p.parent()) else {
+        return AgentKeypair::generate();
+    };
+    let path = dir.join("operator.key");
+    if let Ok(hex) = std::fs::read_to_string(&path)
+        && let Ok(bytes) = <[u8; 32]>::try_from(hex_decode(hex.trim()).unwrap_or_default())
+    {
+        return AgentKeypair::from_seed(bytes);
+    }
+    let kp = AgentKeypair::generate();
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(&path, hex_encode(&kp.to_seed()));
+    kp
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
+/// Deterministic per-share NAS identity seed: `blake3(operator-seed ++ id)`.
+fn derive_share_seed(operator_seed: &[u8; 32], manifest_id: Hash) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(operator_seed);
+    buf.extend_from_slice(manifest_id.as_bytes());
+    *Hash::of(&buf).as_bytes()
 }
 
 impl Manager {
@@ -418,6 +560,65 @@ impl Manager {
                 let _ = self.self_tx.try_send(Command::CheckUpdates(id));
             }
         }
+        // Poll every registered remote accelerator for its live status.
+        if !self.remotes.is_empty()
+            && self.last_remote_poll.elapsed() >= Duration::from_secs(10)
+        {
+            self.last_remote_poll = Instant::now();
+            for label in self.remotes.keys().cloned().collect::<Vec<_>>() {
+                self.spawn_remote_status(label);
+            }
+        }
+    }
+
+    /// Fetch one remote daemon's status off-thread and feed it back as a
+    /// [`Command::RemoteStatusRefresh`].
+    fn spawn_remote_status(&mut self, label: String) {
+        let Some(pinned) = self.remotes.get(&label).copied() else { return };
+        let base = self
+            .state
+            .settings
+            .remote_accelerators
+            .iter()
+            .find(|r| r.label == label)
+            .map(|r| r.admin_url.clone())
+            .unwrap_or_default();
+        let operator = AgentKeypair::from_seed(self.operator.to_seed());
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let mut client = AdminClient::new(base.clone(), operator, pinned);
+            let state = match client.status().await {
+                Ok(s) => {
+                    let role = match s.role.as_str() {
+                        "nas" => Some(AcceleratorRole::Nas),
+                        _ => Some(AcceleratorRole::Relay),
+                    };
+                    RemoteAccelState {
+                        label: label.clone(),
+                        admin_url: base,
+                        reachable: true,
+                        peer_id: Some(s.peer_id),
+                        daemon_key: client.pinned().map(|k| k.to_hex()),
+                        role,
+                        shares: s.shares.iter().map(share_status_row).collect(),
+                        error: None,
+                    }
+                }
+                Err(e) => RemoteAccelState {
+                    label: label.clone(),
+                    admin_url: base,
+                    reachable: false,
+                    peer_id: None,
+                    daemon_key: pinned.map(|k| k.to_hex()),
+                    role: None,
+                    shares: Vec::new(),
+                    error: Some(format!("{e:#}")),
+                },
+            };
+            let _ = tx
+                .send(Command::RemoteStatusRefresh { label, state: Box::new(state) })
+                .await;
+        });
     }
 
     fn handle(&mut self, command: Command) {
@@ -438,6 +639,42 @@ impl Manager {
                 self.state.accelerator = None;
                 self.publish();
                 let _ = self.events.send(AppEvent::AcceleratorChanged);
+            }
+            Command::AccelAddShare(token) => self.accel_add_share(token),
+            Command::AccelRemoveShare(id) => self.accel_remove_share(id),
+            Command::AddRemoteAccelerator { label, admin_url } => {
+                self.add_remote_accelerator(label, admin_url)
+            }
+            Command::RemoveRemoteAccelerator(label) => self.remove_remote_accelerator(label),
+            Command::RemoteAddShare { label, token } => self.remote_share_op(label, Some(token), None),
+            Command::RemoteRemoveShare { label, manifest_id } => {
+                self.remote_share_op(label, None, Some(manifest_id))
+            }
+            Command::RemoteStatusRefresh { label, state } => {
+                if let Some(k) = &state.daemon_key
+                    && let Ok(id) = AgentId::from_hex(k)
+                {
+                    self.remotes.insert(label.clone(), Some(id));
+                    if let Some(r) = self
+                        .state
+                        .settings
+                        .remote_accelerators
+                        .iter_mut()
+                        .find(|r| r.label == label)
+                        && r.daemon_key.as_deref() != Some(k.as_str())
+                    {
+                        r.daemon_key = Some(k.clone());
+                        if let Some(path) = &self.config_path {
+                            let _ = self.state.settings.save(path);
+                        }
+                    }
+                }
+                if let Some(slot) =
+                    self.state.remote_accelerators.iter_mut().find(|r| r.label == label)
+                {
+                    *slot = *state;
+                    self.publish();
+                }
             }
             Command::UpdateSettings(s) => {
                 self.state.settings = *s;
@@ -672,7 +909,216 @@ impl Manager {
                     self.publish();
                 }
             }
+            Command::AccelSharesRefresh(rows) => {
+                if let Some(h) = &mut self.accel {
+                    h.rows = rows.clone();
+                }
+                if let Some(a) = &mut self.state.accelerator {
+                    a.shares = rows;
+                    a.detail = accel_detail(a.role, &a.shares);
+                    self.publish();
+                    let _ = self.events.send(AppEvent::AcceleratorChanged);
+                }
+            }
+            Command::AccelShareAdded { node, row, token } => {
+                if let Some(h) = &mut self.accel {
+                    if let (Some(node), Ok(mid)) =
+                        (node, Hash::from_hex(&row.manifest_id))
+                    {
+                        h.nas_nodes.push((mid, *node));
+                    }
+                    h.rows.retain(|r| r.manifest_id != row.manifest_id);
+                    h.rows.push(*row.clone());
+                    h.tokens.push(token);
+                    let rows = h.rows.clone();
+                    if let Some(a) = &mut self.state.accelerator {
+                        a.shares = rows.clone();
+                        a.detail = accel_detail(a.role, &rows);
+                    }
+                    self.publish();
+                    let _ = self.events.send(AppEvent::AcceleratorChanged);
+                }
+            }
+            Command::RepollRemote(label) => self.spawn_remote_status(label),
         }
+    }
+
+    fn accel_add_share(&mut self, token: String) {
+        let Some(h) = &self.accel else {
+            let _ = self.events.send(AppEvent::AcceleratorFailed(
+                "no accelerator is running".into(),
+            ));
+            return;
+        };
+        let link = match ShareLink::parse(token.trim()) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = self
+                    .events
+                    .send(AppEvent::AcceleratorFailed(format!("bad share link: {e:#}")));
+                return;
+            }
+        };
+        if h.rows.iter().any(|r| r.manifest_id == link.manifest_id.to_hex()) {
+            return; // already carried
+        }
+        let role = h.role;
+        let relay = h.relay.clone();
+        let meta = h.meta.clone();
+        let dir_root = h.nas_dir.clone();
+        let operator_seed = self.operator.to_seed();
+        let tx = self.self_tx.clone();
+        let existing = h.rows.clone();
+        let token_owned = token.trim().to_string();
+
+        tokio::spawn(async move {
+            let added = match role {
+                AcceleratorRole::Relay => match (relay, meta) {
+                    (Some(relay), Some(meta)) => {
+                        relay_add_share(&relay, &meta, &link).await.map(|m| (None, row_from_meta(&m, None, None)))
+                    }
+                    _ => Err(anyhow::anyhow!("relay accelerator is not available")),
+                },
+                AcceleratorRole::Nas => match dir_root {
+                    Some(dir) => {
+                        let seed = derive_share_seed(&operator_seed, link.manifest_id);
+                        match nas_add_share(&dir, net::keypair_from_seed(seed), &link).await {
+                            Ok((node, m, chunks)) => {
+                                let addr = node.listen_addr().await.ok().map(|a| a.to_string());
+                                Ok((
+                                    Some(Box::new(node)),
+                                    row_from_meta(&m, Some(chunks as u64), addr),
+                                ))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    None => Err(anyhow::anyhow!("nas accelerator is not available")),
+                },
+            };
+            match added {
+                Ok((node, row)) => {
+                    let _ = tx
+                        .send(Command::AccelShareAdded {
+                            node,
+                            row: Box::new(row),
+                            token: token_owned,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let mut rows = existing;
+                    rows.push(err_row(&link.name, &link.manifest_id.to_hex(), format!("{e:#}")));
+                    let _ = tx.send(Command::AccelSharesRefresh(rows)).await;
+                }
+            }
+        });
+    }
+
+    fn accel_remove_share(&mut self, manifest_id: String) {
+        let Some(h) = &mut self.accel else { return };
+        let id = manifest_id.trim().to_string();
+        if let Some(pos) = h.rows.iter().position(|r| r.manifest_id == id) {
+            h.rows.remove(pos);
+        }
+        h.tokens.retain(|t| {
+            ShareLink::parse(t).map(|l| l.manifest_id.to_hex() != id).unwrap_or(true)
+        });
+        if let Some(pos) = h.nas_nodes.iter().position(|(mid, _)| mid.to_hex() == id) {
+            let (_, node) = h.nas_nodes.remove(pos);
+            tokio::spawn(async move { node.shutdown().await });
+        }
+        if let (AcceleratorRole::Relay, Some(relay)) = (h.role, h.relay.clone())
+            && let Ok(mid) = Hash::from_hex(&id)
+        {
+            tokio::spawn(async move { let _ = relay.remove_share(mid).await; });
+        }
+        let rows = h.rows.clone();
+        if let Some(a) = &mut self.state.accelerator {
+            a.shares = rows.clone();
+            a.detail = accel_detail(a.role, &rows);
+        }
+        self.publish();
+        let _ = self.events.send(AppEvent::AcceleratorChanged);
+    }
+
+    fn add_remote_accelerator(&mut self, label: String, admin_url: String) {
+        if label.trim().is_empty() || admin_url.trim().is_empty() {
+            let _ = self
+                .events
+                .send(AppEvent::AcceleratorFailed("label and admin URL are required".into()));
+            return;
+        }
+        let admin_url = control_plane::admin::normalize_base(&admin_url);
+        self.remotes.entry(label.clone()).or_insert(None);
+        let settings = &mut self.state.settings;
+        if let Some(r) = settings.remote_accelerators.iter_mut().find(|r| r.label == label) {
+            r.admin_url = admin_url.clone();
+        } else {
+            settings.remote_accelerators.push(crate::settings::RemoteAccelerator {
+                label: label.clone(),
+                admin_url: admin_url.clone(),
+                daemon_key: None,
+            });
+        }
+        if let Some(path) = &self.config_path {
+            let _ = self.state.settings.save(path);
+        }
+        if !self.state.remote_accelerators.iter().any(|r| r.label == label) {
+            self.state.remote_accelerators.push(RemoteAccelState {
+                label: label.clone(),
+                admin_url,
+                reachable: false,
+                peer_id: None,
+                daemon_key: None,
+                role: None,
+                shares: Vec::new(),
+                error: None,
+            });
+        }
+        self.publish();
+        self.spawn_remote_status(label);
+    }
+
+    fn remove_remote_accelerator(&mut self, label: String) {
+        self.remotes.remove(&label);
+        self.state.settings.remote_accelerators.retain(|r| r.label != label);
+        self.state.remote_accelerators.retain(|r| r.label != label);
+        if let Some(path) = &self.config_path {
+            let _ = self.state.settings.save(path);
+        }
+        self.publish();
+    }
+
+    fn remote_share_op(&mut self, label: String, add: Option<String>, remove: Option<String>) {
+        let Some(pinned) = self.remotes.get(&label).copied() else { return };
+        let Some(base) = self
+            .state
+            .settings
+            .remote_accelerators
+            .iter()
+            .find(|r| r.label == label)
+            .map(|r| r.admin_url.clone())
+        else {
+            return;
+        };
+        let operator = AgentKeypair::from_seed(self.operator.to_seed());
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let mut client = AdminClient::new(base, operator, pinned);
+            let result = if let Some(token) = add {
+                client.add_share(token.trim()).await
+            } else if let Some(mid) = remove {
+                client.remove_share(mid.trim()).await
+            } else {
+                Ok(())
+            };
+            if let Err(e) = result {
+                tracing::warn!(%label, error = %format!("{e:#}"), "remote share op failed");
+            }
+            // Re-poll so the UI reflects the change quickly.
+            let _ = tx.send(Command::RepollRemote(label)).await;
+        });
     }
 
     fn add_share(&mut self, dir: PathBuf, private: bool) {
@@ -887,13 +1333,14 @@ impl Manager {
             return;
         }
         let tx = self.self_tx.clone();
+        let operator_seed = self.operator.to_seed();
         tokio::spawn(async move {
             let result = match request {
-                AcceleratorRequest::Relay { cache_bytes, upstream } => {
-                    start_relay_accel(cache_bytes, upstream).await
+                AcceleratorRequest::Relay { cache_bytes, shares } => {
+                    start_relay_accel(cache_bytes, shares).await
                 }
-                AcceleratorRequest::Nas { dir, source, materialize } => {
-                    start_nas_accel(dir, source, materialize).await
+                AcceleratorRequest::Nas { dir, shares } => {
+                    start_nas_accel(dir, shares, operator_seed).await
                 }
             };
             match result {
@@ -1234,7 +1681,9 @@ async fn check_remote_version(node: &Node, req: &SubscribeRequest) -> anyhow::Re
             if let Some(cred) = &req.credential {
                 node.authenticate(peer, cred).await?;
             }
-            anyhow::Ok(node.fetch_manifest(peer).await?.version)
+            // `None`: a rescan changes the share's id, and this check exists to
+            // notice exactly that — pinning the old id would always miss it.
+            anyhow::Ok(node.fetch_manifest(peer, None).await?.version)
         };
         match attempt.await {
             Ok(v) => return Ok(v),
@@ -1245,6 +1694,11 @@ async fn check_remote_version(node: &Node, req: &SubscribeRequest) -> anyhow::Re
 }
 
 /// A [`SwarmConfig`] honouring the subscription's per-file scope, if any.
+///
+/// We deliberately leave `manifest_id` unset: sources are origins/replicas that
+/// each serve one share, and a rescan changes a share's id, so pinning it would
+/// break resync. A multi-share relay only ever appears as a *supplementary*
+/// source next to an origin that answers the metadata request.
 fn swarm_config_for(req: &SubscribeRequest) -> SwarmConfig {
     let allowed_paths = req.credential.as_ref().and_then(|c| match &c.capability.scope {
         Scope::All => None,
@@ -1253,126 +1707,162 @@ fn swarm_config_for(req: &SubscribeRequest) -> SwarmConfig {
     SwarmConfig { allowed_paths, ..SwarmConfig::default() }
 }
 
+fn row_from_meta(
+    m: &net::accel::ShareMeta,
+    replica_chunks: Option<u64>,
+    listen_addr: Option<String>,
+) -> AccelShareRow {
+    AccelShareRow {
+        manifest_id: m.manifest_id.to_hex(),
+        name: m.name.clone(),
+        files: m.files,
+        total_bytes: m.total_bytes,
+        version: m.version,
+        private: m.private,
+        replica_chunks,
+        listen_addr,
+        error: None,
+    }
+}
+
+fn err_row(name: &str, manifest_id: &str, error: String) -> AccelShareRow {
+    AccelShareRow {
+        manifest_id: manifest_id.to_string(),
+        name: name.to_string(),
+        files: 0,
+        total_bytes: 0,
+        version: 0,
+        private: false,
+        replica_chunks: None,
+        listen_addr: None,
+        error: Some(error),
+    }
+}
+
+fn share_status_row(s: &control_plane::ShareStatus) -> AccelShareRow {
+    AccelShareRow {
+        manifest_id: s.manifest_id.clone(),
+        name: s.name.clone(),
+        files: s.files,
+        total_bytes: s.total_bytes,
+        version: s.version,
+        private: s.private,
+        replica_chunks: s.replica_chunks,
+        listen_addr: s.listen_addr.clone(),
+        error: s.error.clone(),
+    }
+}
+
+fn accel_detail(role: AcceleratorRole, shares: &[AccelShareRow]) -> String {
+    let ok = shares.iter().filter(|s| s.error.is_none()).count();
+    match role {
+        AcceleratorRole::Relay if ok == 0 => "relay + Kademlia bootstrap".to_string(),
+        AcceleratorRole::Relay => format!("caching {ok} share(s)"),
+        AcceleratorRole::Nas => format!("replicating {ok} share(s) on disk"),
+    }
+}
+
 async fn start_relay_accel(
     cache_bytes: u64,
-    upstream: Option<ShareLink>,
+    shares: Vec<ShareLink>,
 ) -> anyhow::Result<(AccelHandle, AcceleratorState)> {
-    let relay = RelayNode::spawn_with(RelayConfig { cache_capacity_bytes: cache_bytes }).await?;
+    let relay = Arc::new(
+        RelayNode::spawn_with(RelayConfig { cache_capacity_bytes: cache_bytes }).await?,
+    );
+    let meta = Arc::new(Node::spawn().await?);
     let peer_id = relay.peer_id();
-    let mut detail = "relay + Kademlia bootstrap".to_string();
 
-    if let Some(link) = &upstream {
-        let request = link.clone().into_request();
-        let meta_node = Node::spawn().await?;
-        let mut upstream_ids = Vec::new();
-        for addr in &link.sources {
-            relay.add_upstream(addr.clone()).await?;
-            upstream_ids.push(meta_node.connect(addr.clone()).await?);
-        }
-        if let Some(cred) = &request.credential {
-            meta_node.authenticate_all(&upstream_ids, cred).await?;
-        }
-        let mut meta = None;
-        for &peer in &upstream_ids {
-            if let Ok(m) = meta_node.fetch_share_meta(peer).await {
-                meta = Some(m);
-                break;
+    let mut rows = Vec::new();
+    let mut tokens = Vec::new();
+    for link in &shares {
+        match relay_add_share(&relay, &meta, link).await {
+            Ok(m) => {
+                rows.push(row_from_meta(&m, None, None));
+                tokens.push(link.clone().encode());
+            }
+            Err(e) => {
+                tracing::warn!(name = %link.name, error = %format!("{e:#}"), "relay could not cache share");
+                rows.push(err_row(&link.name, &link.manifest_id.to_hex(), format!("{e:#}")));
             }
         }
-        let (manifest, chunk_lists) =
-            meta.ok_or_else(|| anyhow::anyhow!("no upstream returned the share metadata"))?;
-        let file_count = manifest.files.len();
-        relay.cache_share(manifest, chunk_lists.into_values(), upstream_ids).await?;
-        meta_node.shutdown().await;
-        if let Some(invite) = &link.invite {
-            relay.restrict_to_invite_holders(invite.share).await?;
-        }
-        detail = format!(
-            "caching “{}” ({} files) from {} upstream(s)",
-            link.name,
-            file_count,
-            link.sources.len()
-        );
     }
 
-    let listen_addrs = match relay.listen_addr().await {
-        Ok(a) => vec![a],
-        Err(_) => Vec::new(),
-    };
+    let listen_addrs = relay.listen_addr().await.ok().into_iter().collect();
     let cache = relay.cache_stats().await.ok();
     let state = AcceleratorState {
         role: AcceleratorRole::Relay,
         peer_id,
         listen_addrs,
-        detail,
+        detail: accel_detail(AcceleratorRole::Relay, &rows),
         cache,
         replica_chunks: None,
+        shares: rows.clone(),
     };
     let handle = AccelHandle {
         role: AcceleratorRole::Relay,
-        relay: Some(Arc::new(relay)),
-        node: None,
+        relay: Some(relay),
+        meta: Some(meta),
+        nas_dir: None,
+        nas_nodes: Vec::new(),
+        rows,
+        tokens,
     };
     Ok((handle, state))
 }
 
 async fn start_nas_accel(
     dir: PathBuf,
-    source: ShareLink,
-    materialize: Option<PathBuf>,
+    shares: Vec<ShareLink>,
+    operator_seed: [u8; 32],
 ) -> anyhow::Result<(AccelHandle, AcceleratorState)> {
-    let open_dir = dir.clone();
-    let mut disk =
-        tokio::task::spawn_blocking(move || DiskChunkStore::open(&open_dir)).await??;
+    anyhow::ensure!(!shares.is_empty(), "a NAS accelerator needs at least one share");
+    tokio::fs::create_dir_all(&dir).await.ok();
 
-    let node = Node::spawn().await?;
-    let request = source.clone().into_request();
-    let mut peers = Vec::new();
-    for addr in &source.sources {
-        peers.push(node.connect(addr.clone()).await?);
+    let mut rows = Vec::new();
+    let mut tokens = Vec::new();
+    let mut nas_nodes: Vec<(Hash, Node)> = Vec::new();
+    for link in &shares {
+        let seed = derive_share_seed(&operator_seed, link.manifest_id);
+        match nas_add_share(&dir, net::keypair_from_seed(seed), link).await {
+            Ok((node, m, chunks)) => {
+                let addr = node.listen_addr().await.ok().map(|a| a.to_string());
+                nas_nodes.push((m.manifest_id, node));
+                rows.push(row_from_meta(&m, Some(chunks as u64), addr));
+                tokens.push(link.clone().encode());
+            }
+            Err(e) => {
+                tracing::warn!(name = %link.name, error = %format!("{e:#}"), "nas could not replicate share");
+                rows.push(err_row(&link.name, &link.manifest_id.to_hex(), format!("{e:#}")));
+            }
+        }
     }
-    if let Some(cred) = &request.credential {
-        node.authenticate_all(&peers, cred).await?;
-    }
 
-    let pulled = node.download_share_multi(&peers, &mut disk).await?;
-    let manifest = pulled.share.manifest.clone();
-    let chunk_lists = pulled.share.chunk_lists.clone();
-    let chunks = disk.len();
-
-    let disk = if let Some(out) = materialize {
-        let m = manifest.clone();
-        let l = chunk_lists.clone();
-        tokio::task::spawn_blocking(move || {
-            write_share(&out, &m, &l, &disk)?;
-            anyhow::Ok(disk)
-        })
-        .await??
-    } else {
-        disk
+    let peer_id = nas_nodes
+        .first()
+        .map(|(_, n)| n.peer_id())
+        .ok_or_else(|| anyhow::anyhow!("no share could be replicated"))?;
+    let listen_addrs = match nas_nodes.first() {
+        Some((_, n)) => n.listen_addr().await.ok().into_iter().collect(),
+        None => Vec::new(),
     };
-
-    node.serve(Catalog::new(manifest.clone(), chunk_lists, disk)).await?;
-    if let Some(invite) = &source.invite {
-        node.restrict_to_invite_holders(invite.share).await?;
-    }
-
-    let listen_addrs = match node.listen_addr().await {
-        Ok(a) => vec![a],
-        Err(_) => Vec::new(),
-    };
+    let replica_chunks = rows.iter().filter_map(|r| r.replica_chunks).sum::<u64>() as usize;
     let state = AcceleratorState {
         role: AcceleratorRole::Nas,
-        peer_id: node.peer_id(),
+        peer_id,
         listen_addrs,
-        detail: format!("replica of “{}”: {} chunks on disk", source.name, chunks),
+        detail: accel_detail(AcceleratorRole::Nas, &rows),
         cache: None,
-        replica_chunks: Some(chunks),
+        replica_chunks: Some(replica_chunks),
+        shares: rows.clone(),
     };
     let handle = AccelHandle {
         role: AcceleratorRole::Nas,
         relay: None,
-        node: Some(node),
+        meta: None,
+        nas_dir: Some(dir),
+        nas_nodes,
+        rows,
+        tokens,
     };
     Ok((handle, state))
 }

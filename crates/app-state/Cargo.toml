@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 gaggle-core = { path = "../core" }
 net = { path = "../net" }
+control-plane = { path = "../control-plane" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

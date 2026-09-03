@@ -51,11 +51,20 @@ pub struct SwarmConfig {
     /// narrowed to them — so a request for a file the capability excludes is
     /// never made.
     pub allowed_paths: Option<Vec<String>>,
+    /// Which share to ask each source for. `Some(manifest_id)` is required when a
+    /// source serves several shares at once (a multi-share relay accelerator);
+    /// `None` asks for "the one share you serve".
+    pub manifest_id: Option<Hash>,
 }
 
 impl Default for SwarmConfig {
     fn default() -> Self {
-        Self { per_peer_parallelism: 4, prefer: Vec::new(), allowed_paths: None }
+        Self {
+            per_peer_parallelism: 4,
+            prefer: Vec::new(),
+            allowed_paths: None,
+            manifest_id: None,
+        }
     }
 }
 
@@ -137,11 +146,18 @@ where
     let prefer: HashSet<PeerId> = config.prefer.iter().copied().collect();
 
     // 1. Manifest and chunk lists, from whichever source answers.
-    let mut manifest = match from_any(sources, &request, Request::GetManifest).await? {
+    let mut manifest = match from_any(sources, &request, Request::GetManifest(config.manifest_id))
+        .await?
+    {
         Response::Manifest(m) => m,
         other => anyhow::bail!("asked for the manifest, got {}", other.kind()),
     };
     manifest.validate().context("a source sent an invalid manifest")?;
+    if let Some(want) = config.manifest_id
+        && manifest.id() != want
+    {
+        anyhow::bail!("a source returned a different manifest than the one requested");
+    }
 
     // A scoped invite: narrow the manifest to the files it grants, so we never
     // ask a source for a file it will refuse.

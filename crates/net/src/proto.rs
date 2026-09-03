@@ -19,8 +19,10 @@ pub enum Request {
     /// been answered with [`Response::Welcome`]. Harmless on a public share.
     Hello(SignedCapability),
     /// The share's manifest — the small document everything else is checked
-    /// against.
-    GetManifest,
+    /// against. `None` asks for "the one share you serve" (a peer or a
+    /// single-share relay); `Some(manifest_id)` selects one share on a relay
+    /// that caches several.
+    GetManifest(Option<Hash>),
     /// The ordered chunk list for the file whose Merkle root is this hash.
     GetChunkList(Hash),
     /// The bytes of one content-addressed chunk.

@@ -9,17 +9,17 @@
 //!
 //! Nothing here depends on `gpui`; the `gui` crate is a thin renderer on top.
 
-mod link;
 mod manager;
 mod settings;
 mod state;
 
 pub use gaggle_core::{Hash, Invite};
-pub use link::ShareLink;
 pub use manager::{App, AppEvent, AcceleratorRequest, SubscribeRequest};
+pub use net::ShareLink;
 pub use net::{CacheStats, Multiaddr, PeerId, Scope};
-pub use settings::{Settings, Theme};
+pub use settings::{RemoteAccelerator, Settings, Theme};
 pub use state::{
-    AcceleratorRole, AcceleratorState, AppState, BenchmarkResult, MintedInvite, SourceStats,
-    SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
+    AcceleratorRole, AcceleratorState, AccelShareRow, AppState, BenchmarkResult, MintedInvite,
+    RemoteAccelState, SourceStats, SwarmStatus, TransferId, TransferKind, TransferRow,
+    TransferStatus,
 };

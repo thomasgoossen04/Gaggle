@@ -1,67 +1,86 @@
-//! Headless accelerator daemon. Runs as either a bandwidth-heavy relay node
-//! with a hot-chunk cache or a storage-heavy cache/NAS replica
-//! node.
+//! Headless accelerator daemon.
+//!
+//! It keeps a **persistent Ed25519 identity** (printed on every start) and a
+//! `config.toml` under its home directory, accelerates a *list* of shares, and
+//! exposes a signed-request **admin API** so an operator can add / remove
+//! shares and read status remotely.
 //!
 //! ```text
-//! # relay + Kademlia bootstrap, caching a share pulled from an origin
-//! accelerator --role relay --upstream /ip4/1.2.3.4/udp/4001/quic-v1/p2p/<id> --cache-mib 512
-//!
-//! # durable full replica of a share, kept on disk and re-served
-//! accelerator --role nas --dir ./replica --source /ip4/1.2.3.4/udp/4001/quic-v1/p2p/<id>
+//! accelerator run --role relay                 # start the daemon
+//! accelerator identity                          # print the public key, exit
+//! accelerator authorize <operator-key-hex>      # let an operator manage it
+//! accelerator share add gaggleshare1…           # offline: queue a share
 //! ```
+
+mod config;
+mod run;
+mod supervisor;
 
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, ValueEnum};
-use gaggle_core::ChunkStore;
-use net::{Catalog, DiskChunkStore, Invite, Multiaddr, Node, RelayConfig, RelayNode, SharePublicKey};
+use clap::{Parser, Subcommand};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Role {
-    /// High-bandwidth hot-chunk cache + NAT relay / rendezvous point.
-    Relay,
-    /// Durable full replica of a designated folder, LAN-priority serving.
-    Nas,
-}
+use crate::config::{AcceleratorConfig, Home, Role};
+use crate::run::Overrides;
 
 #[derive(Debug, Parser)]
 #[command(name = "accelerator", about = "P2P folder-share accelerator daemon")]
 struct Cli {
-    /// Which accelerator role this node runs as.
+    /// State directory (identity + config.toml). Defaults to
+    /// $GAGGLE_ACCEL_HOME or ~/.local/share/gaggle/accelerator.
+    #[arg(long, global = true)]
+    home: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run the daemon (default).
+    Run(RunArgs),
+    /// Print the daemon's peer id + public key and exit.
+    Identity,
+    /// Authorise an operator key (hex) to use the admin API.
+    Authorize {
+        /// The operator's public key, 64 hex chars.
+        key: String,
+    },
+    /// Offline edits to the share list (a running daemon uses the admin API).
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShareCmd {
+    /// Add a `gaggleshare1…` token to the boot list.
+    Add { token: String },
+    /// Remove a share by its manifest id.
+    Rm { manifest_id: String },
+    /// List configured share tokens.
+    Ls,
+}
+
+#[derive(Debug, Default, clap::Args)]
+struct RunArgs {
+    /// Role to run as on first start (persisted to config.toml).
     #[arg(long, value_enum)]
-    role: Role,
-
-    /// relay: seed(s) to pull cache misses (and the share's metadata) from.
-    /// Repeatable. Without any, the relay just relays + bootstraps.
-    #[arg(long = "upstream", value_name = "MULTIADDR")]
-    upstreams: Vec<String>,
-
-    /// relay: hot-chunk cache budget, in MiB.
-    #[arg(long, default_value_t = 256)]
-    cache_mib: u64,
-
-    /// nas: directory holding the durable chunk store.
+    role: Option<Role>,
+    /// Relay hot-chunk cache budget, MiB.
     #[arg(long)]
-    dir: Option<PathBuf>,
-
-    /// nas: peer(s) to replicate the share from. Repeatable, at least one.
-    #[arg(long = "source", value_name = "MULTIADDR")]
-    sources: Vec<String>,
-
-    /// nas: also materialize the real folder tree here once replicated.
+    cache_mib: Option<u64>,
+    /// NAS replica root directory.
+    #[arg(long = "dir")]
+    replica_dir: Option<String>,
+    /// host:port for the admin API.
     #[arg(long)]
-    materialize: Option<PathBuf>,
-
-    /// nas: an invite token (`gaggle1…`) for a private share — presented to
-    /// every `--source`, and then required of anyone pulling from this replica.
+    admin_listen: Option<String>,
+    /// Multiaddr to listen on, e.g. /ip4/0.0.0.0/udp/4001/quic-v1.
     #[arg(long)]
-    invite: Option<String>,
-
-    /// relay: hex of the share's public key — makes the relay serve only
-    /// connections that present a valid invite for that share.
-    #[arg(long, value_name = "HEX")]
-    restrict: Option<String>,
+    listen: Option<String>,
 }
 
 #[tokio::main]
@@ -74,127 +93,86 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    tracing::info!(?cli.role, "accelerator starting");
-    tracing::info!("{}", net::describe());
-    tracing::info!("{}", control_plane::describe());
+    let home = Home::resolve(cli.home);
 
-    match cli.role {
-        Role::Relay => run_relay(cli).await,
-        Role::Nas => run_nas(cli).await,
-    }
-}
-
-async fn run_relay(cli: Cli) -> anyhow::Result<()> {
-    let relay = RelayNode::spawn_with(RelayConfig {
-        cache_capacity_bytes: cli.cache_mib * 1024 * 1024,
-    })
-    .await?;
-    tracing::info!(peer_id = %relay.peer_id(), "relay node up");
-    for addr in relay.listen_addrs().await? {
-        tracing::info!(%addr, "listening");
-    }
-
-    if cli.upstreams.is_empty() {
-        tracing::info!("no --upstream given; running as a plain relay + bootstrap node");
-    } else {
-        // Learn the share's metadata from an upstream, then register it for
-        // caching with every upstream as a fill source.
-        let meta_node = Node::spawn().await?;
-        let mut upstream_ids = Vec::new();
-        for addr in &cli.upstreams {
-            let addr: Multiaddr = addr.parse().with_context(|| format!("bad --upstream {addr}"))?;
-            relay.add_upstream(addr.clone()).await?;
-            upstream_ids.push(meta_node.connect(addr).await?);
+    match cli.command.unwrap_or(Command::Run(RunArgs::default())) {
+        Command::Run(args) => {
+            tracing::info!("{}", net::describe());
+            tracing::info!("{}", control_plane::describe());
+            run::run(
+                home,
+                Overrides {
+                    role: args.role,
+                    cache_mib: args.cache_mib,
+                    replica_dir: args.replica_dir,
+                    admin_listen: args.admin_listen,
+                    listen: args.listen,
+                },
+            )
+            .await
         }
-
-        let mut meta = None;
-        for &peer in &upstream_ids {
-            match meta_node.fetch_share_meta(peer).await {
-                Ok(m) => {
-                    meta = Some(m);
-                    break;
-                }
-                Err(e) => tracing::warn!(%peer, error = %e, "could not get share metadata"),
+        Command::Identity => {
+            let identity = net::load_or_create_identity(&home.identity_path())?;
+            let seed = net::identity_seed(&identity)?;
+            let agent = gaggle_core::AgentKeypair::from_seed(seed).public();
+            println!("peer id:    {}", identity.public().to_peer_id());
+            println!("public key: {}", agent.to_hex());
+            println!("home:       {}", home.dir().display());
+            Ok(())
+        }
+        Command::Authorize { key } => {
+            let id = gaggle_core::AgentId::from_hex(key.trim())
+                .context("that is not a 64-hex-char operator key")?;
+            let path = home.config_path();
+            let mut config = AcceleratorConfig::load(&path)?;
+            let hex = id.to_hex();
+            if config.authorized_keys.iter().any(|k| k.trim() == hex) {
+                println!("{hex} is already authorised");
+            } else {
+                config.authorized_keys.push(hex.clone());
+                config.save(&path)?;
+                println!("authorised {hex}");
+                println!("restart the daemon for it to take effect");
             }
+            Ok(())
         }
-        let (manifest, chunk_lists) =
-            meta.context("no upstream returned the share metadata")?;
-        tracing::info!(
-            share = %manifest.id(),
-            files = manifest.files.len(),
-            "caching share from {} upstream(s)",
-            upstream_ids.len()
-        );
-        relay
-            .cache_share(manifest, chunk_lists.into_values(), upstream_ids)
-            .await?;
-        meta_node.shutdown().await;
-
-        if let Some(hex) = &cli.restrict {
-            let share = SharePublicKey::from_hex(hex.trim())
-                .with_context(|| format!("bad --restrict key {hex}"))?;
-            relay.restrict_to_invite_holders(share).await?;
-            tracing::info!(%share, "relay restricted to invite holders");
+        Command::Share { cmd } => {
+            let path = home.config_path();
+            let mut config = AcceleratorConfig::load(&path)?;
+            match cmd {
+                ShareCmd::Ls => {
+                    for token in &config.shares {
+                        println!("{token}");
+                    }
+                }
+                ShareCmd::Add { token } => {
+                    let link = net::ShareLink::parse(token.trim())
+                        .context("that is not a valid gaggleshare1… link")?;
+                    if config.shares.iter().any(|t| t.trim() == token.trim()) {
+                        println!("already listed");
+                    } else {
+                        config.shares.push(token.trim().to_string());
+                        config.save(&path)?;
+                        println!("added “{}” ({})", link.name, link.manifest_id);
+                    }
+                }
+                ShareCmd::Rm { manifest_id } => {
+                    let want = manifest_id.trim();
+                    let before = config.shares.len();
+                    config.shares.retain(|t| {
+                        net::ShareLink::parse(t)
+                            .map(|l| l.manifest_id.to_hex() != want)
+                            .unwrap_or(true)
+                    });
+                    if config.shares.len() == before {
+                        println!("no configured share with manifest id {want}");
+                    } else {
+                        config.save(&path)?;
+                        println!("removed {want}");
+                    }
+                }
+            }
+            Ok(())
         }
     }
-
-    tracing::info!("ready — bootstrap peers against the address above; Ctrl-C to stop");
-    relay.run_until_ctrl_c().await
-}
-
-async fn run_nas(cli: Cli) -> anyhow::Result<()> {
-    let dir = cli.dir.context("--dir is required for the nas role")?;
-    anyhow::ensure!(!cli.sources.is_empty(), "the nas role needs at least one --source");
-
-    let mut disk = DiskChunkStore::open(&dir).with_context(|| format!("opening {}", dir.display()))?;
-    tracing::info!(dir = %dir.display(), have_chunks = disk.len(), "opened durable chunk store");
-
-    let invite = cli
-        .invite
-        .as_deref()
-        .map(|t| Invite::parse(t.trim()).context("parsing --invite"))
-        .transpose()?;
-
-    let node = Node::spawn().await?;
-    let mut sources = Vec::new();
-    for addr in &cli.sources {
-        let addr: Multiaddr = addr.parse().with_context(|| format!("bad --source {addr}"))?;
-        sources.push(node.connect(addr).await?);
-    }
-
-    if let Some(invite) = &invite {
-        node.authenticate_all(&sources, &invite.credential).await?;
-        tracing::info!(share = %invite.share, "presented invite to every source");
-    }
-
-    tracing::info!("replicating share from {} source(s)…", sources.len());
-    let pulled = node.download_share_multi(&sources, &mut disk).await?;
-    let manifest = pulled.share.manifest.clone();
-    let chunk_lists = pulled.share.chunk_lists.clone();
-    tracing::info!(
-        share = %manifest.id(),
-        files = manifest.files.len(),
-        chunks = disk.len(),
-        bytes = manifest.total_size(),
-        "replica complete"
-    );
-
-    if let Some(out) = &cli.materialize {
-        gaggle_core::write_share(out, &manifest, &chunk_lists, &disk)
-            .with_context(|| format!("materializing into {}", out.display()))?;
-        tracing::info!(path = %out.display(), "materialized the folder tree");
-    }
-
-    node.serve(Catalog::new(manifest, chunk_lists, disk)).await?;
-    if let Some(invite) = &invite {
-        node.restrict_to_invite_holders(invite.share).await?;
-        tracing::info!("replica is invite-only");
-    }
-    tracing::info!(peer_id = %node.peer_id(), "serving the replica — Ctrl-C to stop");
-    for addr in node.listen_addrs().await? {
-        tracing::info!(%addr, "listening");
-    }
-    tokio::signal::ctrl_c().await?;
-    node.shutdown().await;
-    Ok(())
 }

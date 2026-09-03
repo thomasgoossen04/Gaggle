@@ -107,7 +107,11 @@ impl Catalog {
     pub(crate) fn answer(&self, request: &Request) -> Response {
         match request {
             Request::Hello(_) => Response::Welcome,
-            Request::GetManifest => Response::Manifest(self.manifest.clone()),
+            Request::GetManifest(None) => Response::Manifest(self.manifest.clone()),
+            Request::GetManifest(Some(id)) if *id == self.manifest_id() => {
+                Response::Manifest(self.manifest.clone())
+            }
+            Request::GetManifest(Some(_)) => Response::NotFound,
             Request::GetChunkList(root) => self
                 .lists_by_root
                 .get(root)

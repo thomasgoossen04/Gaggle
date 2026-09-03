@@ -1,0 +1,441 @@
+//! Admin control API for a remote accelerator daemon.
+//!
+//! A daemon ([`crate::admin::router`]) exposes its status and lets an authorised
+//! operator add / remove which shares it accelerates. Every request is signed by
+//! the operator's Ed25519 key ([`gaggle_core::AgentKeypair`]) and checked
+//! against the daemon's `authorized` set; every response is signed by the
+//! daemon's own key so a client can pin it on first contact (TOFU).
+//!
+//! The router is deliberately transport-only: it forwards mutations to the
+//! daemon over an [`mpsc`] channel and reads status from a [`watch`] channel, so
+//! `control-plane` never has to depend on `net`.
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get};
+use base64::Engine;
+use gaggle_core::{AgentId, AgentKeypair, Hash, Signature};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// Header names for the signed-request scheme.
+pub const H_AGENT: &str = "x-gaggle-agent";
+pub const H_TIMESTAMP: &str = "x-gaggle-timestamp";
+pub const H_NONCE: &str = "x-gaggle-nonce";
+pub const H_SIGNATURE: &str = "x-gaggle-signature";
+pub const H_DAEMON: &str = "x-gaggle-daemon";
+pub const H_DAEMON_SIGNATURE: &str = "x-gaggle-daemon-signature";
+
+/// Requests older than this (clock skew) are rejected.
+const MAX_SKEW_SECS: i64 = 60;
+const MAX_BODY: usize = 64 * 1024;
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn unb64(s: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.as_bytes()).ok()
+}
+
+/// Accept a bare `host:port` (or `//host:port`) and turn it into an absolute
+/// `http://…` origin with no trailing slash, so a pasted `127.0.0.1:8749` works.
+pub fn normalize_base(input: &str) -> String {
+    let s = input.trim().trim_end_matches('/');
+    if s.starts_with("http://") || s.starts_with("https://") {
+        s.to_string()
+    } else {
+        format!("http://{}", s.trim_start_matches("//"))
+    }
+}
+
+/// The bytes an operator signs / a daemon verifies for one request.
+fn canonical(method: &str, path: &str, ts: &str, nonce: &str, body: &[u8]) -> Vec<u8> {
+    let body_hash = Hash::of(body).to_hex();
+    format!("gaggle-admin\n{method}\n{path}\n{ts}\n{nonce}\n{body_hash}").into_bytes()
+}
+
+// --- status payloads -------------------------------------------------------
+
+/// A snapshot of what a daemon is doing, returned by `GET /admin/status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    /// The daemon's Ed25519 identity, hex. Clients pin this.
+    pub agent_id: String,
+    /// The daemon's libp2p peer id.
+    pub peer_id: String,
+    /// `"relay"` or `"nas"`.
+    pub role: String,
+    /// Dialable listen addresses of the daemon's main node.
+    pub listen_addrs: Vec<String>,
+    pub shares: Vec<ShareStatus>,
+}
+
+/// One share a daemon accelerates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareStatus {
+    pub manifest_id: String,
+    pub name: String,
+    pub files: usize,
+    pub total_bytes: u64,
+    pub version: u64,
+    pub private: bool,
+    /// Relay role: chunks of this share currently in the hot cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_chunks: Option<u64>,
+    /// NAS role: chunks of this share on the durable replica.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_chunks: Option<u64>,
+    /// NAS role: this share's own serving address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+    /// Populated if the share failed to start / replicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// --- backend channel -----------------------------------------------------
+
+/// A mutation the router hands to the daemon's supervisor.
+pub enum AdminCommand {
+    AddShare { token: String, ack: oneshot::Sender<Result<(), String>> },
+    RemoveShare { manifest_id: String, ack: oneshot::Sender<Result<(), String>> },
+}
+
+/// Everything the [`router`] needs. Cheap to clone.
+#[derive(Clone)]
+pub struct AdminState {
+    authorized: Arc<Vec<AgentId>>,
+    daemon: Arc<AgentKeypair>,
+    commands: mpsc::Sender<AdminCommand>,
+    status: watch::Receiver<DaemonStatus>,
+}
+
+impl AdminState {
+    pub fn new(
+        authorized: Vec<AgentId>,
+        daemon: AgentKeypair,
+        commands: mpsc::Sender<AdminCommand>,
+        status: watch::Receiver<DaemonStatus>,
+    ) -> Self {
+        Self {
+            authorized: Arc::new(authorized),
+            daemon: Arc::new(daemon),
+            commands,
+            status,
+        }
+    }
+}
+
+/// `GET /admin/status`, `GET /admin/shares`, `POST /admin/shares`,
+/// `DELETE /admin/shares/{manifest_id}` — all behind operator-signature auth,
+/// all responses daemon-signed.
+pub fn router(state: AdminState) -> Router {
+    Router::new()
+        .route("/admin/status", get(status_handler))
+        .route("/admin/shares", get(shares_handler).post(add_share_handler))
+        .route("/admin/shares/{manifest_id}", delete(remove_share_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_and_sign))
+        .with_state(state)
+}
+
+/// Serve the admin [`router`] on `listener` until the process ends. A thin
+/// wrapper so daemons need not depend on `axum` directly.
+pub async fn serve(listener: tokio::net::TcpListener, state: AdminState) -> anyhow::Result<()> {
+    axum::serve(listener, router(state)).await?;
+    Ok(())
+}
+
+async fn status_handler(State(state): State<AdminState>) -> Response {
+    let status = state.status.borrow().clone();
+    axum::Json(status).into_response()
+}
+
+async fn shares_handler(State(state): State<AdminState>) -> Response {
+    let shares = state.status.borrow().shares.clone();
+    axum::Json(shares).into_response()
+}
+
+#[derive(Deserialize)]
+struct AddShareBody {
+    /// A `gaggleshare1…` link token.
+    link: String,
+}
+
+async fn add_share_handler(
+    State(state): State<AdminState>,
+    body: Result<axum::Json<AddShareBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(axum::Json(body)) = body else {
+        return (StatusCode::BAD_REQUEST, "expected { \"link\": \"gaggleshare1…\" }").into_response();
+    };
+    let (ack, rx) = oneshot::channel();
+    if state
+        .commands
+        .send(AdminCommand::AddShare { token: body.link, ack })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down").into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "daemon dropped the request").into_response(),
+    }
+}
+
+async fn remove_share_handler(
+    State(state): State<AdminState>,
+    Path(manifest_id): Path<String>,
+) -> Response {
+    let (ack, rx) = oneshot::channel();
+    if state
+        .commands
+        .send(AdminCommand::RemoveShare { manifest_id, ack })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down").into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, e).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "daemon dropped the request").into_response(),
+    }
+}
+
+/// Verify the operator signature on the way in; sign the response on the way out.
+async fn auth_and_sign(State(state): State<AdminState>, req: Request, next: Next) -> Response {
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "request body too large").into_response(),
+    };
+
+    if let Err((code, msg)) = verify_request(
+        &state,
+        parts.method.as_str(),
+        parts.uri.path(),
+        &parts.headers,
+        &bytes,
+    ) {
+        return sign_response(&state.daemon, (code, msg).into_response()).await;
+    }
+
+    let req = Request::from_parts(parts, axum::body::Body::from(bytes));
+    let resp = next.run(req).await;
+    sign_response(&state.daemon, resp).await
+}
+
+fn verify_request(
+    state: &AdminState,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), (StatusCode, String)> {
+    let unauth = |m: &str| (StatusCode::UNAUTHORIZED, m.to_string());
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    let agent_hex = get(H_AGENT).ok_or_else(|| unauth("missing agent header"))?;
+    let ts = get(H_TIMESTAMP).ok_or_else(|| unauth("missing timestamp header"))?;
+    let nonce = get(H_NONCE).ok_or_else(|| unauth("missing nonce header"))?;
+    let sig_b64 = get(H_SIGNATURE).ok_or_else(|| unauth("missing signature header"))?;
+
+    let agent = AgentId::from_hex(agent_hex).map_err(|_| unauth("malformed agent id"))?;
+    if !state.authorized.contains(&agent) {
+        return Err(unauth("agent is not authorised on this daemon"));
+    }
+
+    let ts_val: i64 = ts.parse().map_err(|_| unauth("malformed timestamp"))?;
+    if (unix_now() as i64 - ts_val).abs() > MAX_SKEW_SECS {
+        return Err(unauth("timestamp is outside the accepted window"));
+    }
+
+    let sig_bytes = unb64(sig_b64).ok_or_else(|| unauth("malformed signature"))?;
+    let sig_arr: [u8; Signature::LEN] =
+        sig_bytes.try_into().map_err(|_| unauth("signature is not 64 bytes"))?;
+    let sig = Signature::from_bytes(sig_arr);
+
+    let msg = canonical(method, path, ts, nonce, body);
+    agent.verify(&msg, &sig).map_err(|_| unauth("signature does not verify"))
+}
+
+/// Buffer `resp`, attach the daemon's identity + a signature over the body hash.
+async fn sign_response(daemon: &AgentKeypair, resp: Response) -> Response {
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => Bytes::new(),
+    };
+    let digest = Hash::of(&bytes).to_hex();
+    let sig = daemon.sign(digest.as_bytes());
+
+    insert(&mut parts.headers, H_DAEMON, &daemon.public().to_hex());
+    insert(&mut parts.headers, H_DAEMON_SIGNATURE, &b64(&sig.to_bytes()));
+
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+fn insert(headers: &mut HeaderMap, name: &str, value: &str) {
+    if let (Ok(n), Ok(v)) = (
+        HeaderName::from_bytes(name.as_bytes()),
+        value.parse::<axum::http::HeaderValue>(),
+    ) {
+        headers.insert(n, v);
+    }
+}
+
+// --- client ------------------------------------------------------------
+
+/// `reqwest` client for a daemon's [`router`]. Signs every request with the
+/// operator key and verifies (and can pin) the daemon's response signature.
+pub struct AdminClient {
+    base: String,
+    http: reqwest::Client,
+    operator: AgentKeypair,
+    /// The daemon identity we expect. `None` until the first successful call,
+    /// after which callers should persist [`AdminClient::pinned`].
+    pinned: Option<AgentId>,
+}
+
+impl AdminClient {
+    pub fn new(base: impl Into<String>, operator: AgentKeypair, pinned: Option<AgentId>) -> Self {
+        Self {
+            base: normalize_base(&base.into()),
+            http: reqwest::Client::new(),
+            operator,
+            pinned,
+        }
+    }
+
+    /// The daemon identity this client has locked onto, if any.
+    pub fn pinned(&self) -> Option<AgentId> {
+        self.pinned
+    }
+
+    /// The normalized base URL this client talks to.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub async fn status(&mut self) -> anyhow::Result<DaemonStatus> {
+        self.send("GET", "/admin/status", None).await
+    }
+
+    pub async fn list_shares(&mut self) -> anyhow::Result<Vec<ShareStatus>> {
+        self.send("GET", "/admin/shares", None).await
+    }
+
+    pub async fn add_share(&mut self, link: &str) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(&serde_json::json!({ "link": link }))?;
+        self.send_unit("POST", "/admin/shares", Some(body)).await
+    }
+
+    pub async fn remove_share(&mut self, manifest_id: &str) -> anyhow::Result<()> {
+        self.send_unit("DELETE", &format!("/admin/shares/{manifest_id}"), None).await
+    }
+
+    async fn send_unit(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        let _: serde::de::IgnoredAny = self.send(method, path, body).await?;
+        Ok(())
+    }
+
+    async fn send<T: serde::de::DeserializeOwned>(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> anyhow::Result<T> {
+        let body = body.unwrap_or_default();
+        let ts = unix_now().to_string();
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).expect("system RNG unavailable");
+        let nonce = b64(&nonce);
+        let sig = self.operator.sign(&canonical(method, path, &ts, &nonce, &body));
+
+        let url = format!("{}{path}", self.base);
+        let req = self
+            .http
+            .request(method.parse()?, &url)
+            .header(H_AGENT, self.operator.public().to_hex())
+            .header(H_TIMESTAMP, &ts)
+            .header(H_NONCE, &nonce)
+            .header(H_SIGNATURE, b64(&sig.to_bytes()))
+            .header("content-type", "application/json")
+            .body(body);
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        let daemon_hdr = resp
+            .headers()
+            .get(H_DAEMON)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let daemon_sig = resp
+            .headers()
+            .get(H_DAEMON_SIGNATURE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = resp.bytes().await?;
+
+        self.verify_daemon(daemon_hdr.as_deref(), daemon_sig.as_deref(), &bytes)?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "daemon returned {status}: {}",
+                String::from_utf8_lossy(&bytes).trim()
+            );
+        }
+        if bytes.is_empty() {
+            // e.g. 202 Accepted with no body — only valid for `()`-shaped calls.
+            return Ok(serde_json::from_slice(b"null")?);
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn verify_daemon(
+        &mut self,
+        agent_hex: Option<&str>,
+        sig_b64: Option<&str>,
+        body: &[u8],
+    ) -> anyhow::Result<()> {
+        let agent_hex = agent_hex.ok_or_else(|| anyhow::anyhow!("daemon did not identify itself"))?;
+        let sig_b64 = sig_b64.ok_or_else(|| anyhow::anyhow!("daemon did not sign its response"))?;
+        let agent = AgentId::from_hex(agent_hex)?;
+        let sig_bytes = unb64(sig_b64).ok_or_else(|| anyhow::anyhow!("malformed daemon signature"))?;
+        let sig_arr: [u8; Signature::LEN] = sig_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("daemon signature is not 64 bytes"))?;
+        let digest = Hash::of(body).to_hex();
+        agent
+            .verify(digest.as_bytes(), &Signature::from_bytes(sig_arr))
+            .map_err(|_| anyhow::anyhow!("daemon response signature does not verify"))?;
+
+        match self.pinned {
+            Some(expected) if expected != agent => {
+                anyhow::bail!("daemon identity changed — expected {expected}, got {agent}")
+            }
+            Some(_) => {}
+            None => self.pinned = Some(agent),
+        }
+        Ok(())
+    }
+}

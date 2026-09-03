@@ -1,0 +1,153 @@
+//! On-disk state for the accelerator daemon: a persistent identity key plus a
+//! `config.toml` holding the role, the operators allowed to manage it, and the
+//! list of shares to accelerate on boot.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
+
+/// Which accelerator role the daemon runs as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// High-bandwidth hot-chunk cache + NAT relay / rendezvous point.
+    #[default]
+    Relay,
+    /// Durable on-disk replica; one serving node per share.
+    Nas,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Relay => "relay",
+            Role::Nas => "nas",
+        }
+    }
+}
+
+/// Where the daemon keeps its identity and config.
+#[derive(Debug, Clone)]
+pub struct Home(PathBuf);
+
+impl Home {
+    /// `--home` if given, else `$GAGGLE_ACCEL_HOME`, else
+    /// `$HOME/.local/share/gaggle/accelerator`, else a temp dir.
+    pub fn resolve(explicit: Option<PathBuf>) -> Self {
+        if let Some(dir) = explicit {
+            return Self(dir);
+        }
+        if let Some(dir) = std::env::var_os("GAGGLE_ACCEL_HOME") {
+            return Self(PathBuf::from(dir));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return Self(PathBuf::from(home).join(".local/share/gaggle/accelerator"));
+        }
+        Self(std::env::temp_dir().join("gaggle-accelerator"))
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn identity_path(&self) -> PathBuf {
+        self.0.join("identity.key")
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.0.join("config.toml")
+    }
+
+    /// Default replica root when the config does not set one.
+    pub fn default_replica_dir(&self) -> PathBuf {
+        self.0.join("replica")
+    }
+}
+
+/// The daemon's `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AcceleratorConfig {
+    pub role: Role,
+    /// Multiaddr to listen on. Empty = ephemeral loopback (dev). Use
+    /// `/ip4/0.0.0.0/udp/4001/quic-v1` for a reachable daemon.
+    pub listen: String,
+    /// `host:port` for the admin HTTP API.
+    pub admin_listen: String,
+    /// Relay role: hot-chunk cache budget in MiB.
+    pub cache_mib: u64,
+    /// NAS role: replica root. Relative paths resolve under the home dir.
+    pub replica_dir: Option<String>,
+    /// Hex `AgentId`s permitted to call the admin API.
+    pub authorized_keys: Vec<String>,
+    /// `gaggleshare1…` tokens to accelerate on boot and keep in sync.
+    pub shares: Vec<String>,
+}
+
+impl Default for AcceleratorConfig {
+    fn default() -> Self {
+        Self {
+            role: Role::Relay,
+            listen: String::new(),
+            admin_listen: "127.0.0.1:8749".to_string(),
+            cache_mib: 256,
+            replica_dir: None,
+            authorized_keys: Vec::new(),
+            shares: Vec::new(),
+        }
+    }
+}
+
+impl AcceleratorConfig {
+    /// Load from `path`; a missing file yields [`AcceleratorConfig::default`].
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Write to `path` (pretty TOML), creating parent directories.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(self)?;
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// The listen multiaddr, if one is configured.
+    pub fn listen_addr(&self) -> anyhow::Result<Option<net::Multiaddr>> {
+        let s = self.listen.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(s.parse().with_context(|| format!("bad listen address {s:?}"))?))
+    }
+
+    pub fn resolved_replica_dir(&self, home: &Home) -> PathBuf {
+        match &self.replica_dir {
+            Some(d) => {
+                let p = PathBuf::from(d);
+                if p.is_absolute() { p } else { home.dir().join(p) }
+            }
+            None => home.default_replica_dir(),
+        }
+    }
+
+    pub fn authorized_ids(&self) -> anyhow::Result<Vec<gaggle_core::AgentId>> {
+        self.authorized_keys
+            .iter()
+            .map(|k| {
+                gaggle_core::AgentId::from_hex(k.trim())
+                    .with_context(|| format!("bad authorized key {k:?}"))
+            })
+            .collect()
+    }
+}

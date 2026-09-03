@@ -123,6 +123,13 @@ pub struct Gaggle {
     pub(crate) accel_cache: Entity<InputState>,
     pub(crate) accel_link: Entity<InputState>,
     pub(crate) accel_dir: Entity<InputState>,
+    /// Paste field: add a share to the *running* local accelerator.
+    pub(crate) accel_add: Entity<InputState>,
+    // Remote accelerator form.
+    pub(crate) remote_label: Entity<InputState>,
+    pub(crate) remote_url: Entity<InputState>,
+    /// Paste field: add a share to a remote accelerator (row buttons read it).
+    pub(crate) remote_add: Entity<InputState>,
 }
 
 impl Gaggle {
@@ -156,6 +163,10 @@ impl Gaggle {
         let accel_cache = num(cx, window, "256".into(), integer);
         let accel_link = text(cx, window, String::new());
         let accel_dir = text(cx, window, String::new());
+        let accel_add = text(cx, window, String::new());
+        let remote_label = text(cx, window, String::new());
+        let remote_url = text(cx, window, String::new());
+        let remote_add = text(cx, window, String::new());
 
         // Poll the manager and re-render on change.
         cx.spawn(async move |this, cx| {
@@ -196,6 +207,10 @@ impl Gaggle {
             accel_cache,
             accel_link,
             accel_dir,
+            accel_add,
+            remote_label,
+            remote_url,
+            remote_add,
         }
     }
 
@@ -355,7 +370,7 @@ impl Gaggle {
         match text.as_deref().map(str::trim).map(ShareLink::parse) {
             Some(Ok(link)) => {
                 let name = link.name.clone();
-                self.app.subscribe(link.into_request());
+                self.app.subscribe(link.into());
                 self.tab = Tab::Transfers;
                 self.set_notice(format!("Subscribed to “{name}”"), cx);
             }
@@ -454,36 +469,105 @@ impl Gaggle {
         self.set_notice("Benchmarking the download volume…", cx);
     }
 
+    /// Parse the (possibly multi-line) share-link field into links.
+    fn accel_links(&self, cx: &Context<Self>) -> (Vec<ShareLink>, usize) {
+        let raw = self.accel_link.read(cx).value().to_string();
+        let mut links = Vec::new();
+        let mut bad = 0;
+        for line in raw.split(['\n', ' ']).map(str::trim).filter(|l| !l.is_empty()) {
+            match ShareLink::parse(line) {
+                Ok(l) => links.push(l),
+                Err(_) => bad += 1,
+            }
+        }
+        (links, bad)
+    }
+
     pub(crate) fn start_relay(&mut self, cx: &mut Context<Self>) {
         let cache_mib = self.accel_cache.read(cx).value().trim().parse::<u64>().unwrap_or(256);
-        let upstream = ShareLink::parse(self.accel_link.read(cx).value().trim()).ok();
+        let (shares, bad) = self.accel_links(cx);
+        if bad > 0 {
+            self.set_notice(format!("{bad} share link(s) could not be parsed"), cx);
+            return;
+        }
         self.app.start_accelerator(AcceleratorRequest::Relay {
             cache_bytes: cache_mib.max(16) * 1024 * 1024,
-            upstream,
+            shares,
         });
         self.set_notice("Starting relay accelerator…", cx);
     }
 
     pub(crate) fn start_nas(&mut self, cx: &mut Context<Self>) {
         let dir = self.accel_dir.read(cx).value().trim().to_string();
-        let link = ShareLink::parse(self.accel_link.read(cx).value().trim());
-        match (dir.is_empty(), link) {
-            (true, _) => self.set_notice("NAS mode needs a replica directory", cx),
-            (_, Err(e)) => self.set_notice(format!("NAS mode needs a valid share link: {e}"), cx),
-            (false, Ok(source)) => {
-                self.app.start_accelerator(AcceleratorRequest::Nas {
-                    dir: dir.into(),
-                    source,
-                    materialize: None,
-                });
-                self.set_notice("Starting NAS replica…", cx);
-            }
+        let (shares, bad) = self.accel_links(cx);
+        if dir.is_empty() {
+            self.set_notice("NAS mode needs a replica directory", cx);
+        } else if shares.is_empty() || bad > 0 {
+            self.set_notice("NAS mode needs at least one valid share link", cx);
+        } else {
+            self.app.start_accelerator(AcceleratorRequest::Nas { dir: dir.into(), shares });
+            self.set_notice("Starting NAS replica…", cx);
         }
     }
 
     pub(crate) fn stop_accelerator(&mut self, cx: &mut Context<Self>) {
         self.app.stop_accelerator();
         self.set_notice("Accelerator stopped", cx);
+    }
+
+    pub(crate) fn accel_add_share(&mut self, cx: &mut Context<Self>) {
+        let token = self.accel_add.read(cx).value().trim().to_string();
+        if token.is_empty() {
+            return;
+        }
+        self.app.accel_add_share(token);
+        self.set_notice("Adding share to the accelerator…", cx);
+    }
+
+    pub(crate) fn accel_remove_share(&mut self, manifest_id: String, cx: &mut Context<Self>) {
+        self.app.accel_remove_share(manifest_id);
+        cx.notify();
+    }
+
+    pub(crate) fn copy_operator_key(&mut self, cx: &mut Context<Self>) {
+        let key = self.app.operator_public_key();
+        self.copy_text(key, "Operator key copied to clipboard", cx);
+    }
+
+    pub(crate) fn add_remote(&mut self, cx: &mut Context<Self>) {
+        let label = self.remote_label.read(cx).value().trim().to_string();
+        let url = self.remote_url.read(cx).value().trim().to_string();
+        if label.is_empty() || url.is_empty() {
+            self.set_notice("A remote accelerator needs a label and an admin URL", cx);
+            return;
+        }
+        self.app.add_remote_accelerator(label, url);
+        self.set_notice("Registering remote accelerator…", cx);
+    }
+
+    pub(crate) fn remove_remote(&mut self, label: String, cx: &mut Context<Self>) {
+        self.app.remove_remote_accelerator(label);
+        cx.notify();
+    }
+
+    pub(crate) fn remote_add_share(&mut self, label: String, cx: &mut Context<Self>) {
+        let token = self.remote_add.read(cx).value().trim().to_string();
+        if token.is_empty() {
+            self.set_notice("Paste a share link first", cx);
+            return;
+        }
+        self.app.remote_add_share(label, token);
+        self.set_notice("Sending share to the remote accelerator…", cx);
+    }
+
+    pub(crate) fn remote_remove_share(
+        &mut self,
+        label: String,
+        manifest_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.app.remote_remove_share(label, manifest_id);
+        cx.notify();
     }
 
     pub(crate) fn toggle_theme_menu(&mut self, cx: &mut Context<Self>) {

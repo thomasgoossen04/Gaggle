@@ -14,7 +14,7 @@
 //!   if full), and forwards it — so a swarm of peers hammering the relay costs
 //!   the origin only one fetch per hot chunk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gaggle_core::{
@@ -50,17 +50,38 @@ enum Command {
     AddUpstream { peer: PeerId, addr: Multiaddr },
     CacheShare { manifest: Box<Manifest>, chunk_lists: Vec<ChunkList>, upstreams: Vec<PeerId> },
     CacheStats(oneshot::Sender<CacheStats>),
-    Restrict(SharePublicKey),
+    Restrict { share: SharePublicKey, manifest_id: Hash },
+    Unrestrict(SharePublicKey),
+    RemoveShare(Hash),
+    Shares(oneshot::Sender<Vec<Hash>>),
 }
 
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-/// A connection's capability grant on the relay.
+/// A connection's capability grant on the relay — one per private share the
+/// connection has authenticated for.
 struct RelayGrant {
+    share: SharePublicKey,
     scope: Scope,
     expires_at: Option<u64>,
+}
+
+impl RelayGrant {
+    fn live(&self, now: u64) -> bool {
+        self.expires_at.is_none_or(|e| now < e)
+    }
+}
+
+/// One share the relay caches: its metadata, the seeds to fill misses from, and
+/// (for a private share) the key an invite must be signed under.
+struct ShareEntry {
+    manifest: Manifest,
+    lists: Vec<ChunkList>,
+    upstreams: Vec<PeerId>,
+    /// `Some` once [`RelayNode::restrict_to_invite_holders`] gated this share.
+    restrict: Option<SharePublicKey>,
 }
 
 /// Handle to a running relay/bootstrap/cache node. Drop stops it.
@@ -79,9 +100,43 @@ impl RelayNode {
 
     /// Start the relay with an explicit [`RelayConfig`].
     pub async fn spawn_with(config: RelayConfig) -> anyhow::Result<Self> {
-        let mut swarm = build_relay_swarm()?;
+        Self::spawn_inner(config, None, None).await
+    }
+
+    /// [`spawn_with`](Self::spawn_with) plus a persistent libp2p identity, so the
+    /// relay keeps the same [`PeerId`] across restarts.
+    pub async fn spawn_with_identity(
+        config: RelayConfig,
+        keypair: crate::Keypair,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(config, Some(keypair), None).await
+    }
+
+    /// [`spawn_with`](Self::spawn_with) with an optional persistent identity and
+    /// an optional explicit listen [`Multiaddr`] (e.g.
+    /// `/ip4/0.0.0.0/udp/4001/quic-v1` for a public daemon).
+    pub async fn spawn_with_opts(
+        config: RelayConfig,
+        keypair: Option<crate::Keypair>,
+        listen: Option<Multiaddr>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(config, keypair, listen).await
+    }
+
+    async fn spawn_inner(
+        config: RelayConfig,
+        keypair: Option<crate::Keypair>,
+        listen: Option<Multiaddr>,
+    ) -> anyhow::Result<Self> {
+        let mut swarm = match keypair {
+            Some(kp) => crate::build_relay_swarm_with(kp)?,
+            None => build_relay_swarm()?,
+        };
         let peer_id = *swarm.local_peer_id();
-        swarm.listen_on(LISTEN_QUIC.parse()?)?;
+        match listen {
+            Some(addr) => swarm.listen_on(addr)?,
+            None => swarm.listen_on(LISTEN_QUIC.parse()?)?,
+        };
 
         loop {
             match swarm.select_next_some().await {
@@ -135,9 +190,11 @@ impl RelayNode {
         Ok(peer)
     }
 
-    /// Register a share the relay should cache: its manifest and chunk lists (so
-    /// the relay can answer `GetManifest` / `GetChunkList` and knows each
-    /// chunk's expected length), and the `upstreams` to fetch misses from.
+    /// Register (or refresh) a share the relay should cache: its manifest and
+    /// chunk lists (so the relay can answer `GetManifest` / `GetChunkList` and
+    /// knows each chunk's expected length), and the `upstreams` to fetch misses
+    /// from. A relay may cache any number of shares at once; re-calling for a
+    /// share already cached replaces its metadata and merges the upstreams.
     pub async fn cache_share(
         &self,
         manifest: Manifest,
@@ -152,6 +209,19 @@ impl RelayNode {
         .await
     }
 
+    /// Stop caching the share with this manifest id and forget its metadata.
+    /// Chunks of it already in the hot cache age out normally.
+    pub async fn remove_share(&self, manifest_id: Hash) -> anyhow::Result<()> {
+        self.send(Command::RemoveShare(manifest_id)).await
+    }
+
+    /// The manifest ids of every share the relay currently caches.
+    pub async fn shares(&self) -> anyhow::Result<Vec<Hash>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::Shares(tx)).await?;
+        Ok(rx.await?)
+    }
+
     /// Current hot-chunk cache occupancy and hit/miss counts.
     pub async fn cache_stats(&self) -> anyhow::Result<CacheStats> {
         let (tx, rx) = oneshot::channel();
@@ -159,13 +229,27 @@ impl RelayNode {
         Ok(rx.await?)
     }
 
-    /// Make the relay private: it will serve — from cache or via
-    /// an upstream fill — only to a connection that has presented a valid
-    /// [`SignedCapability`](gaggle_core::SignedCapability) for `share` and one
-    /// of the cached manifests, and only within that capability's
-    /// [`Scope`](gaggle_core::Scope). Call after [`cache_share`](Self::cache_share).
-    pub async fn restrict_to_invite_holders(&self, share: SharePublicKey) -> anyhow::Result<()> {
-        self.send(Command::Restrict(share)).await
+    /// Gate the cached share `manifest_id`: the relay will serve its manifest,
+    /// chunk lists and chunks — from cache or via an upstream fill — only to a
+    /// connection that has presented a valid
+    /// [`SignedCapability`](gaggle_core::SignedCapability) for `share` and that
+    /// manifest, and only within the capability's
+    /// [`Scope`](gaggle_core::Scope). Other cached shares are unaffected, so one
+    /// relay can carry a mix of public and private shares. Call after
+    /// [`cache_share`](Self::cache_share) for that share.
+    pub async fn restrict_to_invite_holders(
+        &self,
+        share: SharePublicKey,
+        manifest_id: Hash,
+    ) -> anyhow::Result<()> {
+        self.send(Command::Restrict { share, manifest_id }).await
+    }
+
+    /// Lift the gate that [`restrict_to_invite_holders`](Self::restrict_to_invite_holders)
+    /// put on every share keyed to `share`; those shares become public again and
+    /// existing grants for `share` are dropped.
+    pub async fn unrestrict(&self, share: SharePublicKey) -> anyhow::Result<()> {
+        self.send(Command::Unrestrict(share)).await
     }
 
     /// Run until the process is stopped.
@@ -212,21 +296,27 @@ struct EventLoop {
     commands: mpsc::Receiver<Command>,
     cache: LruChunkCache,
 
-    /// One manifest per registered share, newest last.
-    manifests: Vec<Manifest>,
+    /// Every share the relay caches, keyed by manifest id.
+    shares: HashMap<Hash, ShareEntry>,
+
+    // --- indexes derived from `shares`, rebuilt on every mutation ---
     lists_by_root: HashMap<Hash, ChunkList>,
-    /// Expected byte length of every chunk in a registered share.
+    /// Manifest id that owns each chunk-list root.
+    manifest_by_root: HashMap<Hash, Hash>,
+    /// Expected byte length of every chunk in a cached share.
     chunk_len: HashMap<Hash, u32>,
     /// Upstream seeds to try, per chunk.
     chunk_upstreams: HashMap<Hash, Vec<PeerId>>,
     /// Manifest path per chunk-list root, and per chunk — for per-file scope
-    /// checks on a private relay.
+    /// checks on a private share.
     path_by_root: HashMap<Hash, String>,
     paths_by_chunk: HashMap<Hash, Vec<String>>,
+    /// Manifest ids each chunk appears in — a chunk in any public share is
+    /// always servable, one only in private shares needs a matching grant.
+    manifests_by_chunk: HashMap<Hash, Vec<Hash>>,
 
-    /// `Some` once [`RelayNode::restrict_to_invite_holders`] was called.
-    restrict: Option<SharePublicKey>,
-    grants: HashMap<PeerId, RelayGrant>,
+    /// Per-connection capability grants, one entry per private share admitted.
+    grants: HashMap<PeerId, Vec<RelayGrant>>,
 
     pending_fills: HashMap<OutboundRequestId, PendingFill>,
 }
@@ -241,16 +331,131 @@ impl EventLoop {
             swarm,
             commands,
             cache: LruChunkCache::new(config.cache_capacity_bytes),
-            manifests: Vec::new(),
+            shares: HashMap::new(),
             lists_by_root: HashMap::new(),
+            manifest_by_root: HashMap::new(),
             chunk_len: HashMap::new(),
             chunk_upstreams: HashMap::new(),
             path_by_root: HashMap::new(),
             paths_by_chunk: HashMap::new(),
-            restrict: None,
+            manifests_by_chunk: HashMap::new(),
             grants: HashMap::new(),
             pending_fills: HashMap::new(),
         }
+    }
+
+    /// Recompute every derived index from `self.shares`.
+    fn rebuild_indexes(&mut self) {
+        self.lists_by_root.clear();
+        self.manifest_by_root.clear();
+        self.chunk_len.clear();
+        self.chunk_upstreams.clear();
+        self.path_by_root.clear();
+        self.paths_by_chunk.clear();
+        self.manifests_by_chunk.clear();
+
+        for (mid, entry) in &self.shares {
+            let path_of_root: HashMap<Hash, &str> =
+                entry.manifest.files.iter().map(|f| (f.root, f.path.as_str())).collect();
+            for list in &entry.lists {
+                let root = list.root();
+                self.manifest_by_root.insert(root, *mid);
+                let path = path_of_root.get(&root).map(|p| p.to_string());
+                if let Some(path) = &path {
+                    self.path_by_root.insert(root, path.clone());
+                }
+                for chunk in &list.chunks {
+                    self.chunk_len.insert(chunk.hash, chunk.len);
+                    self.chunk_upstreams
+                        .entry(chunk.hash)
+                        .or_default()
+                        .extend(entry.upstreams.iter().copied());
+                    let mids = self.manifests_by_chunk.entry(chunk.hash).or_default();
+                    if !mids.contains(mid) {
+                        mids.push(*mid);
+                    }
+                    if let Some(path) = &path {
+                        let paths = self.paths_by_chunk.entry(chunk.hash).or_default();
+                        if !paths.contains(path) {
+                            paths.push(path.clone());
+                        }
+                    }
+                }
+                self.lists_by_root.insert(root, list.clone());
+            }
+        }
+        // De-duplicate upstreams per chunk.
+        for ups in self.chunk_upstreams.values_mut() {
+            let mut seen = HashSet::new();
+            ups.retain(|p| seen.insert(*p));
+        }
+    }
+
+    /// Does this relay gate at least one cached share?
+    fn any_private(&self) -> bool {
+        self.shares.values().any(|s| s.restrict.is_some())
+    }
+
+    /// Live (non-expired) grants `peer` holds.
+    fn live_grants(&self, peer: &PeerId, now: u64) -> impl Iterator<Item = &RelayGrant> {
+        self.grants.get(peer).into_iter().flatten().filter(move |g| g.live(now))
+    }
+
+    /// May `peer` see the manifest / chunk lists of the cached share `mid`?
+    fn manifest_access(&self, mid: &Hash, peer: &PeerId) -> bool {
+        match self.shares.get(mid) {
+            None => false,
+            Some(entry) => match entry.restrict {
+                None => true,
+                Some(pk) => {
+                    let now = unix_now();
+                    self.live_grants(peer, now).any(|g| g.share == pk)
+                }
+            },
+        }
+    }
+
+    /// May `peer` fetch `path` within the cached share `mid`?
+    fn path_allowed_in(&self, mid: &Hash, path: &str, peer: &PeerId) -> bool {
+        match self.shares.get(mid).and_then(|e| e.restrict) {
+            None => true,
+            Some(pk) => {
+                let now = unix_now();
+                self.live_grants(peer, now).any(|g| g.share == pk && g.scope.allows(path))
+            }
+        }
+    }
+
+    /// May `peer` fetch this chunk? Allowed if the chunk belongs to any public
+    /// cached share, or to a private one `peer` holds a scope-matching grant for.
+    fn chunk_allowed(&self, hash: &Hash, peer: &PeerId) -> bool {
+        let Some(mids) = self.manifests_by_chunk.get(hash) else { return false };
+        let now = unix_now();
+        for mid in mids {
+            let Some(entry) = self.shares.get(mid) else { continue };
+            match entry.restrict {
+                None => return true,
+                Some(pk) => {
+                    let chunk_paths = self.paths_by_chunk.get(hash);
+                    for g in self.live_grants(peer, now) {
+                        if g.share != pk {
+                            continue;
+                        }
+                        match &g.scope {
+                            Scope::All => return true,
+                            Scope::Files(_) => {
+                                if chunk_paths
+                                    .is_some_and(|ps| ps.iter().any(|p| g.scope.allows(p)))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     async fn run(mut self) {
@@ -281,42 +486,76 @@ impl EventLoop {
                 );
             }
             Command::CacheShare { manifest, chunk_lists, upstreams } => {
-                let path_of_root: HashMap<Hash, &str> =
-                    manifest.files.iter().map(|f| (f.root, f.path.as_str())).collect();
-                for list in &chunk_lists {
-                    let root = list.root();
-                    let path = path_of_root.get(&root).map(|p| p.to_string());
-                    if let Some(path) = &path {
-                        self.path_by_root.insert(root, path.clone());
-                    }
-                    for chunk in &list.chunks {
-                        self.chunk_len.insert(chunk.hash, chunk.len);
-                        self.chunk_upstreams.entry(chunk.hash).or_default().extend(&upstreams);
-                        if let Some(path) = &path {
-                            let entry = self.paths_by_chunk.entry(chunk.hash).or_default();
-                            if !entry.contains(path) {
-                                entry.push(path.clone());
-                            }
-                        }
-                    }
-                    self.lists_by_root.insert(root, list.clone());
-                }
+                let mid = manifest.id();
                 tracing::info!(
-                    share = %manifest.id(),
+                    share = %mid,
                     files = manifest.files.len(),
-                    chunks = self.chunk_len.len(),
+                    chunk_lists = chunk_lists.len(),
                     upstreams = upstreams.len(),
                     "caching share"
                 );
-                self.manifests.push(*manifest);
+                match self.shares.get_mut(&mid) {
+                    Some(entry) => {
+                        entry.manifest = *manifest;
+                        entry.lists = chunk_lists;
+                        for up in upstreams {
+                            if !entry.upstreams.contains(&up) {
+                                entry.upstreams.push(up);
+                            }
+                        }
+                    }
+                    None => {
+                        self.shares.insert(
+                            mid,
+                            ShareEntry {
+                                manifest: *manifest,
+                                lists: chunk_lists,
+                                upstreams,
+                                restrict: None,
+                            },
+                        );
+                    }
+                }
+                self.rebuild_indexes();
+            }
+            Command::RemoveShare(mid) => {
+                if self.shares.remove(&mid).is_some() {
+                    tracing::info!(share = %mid, "dropped cached share");
+                    self.rebuild_indexes();
+                }
+            }
+            Command::Shares(reply) => {
+                let _ = reply.send(self.shares.keys().copied().collect());
             }
             Command::CacheStats(reply) => {
                 let _ = reply.send(self.cache.stats());
             }
-            Command::Restrict(share) => {
-                self.restrict = Some(share);
-                self.grants.clear();
-                tracing::info!(%share, "relay is now invite-only");
+            Command::Restrict { share, manifest_id } => {
+                match self.shares.get_mut(&manifest_id) {
+                    Some(entry) => {
+                        entry.restrict = Some(share);
+                        // Drop any stale grants for this key so the gate is clean.
+                        for grants in self.grants.values_mut() {
+                            grants.retain(|g| g.share != share);
+                        }
+                        tracing::info!(%share, share_id = %manifest_id, "share is now invite-only");
+                    }
+                    None => tracing::warn!(
+                        share_id = %manifest_id,
+                        "restrict_to_invite_holders for a share this relay does not cache"
+                    ),
+                }
+            }
+            Command::Unrestrict(share) => {
+                for entry in self.shares.values_mut() {
+                    if entry.restrict == Some(share) {
+                        entry.restrict = None;
+                    }
+                }
+                for grants in self.grants.values_mut() {
+                    grants.retain(|g| g.share != share);
+                }
+                tracing::info!(%share, "share restriction lifted");
             }
         }
     }
@@ -401,68 +640,56 @@ impl EventLoop {
     ) {
         // Credential presentation.
         if let Request::Hello(cred) = &request {
-            let resp = match &self.restrict {
-                None => Response::Welcome,
-                Some(share) => match self.admit(peer, cred, *share) {
+            let resp = if self.any_private() {
+                match self.admit(peer, cred) {
                     Ok(()) => Response::Welcome,
                     Err(why) => Response::Unauthorized(why),
-                },
+                }
+            } else {
+                Response::Welcome
             };
             let _ = self.swarm.behaviour_mut().chunk_exchange.send_response(channel, resp);
             return;
         }
 
-        // Access + per-file scope for a private relay.
-        let scope = if self.restrict.is_some() {
-            match self.grants.get(&peer) {
-                Some(g) if g.expires_at.is_some_and(|e| unix_now() >= e) => {
-                    self.grants.remove(&peer);
-                    let _ = self.swarm.behaviour_mut().chunk_exchange.send_response(
-                        channel,
-                        Response::Unauthorized("capability has expired".into()),
-                    );
-                    return;
-                }
-                Some(g) => Some(g.scope.clone()),
-                None => {
-                    let _ = self.swarm.behaviour_mut().chunk_exchange.send_response(
-                        channel,
-                        Response::Unauthorized("present a valid invite first".into()),
-                    );
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let allows = |path: &str| scope.as_ref().is_none_or(|s| s.allows(path));
-
         let response = match request {
             Request::Hello(_) => unreachable!("handled above"),
-            Request::GetManifest => {
-                self.manifests.last().cloned().map_or(Response::NotFound, Response::Manifest)
-            }
-            Request::GetChunkList(root) => match self.path_by_root.get(&root) {
-                Some(path) if !allows(path) => {
-                    Response::Unauthorized("this file is outside your invite".into())
+            Request::GetManifest(sel) => {
+                match self.resolve_share(sel) {
+                    None => Response::NotFound,
+                    Some(mid) if !self.manifest_access(&mid, &peer) => {
+                        Response::Unauthorized("present a valid invite first".into())
+                    }
+                    Some(mid) => Response::Manifest(self.shares[&mid].manifest.clone()),
                 }
-                _ => self
-                    .lists_by_root
-                    .get(&root)
-                    .cloned()
-                    .map_or(Response::NotFound, Response::ChunkList),
+            }
+            Request::GetChunkList(root) => match self.manifest_by_root.get(&root).copied() {
+                None => Response::NotFound,
+                Some(mid) if !self.manifest_access(&mid, &peer) => {
+                    Response::Unauthorized("present a valid invite first".into())
+                }
+                Some(mid) => match self.path_by_root.get(&root) {
+                    Some(path) if !self.path_allowed_in(&mid, path, &peer) => {
+                        Response::Unauthorized("this file is outside your invite".into())
+                    }
+                    _ => self
+                        .lists_by_root
+                        .get(&root)
+                        .cloned()
+                        .map_or(Response::NotFound, Response::ChunkList),
+                },
             },
             Request::GetInventory => {
                 let held: Vec<Hash> = self
                     .chunk_len
                     .keys()
                     .copied()
-                    .filter(|h| self.cache.contains(h) && self.chunk_allowed(h, &scope))
+                    .filter(|h| self.cache.contains(h) && self.chunk_allowed(h, &peer))
                     .collect();
                 Response::Inventory(held)
             }
             Request::GetChunk(hash) => {
-                if !self.chunk_allowed(&hash, &scope) {
+                if !self.chunk_allowed(&hash, &peer) {
                     Response::Unauthorized("this chunk is outside your invite".into())
                 } else if let Some(bytes) = self.cache.get_refreshing(&hash) {
                     Response::Chunk(bytes)
@@ -489,36 +716,37 @@ impl EventLoop {
         let _ = self.swarm.behaviour_mut().chunk_exchange.send_response(channel, response);
     }
 
-    /// Verify a presented capability and record its grant. `Err` carries a
-    /// human-readable reason.
-    fn admit(
-        &mut self,
-        peer: PeerId,
-        cred: &gaggle_core::SignedCapability,
-        share: SharePublicKey,
-    ) -> Result<(), String> {
-        let cap = cred.verify(unix_now()).map_err(|e| e.to_string())?;
-        if cap.share != share {
-            return Err("capability is for a different share".into());
+    /// Which cached share a `GetManifest(sel)` targets: the selected id if it is
+    /// cached, or the sole cached share when `sel` is `None`.
+    fn resolve_share(&self, sel: Option<Hash>) -> Option<Hash> {
+        match sel {
+            Some(id) => self.shares.contains_key(&id).then_some(id),
+            None => (self.shares.len() == 1).then(|| *self.shares.keys().next().unwrap()),
         }
-        if !self.manifests.iter().any(|m| m.id() == cap.manifest_id) {
-            return Err("capability is for a manifest this relay does not cache".into());
-        }
-        self.grants
-            .insert(peer, RelayGrant { scope: cap.scope.clone(), expires_at: cap.expires_at });
-        Ok(())
     }
 
-    /// Is `hash` inside `scope` (given what files the relay knows the chunk to
-    /// be part of)? A `None` scope allows everything.
-    fn chunk_allowed(&self, hash: &Hash, scope: &Option<Scope>) -> bool {
-        match scope {
-            None | Some(Scope::All) => true,
-            Some(s) => {
-                let paths = self.paths_by_chunk.get(hash);
-                paths.is_some_and(|ps| ps.iter().any(|p| s.allows(p)))
-            }
+    /// Verify a presented capability and record a grant for the private share it
+    /// unlocks. `Err` carries a human-readable reason.
+    fn admit(&mut self, peer: PeerId, cred: &gaggle_core::SignedCapability) -> Result<(), String> {
+        let cap = cred.verify(unix_now()).map_err(|e| e.to_string())?;
+        let gated = self
+            .shares
+            .get(&cap.manifest_id)
+            .filter(|e| e.restrict == Some(cap.share))
+            .is_some();
+        if !gated {
+            return Err(
+                "capability is for a share/manifest this relay does not gate for invites".into(),
+            );
         }
+        let grants = self.grants.entry(peer).or_default();
+        grants.retain(|g| g.share != cap.share);
+        grants.push(RelayGrant {
+            share: cap.share,
+            scope: cap.scope.clone(),
+            expires_at: cap.expires_at,
+        });
+        Ok(())
     }
 
     /// An upstream for `hash`, preferring one we already have a connection to.

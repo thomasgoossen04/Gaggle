@@ -1,17 +1,20 @@
 //! [`ShareLink`] — the copy-pasteable string that lets one node subscribe to
-//! another's share. It bundles what [`SubscribeRequest`] needs that a bare
-//! [`Invite`] does not: the network address(es) to reach a seed at.
+//! another's share. It bundles a [`gaggle_core::Invite`] (for a private share)
+//! with what an invite lacks: the network address(es) to reach a seed at.
+//!
+//! It lives in `net` rather than a frontend crate because the `accelerator`
+//! daemon (its config file) and `control-plane` (the admin API body) both round
+//! -trip these tokens.
 
 use base64::Engine;
 use gaggle_core::{Hash, Invite};
-use net::Multiaddr;
 use serde::{Deserialize, Serialize};
 
-use crate::manager::SubscribeRequest;
+use crate::Multiaddr;
 
 const PREFIX: &str = "gaggleshare1";
 
-/// Everything a subscriber needs, in one token.
+/// Everything a subscriber needs, in one `gaggleshare1<base64url>` token.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShareLink {
     pub name: String,
@@ -31,6 +34,11 @@ impl ShareLink {
     pub fn with_invite(mut self, invite: Invite) -> Self {
         self.invite = Some(invite);
         self
+    }
+
+    /// The capability token embedded in the link, if it is for a private share.
+    pub fn credential(&self) -> Option<&gaggle_core::SignedCapability> {
+        self.invite.as_ref().map(|i| &i.credential)
     }
 
     /// Encode as a single `gaggleshare1<base64url>` token.
@@ -53,16 +61,6 @@ impl ShareLink {
         anyhow::ensure!(!link.sources.is_empty(), "share link names no sources");
         Ok(link)
     }
-
-    /// Turn it into a request the transfer manager can run.
-    pub fn into_request(self) -> SubscribeRequest {
-        SubscribeRequest {
-            name: self.name,
-            manifest_id: self.manifest_id,
-            sources: self.sources,
-            credential: self.invite.map(|i| i.credential),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -71,7 +69,7 @@ mod tests {
     use gaggle_core::{Capability, ShareKeypair};
 
     fn addr() -> Multiaddr {
-        let peer = net::PeerId::random();
+        let peer = crate::PeerId::random();
         format!("/ip4/127.0.0.1/udp/40521/quic-v1/p2p/{peer}").parse().unwrap()
     }
 
@@ -84,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_with_invite_and_becomes_a_request() {
+    fn round_trips_with_invite() {
         let kp = ShareKeypair::from_seed([1u8; 32]);
         let mid = Hash::of(b"m");
         let invite = Invite::new(kp.public(), mid, "mp", kp.issue(Capability::new(kp.public(), mid)));
@@ -92,10 +90,7 @@ mod tests {
 
         let back = ShareLink::parse(&link.encode()).unwrap();
         assert_eq!(back, link);
-
-        let req = back.into_request();
-        assert_eq!(req.manifest_id, mid);
-        assert!(req.credential.is_some());
+        assert!(back.credential().is_some());
     }
 
     #[test]

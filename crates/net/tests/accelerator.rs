@@ -13,9 +13,10 @@ use std::fs;
 use std::time::Duration;
 
 use gaggle_core::{
-    ChunkList, ChunkStore, DiskChunkStore, Hash, Manifest, MemoryChunkStore, snapshot_dir,
+    Capability, ChunkList, ChunkStore, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
+    ShareKeypair, snapshot_dir,
 };
-use net::{Catalog, Node, RelayConfig, RelayNode, SwarmConfig};
+use net::{Catalog, Keypair, Node, RelayConfig, RelayNode, SwarmConfig};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -44,6 +45,24 @@ fn snapshot(share: &TempDir) -> (Manifest, BTreeMap<String, ChunkList>, MemoryCh
     let mut store = MemoryChunkStore::new();
     let snap = snapshot_dir(share.path(), "accel-share", 1, &mut store).unwrap();
     (snap.manifest, snap.chunk_lists, store)
+}
+
+/// A second, content-distinct share so a relay can cache more than one.
+fn sample_share_seeded(mut state: u64, marker: &str) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("data")).unwrap();
+    fs::write(root.join("about.txt"), format!("share {marker}\n")).unwrap();
+
+    let mut blob = Vec::with_capacity(9 * MIB);
+    while blob.len() < 9 * MIB {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        blob.extend_from_slice(&state.to_le_bytes());
+    }
+    fs::write(root.join("data/blob.bin"), &blob).unwrap();
+    dir
 }
 
 fn distinct_chunk_count(lists: &BTreeMap<String, ChunkList>) -> usize {
@@ -300,4 +319,153 @@ async fn nas_lan_priority_pulls_from_the_replica_first() {
     sub.shutdown().await;
     origin.shutdown().await;
     nas.shutdown().await;
+}
+
+// --- Multi-share relay accelerator ------------------------------------------
+
+/// Pull the share `want` from a relay that caches several, verifying it.
+async fn pull_via_relay(
+    sub: &Node,
+    relay: &RelayNode,
+    want: Hash,
+) -> anyhow::Result<MemoryChunkStore> {
+    let mut store = MemoryChunkStore::new();
+    timeout(
+        Duration::from_secs(30),
+        sub.download_share_selecting(relay.peer_id(), want, &mut store),
+    )
+    .await
+    .expect("relay download timed out")?;
+    Ok(store)
+}
+
+#[tokio::test]
+async fn one_relay_caches_two_shares_at_once() {
+    let share_a = sample_share_seeded(0x1111_2222_3333_4444, "A");
+    let share_b = sample_share_seeded(0xaaaa_bbbb_cccc_dddd, "B");
+    let (origin_a, manifest_a, lists_a) = full_seed(&share_a).await;
+    let (origin_b, manifest_b, lists_b) = full_seed(&share_b).await;
+    assert_ne!(manifest_a.id(), manifest_b.id());
+
+    let relay = RelayNode::spawn_with(RelayConfig { cache_capacity_bytes: 64 * MIB as u64 })
+        .await
+        .unwrap();
+    let id_a = relay.add_upstream(origin_a.listen_addr().await.unwrap()).await.unwrap();
+    let id_b = relay.add_upstream(origin_b.listen_addr().await.unwrap()).await.unwrap();
+    relay.cache_share(manifest_a.clone(), lists_a.values().cloned(), vec![id_a]).await.unwrap();
+    relay.cache_share(manifest_b.clone(), lists_b.values().cloned(), vec![id_b]).await.unwrap();
+
+    let mut shares = relay.shares().await.unwrap();
+    shares.sort();
+    let mut want = vec![manifest_a.id(), manifest_b.id()];
+    want.sort();
+    assert_eq!(shares, want);
+
+    let sub = Node::spawn().await.unwrap();
+    sub.add_peer_address(relay.peer_id(), bare_addr_relay(&relay).await).await.unwrap();
+
+    let store_a = pull_via_relay(&sub, &relay, manifest_a.id()).await.unwrap();
+    reconstruct_and_check(&share_a, &manifest_a, &store_a);
+    let store_b = pull_via_relay(&sub, &relay, manifest_b.id()).await.unwrap();
+    reconstruct_and_check(&share_b, &manifest_b, &store_b);
+
+    // Dropping one share leaves the other fully serveable.
+    relay.remove_share(manifest_a.id()).await.unwrap();
+    assert_eq!(relay.shares().await.unwrap(), vec![manifest_b.id()]);
+    assert!(pull_via_relay(&sub, &relay, manifest_a.id()).await.is_err());
+    let store_b2 = pull_via_relay(&sub, &relay, manifest_b.id()).await.unwrap();
+    reconstruct_and_check(&share_b, &manifest_b, &store_b2);
+
+    sub.shutdown().await;
+    origin_a.shutdown().await;
+    origin_b.shutdown().await;
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_relay_mixes_a_public_and_a_private_share() {
+    let share_pub = sample_share_seeded(0x0f0f_0f0f_0f0f_0f0f, "pub");
+    let share_priv = sample_share_seeded(0xf0f0_f0f0_f0f0_f0f0, "priv");
+    let (origin_pub, manifest_pub, lists_pub) = full_seed(&share_pub).await;
+    let (origin_priv, manifest_priv, lists_priv) = full_seed(&share_priv).await;
+    let keypair = ShareKeypair::from_seed([42u8; 32]);
+
+    let relay = RelayNode::spawn_with(RelayConfig { cache_capacity_bytes: 64 * MIB as u64 })
+        .await
+        .unwrap();
+    let id_pub = relay.add_upstream(origin_pub.listen_addr().await.unwrap()).await.unwrap();
+    let id_priv = relay.add_upstream(origin_priv.listen_addr().await.unwrap()).await.unwrap();
+    relay
+        .cache_share(manifest_pub.clone(), lists_pub.values().cloned(), vec![id_pub])
+        .await
+        .unwrap();
+    relay
+        .cache_share(manifest_priv.clone(), lists_priv.values().cloned(), vec![id_priv])
+        .await
+        .unwrap();
+    relay
+        .restrict_to_invite_holders(keypair.public(), manifest_priv.id())
+        .await
+        .unwrap();
+
+    let relay_addr = bare_addr_relay(&relay).await;
+
+    // A stranger: the public share is served, the private one is refused.
+    let stranger = Node::spawn().await.unwrap();
+    stranger.add_peer_address(relay.peer_id(), relay_addr.clone()).await.unwrap();
+    let ok = pull_via_relay(&stranger, &relay, manifest_pub.id()).await.unwrap();
+    reconstruct_and_check(&share_pub, &manifest_pub, &ok);
+    assert!(pull_via_relay(&stranger, &relay, manifest_priv.id()).await.is_err());
+
+    // An invite holder gets the private share too.
+    let member = Node::spawn().await.unwrap();
+    member.add_peer_address(relay.peer_id(), relay_addr).await.unwrap();
+    let cred = keypair.issue(Capability::new(keypair.public(), manifest_priv.id()));
+    member.authenticate(relay.peer_id(), &cred).await.unwrap();
+    let got = pull_via_relay(&member, &relay, manifest_priv.id()).await.unwrap();
+    reconstruct_and_check(&share_priv, &manifest_priv, &got);
+
+    stranger.shutdown().await;
+    member.shutdown().await;
+    origin_pub.shutdown().await;
+    origin_priv.shutdown().await;
+    relay.shutdown().await;
+}
+
+async fn bare_addr_relay(relay: &RelayNode) -> net::Multiaddr {
+    relay.listen_addrs().await.unwrap().into_iter().next().unwrap()
+}
+
+// --- Persistent node identity --------------------------------------------
+
+#[tokio::test]
+async fn a_persistent_identity_keeps_the_peer_id_across_restarts() {
+    let keypair = Keypair::generate_ed25519();
+
+    let n1 = Node::spawn_with_identity(keypair.clone()).await.unwrap();
+    let id1 = n1.peer_id();
+    n1.shutdown().await;
+
+    let n2 = Node::spawn_with_identity(keypair.clone()).await.unwrap();
+    assert_eq!(n2.peer_id(), id1, "same identity → same peer id");
+    n2.shutdown().await;
+
+    let relay = RelayNode::spawn_with_identity(RelayConfig::default(), keypair.clone())
+        .await
+        .unwrap();
+    assert_eq!(relay.peer_id(), id1, "the relay derives the same peer id from that identity");
+    relay.shutdown().await;
+
+    let other = Node::spawn_with_identity(Keypair::generate_ed25519()).await.unwrap();
+    assert_ne!(other.peer_id(), id1);
+    other.shutdown().await;
+}
+
+#[test]
+fn load_or_create_identity_round_trips_on_disk() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("sub/identity.key");
+    let first = net::load_or_create_identity(&path).unwrap();
+    let again = net::load_or_create_identity(&path).unwrap();
+    assert_eq!(first.public().to_peer_id(), again.public().to_peer_id());
 }

@@ -44,6 +44,23 @@ pub struct Settings {
     /// without an explicit resync. `None` disables the background poll.
     #[serde(default)]
     pub auto_resync_secs: Option<u64>,
+    /// Remote accelerator daemons this node manages over their admin API.
+    #[serde(default)]
+    pub remote_accelerators: Vec<RemoteAccelerator>,
+}
+
+/// A remote accelerator daemon registered in Settings — its admin URL and the
+/// daemon identity pinned on first contact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAccelerator {
+    /// A short human label, unique within the list.
+    pub label: String,
+    /// Base URL of the daemon's admin API, e.g. `http://host:8749`.
+    pub admin_url: String,
+    /// Hex `AgentId` of the daemon, learned + pinned on the first successful
+    /// call. `None` until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_key: Option<String>,
 }
 
 impl Default for Settings {
@@ -55,6 +72,7 @@ impl Default for Settings {
             storage_cap_bytes: None,
             theme: Theme::System,
             auto_resync_secs: None,
+            remote_accelerators: Vec::new(),
         }
     }
 }

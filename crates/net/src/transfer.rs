@@ -29,16 +29,22 @@ pub struct DownloadedShare {
 /// The relay accelerator uses this to learn a share before it starts caching.
 pub async fn fetch_manifest_and_lists<F, Fut>(
     mut request: F,
+    want: Option<Hash>,
 ) -> anyhow::Result<(Manifest, BTreeMap<String, ChunkList>)>
 where
     F: FnMut(Request) -> Fut,
     Fut: Future<Output = anyhow::Result<Response>>,
 {
-    let manifest = match request(Request::GetManifest).await? {
+    let manifest = match request(Request::GetManifest(want)).await? {
         Response::Manifest(m) => m,
         other => anyhow::bail!("asked for the manifest, got {}", other.kind()),
     };
     manifest.validate().context("peer sent an invalid manifest")?;
+    if let Some(want) = want
+        && manifest.id() != want
+    {
+        anyhow::bail!("peer returned a different manifest than the one requested");
+    }
 
     let mut chunk_lists = BTreeMap::new();
     for file in &manifest.files {
@@ -59,17 +65,19 @@ where
 /// Pull the share reachable through `request` into `store`, checking every piece
 /// against the manifest. Chunks already present in `store` are not re-fetched,
 /// so a partially-filled `store` (a resumed download, an on-disk replica) just
-/// tops itself up.
+/// tops itself up. `want` selects a share by manifest id when the source serves
+/// several (a multi-share relay); pass `None` otherwise.
 pub async fn fetch_share<F, Fut, S>(
     mut request: F,
     store: &mut S,
+    want: Option<Hash>,
 ) -> anyhow::Result<DownloadedShare>
 where
     F: FnMut(Request) -> Fut,
     Fut: Future<Output = anyhow::Result<Response>>,
     S: ChunkStore + ?Sized,
 {
-    let (manifest, chunk_lists) = fetch_manifest_and_lists(&mut request).await?;
+    let (manifest, chunk_lists) = fetch_manifest_and_lists(&mut request, want).await?;
 
     for (path, list) in &chunk_lists {
         for chunk in &list.chunks {

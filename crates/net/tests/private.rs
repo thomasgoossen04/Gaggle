@@ -81,7 +81,7 @@ async fn a_private_share_refuses_a_peer_with_no_invite() {
     connect(&sub, &origin).await;
 
     // A raw request is bounced.
-    let resp = sub.request(origin.peer_id(), Request::GetManifest).await.unwrap();
+    let resp = sub.request(origin.peer_id(), Request::GetManifest(None)).await.unwrap();
     assert!(matches!(resp, Response::Unauthorized(_)), "got {resp:?}");
 
     // And so is a full download.
@@ -254,7 +254,7 @@ async fn a_private_relay_only_serves_invite_holders() {
         .unwrap();
     let origin_id = relay.add_upstream(origin.listen_addr().await.unwrap()).await.unwrap();
     relay.cache_share(manifest.clone(), lists.values().cloned(), vec![origin_id]).await.unwrap();
-    relay.restrict_to_invite_holders(keypair.public()).await.unwrap();
+    relay.restrict_to_invite_holders(keypair.public(), manifest.id()).await.unwrap();
 
     let relay_addr = relay.listen_addrs().await.unwrap().into_iter().next().unwrap();
 

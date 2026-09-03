@@ -74,9 +74,12 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
 - **`control-plane`** gets its first real code: `invite::{InviteRegistry, router,
   InviteClient}` — an in-memory HTTP service to `POST /invites` (rejecting
   bad-signature invites) and `GET /invites/{code}`.
-- **`accelerator` binary** wires everything: `--role relay [--upstream <addr>]...
-  [--cache-mib N] [--restrict <sharepub-hex>]` and `--role nas --dir <path>
-  --source <addr>... [--materialize <path>] [--invite <gaggle1…>]`.
+- **`accelerator` binary** is a config-file + admin-API daemon (see "Remote,
+  multi-share accelerators" below): `accelerator run [--role relay|nas]
+  [--cache-mib N] [--dir <path>] [--admin-listen host:port] [--listen <maddr>]`,
+  plus `accelerator identity` / `authorize <hex>` / `share {add|rm|ls}`. State
+  lives under `--home` / `$GAGGLE_ACCEL_HOME` / `~/.local/share/gaggle/accelerator`
+  (`identity.key` + `config.toml`).
 
 Tests: `crates/net/tests/loopback.rs` (direct transfer), `discovery.rs` (DHT +
 relay/dcutr), `swarm.rs` (multi-seed load spread, partial-seed stitching, dead-source
@@ -112,11 +115,56 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   turns on a background poll that only *flags* newer versions. A private share pins its
   manifest id in every capability, so a rescanned private share needs a fresh invite.
 - **Accelerator control (milestone 9)** — `App::start_accelerator(AcceleratorRequest::{Relay,Nas})`
-  runs an in-process `RelayNode` (optionally read-through caching one `ShareLink`) or a
-  NAS replica (`DiskChunkStore` + `download_share_multi` + `serve`), surfaced as
-  `AppState::accelerator` (role, peer id, listen addr, live `CacheStats` / replica chunk
-  count). `App::benchmark()` measures sequential write throughput to the download volume
-  plus free space (`statvfs` on unix) and suggests a role.
+  runs an in-process `RelayNode` or NAS replica set carrying a *list* of `ShareLink`s
+  (see "Remote, multi-share accelerators" below), surfaced as `AppState::accelerator`
+  (role, peer id, listen addr, live `CacheStats` / replica chunk count, per-share rows).
+  `App::benchmark()` measures sequential write throughput to the download volume plus
+  free space (`statvfs` on unix) and suggests a role.
+**Remote, multi-share accelerators** — accelerators are no longer bound to one
+share, and can be driven remotely:
+
+- **Multi-share `RelayNode`** — `cache_share` appends (keyed by manifest id),
+  `remove_share` / `shares` manage the set, and `restrict_to_invite_holders(share,
+  manifest_id)` now gates *one* cached share, so a relay carries any mix of public
+  and private shares. `Request::GetManifest(Option<Hash>)` selects a share on a
+  multi-share source; `Node::download_share_selecting` / `SwarmConfig::manifest_id`
+  are the downloader side (a plain download still sends `None`). `net::accel::{relay_add_share,
+  nas_add_share}` are the per-share start helpers shared by the daemon and `app-state`.
+- **Persistent identity** — `net::load_or_create_identity(path)` +
+  `Node::spawn_*_with_identity` / `RelayNode::spawn_with_opts` keep a stable
+  `PeerId` across restarts. `net::{keypair_from_seed, identity_seed}` derive
+  sibling identities (NAS uses one per share). `gaggle_core::{AgentKeypair,
+  AgentId}` is a general Ed25519 signer (sibling of the per-share `identity` module).
+- **`control-plane::admin`** — `router(AdminState)` serves `GET /admin/status`,
+  `GET|POST /admin/shares`, `DELETE /admin/shares/{id}`. Every request is signed
+  by the operator's `AgentKeypair` (canonical `METHOD\nPATH\nTS\nNONCE\nblake3(body)`,
+  headers `x-gaggle-agent|timestamp|nonce|signature`, ±60 s skew, checked against
+  `AdminState.authorized`); every response is signed by the daemon key
+  (`x-gaggle-daemon[-signature]`) so `AdminClient` TOFU-pins it. Mutations go out
+  an `mpsc<AdminCommand>`; status comes in a `watch<DaemonStatus>` — no `net` dep.
+- **`accelerator` daemon** — `config.rs` (`AcceleratorConfig` toml: role, listen,
+  admin_listen, cache_mib, replica_dir, `authorized_keys`, `shares`),
+  `supervisor.rs` (`Supervisor` owns a multi-share `RelayNode` **or** a
+  `HashMap<Hash, Node>` of per-share replicas; applies `AdminCommand`s and
+  rewrites `config.toml`), `run.rs` (identity + config + supervisor + admin
+  server). Prints its peer id + public key on every start.
+- **`app-state`** — `App` keeps a persistent operator `AgentKeypair` at
+  `operator.key` (`App::operator_public_key()`). `AcceleratorRequest::{Relay,Nas}`
+  take `shares: Vec<ShareLink>`; `AcceleratorState.shares: Vec<AccelShareRow>`;
+  `App::accel_add_share` / `accel_remove_share` mutate a *running* local
+  accelerator. `Settings.remote_accelerators: Vec<RemoteAccelerator>` (label +
+  admin URL + pinned `daemon_key`); `App::{add,remove}_remote_accelerator` /
+  `remote_{add,remove}_share`; the manager polls each every ~10 s via `AdminClient`
+  into `AppState.remote_accelerators: Vec<RemoteAccelState>`.
+- **`ShareLink`** moved from `app-state` to **`net`** (`net::ShareLink`, re-exported
+  by `app-state`); `into_request()` is now `From<ShareLink> for SubscribeRequest`
+  in `app-state`.
+- **`gui`** Accelerator tab: an operator-key card (copy → `accelerator authorize
+  <key>`), the local form now taking one link per line + a running-status card
+  listing every carried share with Remove and an "Add share" field, and a
+  "Remote accelerators" section (reachable dot, role, per-share rows, "Add
+  remote" form + per-remote "Add share").
+
 - **`gui`** — a gpui shell over `App`: Shares (add public / private folder, copy link,
   rescan, per-row ▸ panel with the invite form), Transfers (progress bars,
   pause/resume/remove, check-updates/resync, `update vN` badge, per-row ▸ swarm
@@ -133,8 +181,15 @@ later subscribers fail, **rescan→check_updates→resync applies only the delta
 file arrives, removed file is deleted, `version` bumps), **a private share refuses a
 strangers then admits a minted invite**, **benchmark reports throughput + free space**,
 **a NAS accelerator replicates a share**. `app-state` unit tests cover `Settings`
-persistence, `ShareLink` round trips, and name sanitizing.
-`crates/core/tests/snapshot.rs` adds a `sync_share` delta-apply test.
+persistence, `ShareLink` round trips, and name sanitizing. **`relay_accelerator_carries_multiple_shares`**
+starts a local relay with two `ShareLink`s and drops one live; **remote-accelerator
+tests** cover `Settings` round-tripping `remote_accelerators` and a registered
+remote reporting unreachable + persisting. `crates/net/tests/accelerator.rs` adds
+one-relay-two-shares, mixed public/private on one relay, `remove_share`, and
+persistent-identity tests. `crates/control-plane/tests/admin.rs` round-trips a
+signed request through the admin router (authorised ok; bad key / stale ts → 401;
+add-share reaches the supervisor channel). `crates/core/tests/snapshot.rs` adds a
+`sync_share` delta-apply test.
 
 ## Commands
 
@@ -146,8 +201,10 @@ cargo test -p gaggle-core                   # test one crate (unit + tests/snaps
 cargo test -p gaggle-core merkle::tests::every_proof_verifies   # single test
 cargo clippy --workspace --all-targets      # lint (CI-level check)
 
-cargo run -p accelerator -- --role relay    # run the daemon as a relay node
-cargo run -p accelerator -- --role nas      # ... or as a cache/NAS replica node
+cargo run -p accelerator -- run --role relay   # run the daemon (relay role)
+cargo run -p accelerator -- run --role nas     # ... or the cache/NAS replica role
+cargo run -p accelerator -- identity           # print its persistent public key
+cargo run -p accelerator -- authorize <hex>    # let an operator drive the admin API
 cargo run -p gui                            # run the desktop app
 ```
 
@@ -167,13 +224,15 @@ Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), six members unde
 |---|---|---|
 | `crates/core` → **`gaggle-core`** | lib | Manifest format, chunking, merkle trees, dedup. Pure logic, no async, dependency-light. |
 | `crates/net` → `net` | lib | libp2p swarm: QUIC transport, Kademlia DHT, relay + dcutr NAT traversal. |
-| `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client for bootstrap, invite exchange, accelerator registration, admin/status. |
+| `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). |
 | `crates/app-state` → `app-state` | lib | UI-framework-agnostic application state + transfer manager. Testable headless. |
 | `crates/accelerator` → `accelerator` | **bin** | Headless daemon; `--role relay\|nas` selects bandwidth-heavy vs storage-heavy behaviour. |
 | `crates/gui` → `gui` | **bin** | `gpui` + `gpui-component` desktop frontend. |
 
 Dependency direction: `gaggle-core` is the leaf. `net` → core. `control-plane` → core.
-`app-state` → core + net. `accelerator` → core + net + control-plane. `gui` → app-state.
+`app-state` → core + net + control-plane (the `AdminClient` for remote accelerators).
+`accelerator` → core + net + control-plane. `gui` → app-state. `ShareLink` lives in
+`net` so the daemon config and the admin API can both round-trip its tokens.
 
 **The `crates/core` directory holds a package named `gaggle-core`, imported as
 `gaggle_core`.** Naming it `core` collides with Rust's built-in `core` crate — macro

@@ -432,7 +432,7 @@ async fn private_share_needs_a_minted_invite() {
 
     let out_ok = TempDir::new().unwrap();
     let guest = app_downloading_into(out_ok.path()).await;
-    guest.subscribe(link.into_request());
+    guest.subscribe(SubscribeRequest::from(link));
     let done = wait_for(&guest, 60, |s| {
         s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
     })
@@ -505,7 +505,7 @@ async fn a_scoped_invite_downloads_only_its_files() {
 
     let out = TempDir::new().unwrap();
     let guest = app_downloading_into(out.path()).await;
-    guest.subscribe(link.into_request());
+    guest.subscribe(SubscribeRequest::from(link));
     let done = wait_for(&guest, 60, |s| {
         s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
     })
@@ -551,8 +551,7 @@ async fn nas_accelerator_replicates_a_share() {
     let node = App::new(None).await.unwrap();
     node.start_accelerator(AcceleratorRequest::Nas {
         dir: replica_dir.path().to_path_buf(),
-        source: link,
-        materialize: None,
+        shares: vec![link],
     });
 
     let up = wait_for(&node, 60, |s| {
@@ -567,4 +566,110 @@ async fn nas_accelerator_replicates_a_share() {
 
     node.stop_accelerator();
     wait_for(&node, 10, |s| s.accelerator.is_none()).await;
+}
+
+/// A second folder with distinct content, so two shares have distinct manifests.
+fn other_folder() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.txt"), b"a different share entirely\n").unwrap();
+    let mut blob = Vec::with_capacity(6 * 1024 * 1024);
+    let mut state = 0xfeed_face_dead_beefu64;
+    while blob.len() < 6 * 1024 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        blob.extend_from_slice(&state.to_le_bytes());
+    }
+    fs::write(dir.path().join("data.bin"), &blob).unwrap();
+    dir
+}
+
+async fn seed_and_link(app: &App) -> ShareLink {
+    let s = wait_for(app, 20, |s| {
+        s.seeds()
+            .next()
+            .is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = s.seeds().next().unwrap();
+    ShareLink::new(seed.name.clone(), seed.manifest_id, vec![seed.share_addr.clone().unwrap()])
+}
+
+#[tokio::test]
+async fn relay_accelerator_carries_multiple_shares() {
+    let folder_a = sample_folder();
+    let folder_b = other_folder();
+    let seeder_a = App::new(None).await.unwrap();
+    let seeder_b = App::new(None).await.unwrap();
+    seeder_a.add_local_share(folder_a.path());
+    seeder_b.add_local_share(folder_b.path());
+    let link_a = seed_and_link(&seeder_a).await;
+    let link_b = seed_and_link(&seeder_b).await;
+    assert_ne!(link_a.manifest_id, link_b.manifest_id);
+
+    let node = App::new(None).await.unwrap();
+    node.start_accelerator(AcceleratorRequest::Relay {
+        cache_bytes: 64 << 20,
+        shares: vec![link_a.clone(), link_b.clone()],
+    });
+
+    let up = wait_for(&node, 60, |s| {
+        s.accelerator
+            .as_ref()
+            .is_some_and(|a| a.shares.iter().filter(|r| r.error.is_none()).count() == 2)
+    })
+    .await;
+    let acc = up.accelerator.unwrap();
+    assert_eq!(acc.role, AcceleratorRole::Relay);
+    let ids: Vec<&str> = acc.shares.iter().map(|r| r.manifest_id.as_str()).collect();
+    assert!(ids.contains(&link_a.manifest_id.to_hex().as_str()));
+    assert!(ids.contains(&link_b.manifest_id.to_hex().as_str()));
+
+    // Drop one share from the running accelerator.
+    node.accel_remove_share(link_a.manifest_id.to_hex());
+    let after = wait_for(&node, 15, |s| {
+        s.accelerator.as_ref().is_some_and(|a| a.shares.len() == 1)
+    })
+    .await;
+    assert_eq!(
+        after.accelerator.unwrap().shares[0].manifest_id,
+        link_b.manifest_id.to_hex()
+    );
+
+    node.stop_accelerator();
+}
+
+#[tokio::test]
+async fn settings_round_trip_remote_accelerators() {
+    use app_state::RemoteAccelerator;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+
+    let mut s = Settings::default();
+    s.remote_accelerators.push(RemoteAccelerator {
+        label: "vps".into(),
+        admin_url: "http://accel.example:8749".into(),
+        daemon_key: Some("aa".repeat(32)),
+    });
+    s.save(&path).unwrap();
+    assert_eq!(Settings::load(&path).unwrap(), s);
+}
+
+#[tokio::test]
+async fn a_registered_remote_accelerator_shows_up_and_reports_unreachable() {
+    let dir = TempDir::new().unwrap();
+    let app = App::new(Some(dir.path().join("settings.json"))).await.unwrap();
+    assert!(!app.operator_public_key().is_empty());
+
+    app.add_remote_accelerator("vps", "http://127.0.0.1:59999");
+    let s = wait_for(&app, 15, |s| {
+        s.remote_accelerators.iter().any(|r| r.label == "vps" && r.error.is_some())
+    })
+    .await;
+    let r = s.remote_accelerators.iter().find(|r| r.label == "vps").unwrap();
+    assert!(!r.reachable);
+
+    // Persisted to settings.
+    let reloaded = Settings::load(&dir.path().join("settings.json")).unwrap();
+    assert!(reloaded.remote_accelerators.iter().any(|r| r.label == "vps"));
 }

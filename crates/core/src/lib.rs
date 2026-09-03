@@ -20,6 +20,7 @@
 //!   present is a no-op — that is the dedup mechanism.
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod chunk;
 pub mod chunklist;
 pub mod error;
@@ -31,6 +32,7 @@ pub mod merkle;
 pub mod snapshot;
 pub mod store;
 
+pub use agent::{AgentId, AgentKeypair};
 pub use chunk::{Chunk, ChunkWithData, ChunkerConfig, chunk_reader, chunk_slice};
 pub use chunklist::{ChunkList, ChunkRef};
 pub use error::{Error, Result};

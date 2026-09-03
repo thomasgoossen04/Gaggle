@@ -112,7 +112,8 @@ async fn write_frame<T: AsyncWrite + Unpin + Send>(io: &mut T, body: &[u8]) -> i
 
 fn encode_request(req: &Request) -> Vec<u8> {
     match req {
-        Request::GetManifest => vec![tag::REQ_MANIFEST],
+        Request::GetManifest(None) => vec![tag::REQ_MANIFEST],
+        Request::GetManifest(Some(h)) => hash_frame(tag::REQ_MANIFEST, h),
         Request::GetChunkList(h) => hash_frame(tag::REQ_CHUNK_LIST, h),
         Request::GetChunk(h) => hash_frame(tag::REQ_CHUNK, h),
         Request::GetInventory => vec![tag::REQ_INVENTORY],
@@ -123,7 +124,8 @@ fn encode_request(req: &Request) -> Vec<u8> {
 fn decode_request(bytes: &[u8]) -> io::Result<Request> {
     let (tag, rest) = bytes.split_first().ok_or_else(|| bad("empty request frame"))?;
     match *tag {
-        tag::REQ_MANIFEST => Ok(Request::GetManifest),
+        tag::REQ_MANIFEST if rest.is_empty() => Ok(Request::GetManifest(None)),
+        tag::REQ_MANIFEST => Ok(Request::GetManifest(Some(read_hash(rest)?))),
         tag::REQ_CHUNK_LIST => Ok(Request::GetChunkList(read_hash(rest)?)),
         tag::REQ_CHUNK => Ok(Request::GetChunk(read_hash(rest)?)),
         tag::REQ_INVENTORY => Ok(Request::GetInventory),
@@ -206,7 +208,8 @@ mod tests {
     fn request_frames_round_trip() {
         let h = Hash::of(b"x");
         for req in [
-            Request::GetManifest,
+            Request::GetManifest(None),
+            Request::GetManifest(Some(Hash::of(b"share"))),
             Request::GetChunkList(h),
             Request::GetChunk(h),
             Request::GetInventory,

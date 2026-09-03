@@ -149,6 +149,23 @@ pub struct BenchmarkResult {
     pub suggested: AcceleratorRole,
 }
 
+/// One share an accelerator (local or remote) is carrying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccelShareRow {
+    /// Manifest id, hex.
+    pub manifest_id: String,
+    pub name: String,
+    pub files: usize,
+    pub total_bytes: u64,
+    pub version: u64,
+    pub private: bool,
+    /// NAS role: chunks of this share on the durable replica.
+    pub replica_chunks: Option<u64>,
+    /// NAS role: this share's own serving address.
+    pub listen_addr: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Live status of an in-process accelerator this node is running.
 #[derive(Debug, Clone)]
 pub struct AcceleratorState {
@@ -162,6 +179,25 @@ pub struct AcceleratorState {
     pub cache: Option<CacheStats>,
     /// NAS role: chunks currently on the durable replica.
     pub replica_chunks: Option<usize>,
+    /// Every share this accelerator is carrying.
+    pub shares: Vec<AccelShareRow>,
+}
+
+/// Live status of a remote accelerator daemon this node manages.
+#[derive(Debug, Clone)]
+pub struct RemoteAccelState {
+    pub label: String,
+    pub admin_url: String,
+    /// `true` once a signed status call has succeeded.
+    pub reachable: bool,
+    /// Daemon libp2p peer id, from its last status.
+    pub peer_id: Option<String>,
+    /// Pinned daemon identity (hex `AgentId`).
+    pub daemon_key: Option<String>,
+    pub role: Option<AcceleratorRole>,
+    pub shares: Vec<AccelShareRow>,
+    /// Populated when the last poll failed.
+    pub error: Option<String>,
 }
 
 /// A `gaggleshare1…` token just produced by
@@ -184,10 +220,15 @@ pub struct AppState {
     pub swarm: SwarmStatus,
     /// The accelerator this node is running, if any.
     pub accelerator: Option<AcceleratorState>,
+    /// Remote accelerator daemons this node manages, one per Settings entry.
+    pub remote_accelerators: Vec<RemoteAccelState>,
     /// The most recent [`App::benchmark`](crate::App::benchmark) result.
     pub benchmark: Option<BenchmarkResult>,
     /// The token from the most recent [`App::mint_invite`](crate::App::mint_invite).
     pub minted_invite: Option<MintedInvite>,
+    /// This node's operator public key (hex) — authorise it on a daemon with
+    /// `accelerator authorize <key>`.
+    pub operator_key: String,
 }
 
 impl AppState {

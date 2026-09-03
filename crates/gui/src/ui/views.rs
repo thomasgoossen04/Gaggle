@@ -1,7 +1,10 @@
 //! The tab bodies — Shares, Transfers, Accelerator, Settings — plus their row
 //! builders and the expandable detail panels (swarm inspector, invite form).
 
-use app_state::{AcceleratorState, SourceStats, Theme, TransferRow, TransferStatus};
+use app_state::{
+    AccelShareRow, AcceleratorState, RemoteAccelState, SourceStats, Theme, TransferRow,
+    TransferStatus,
+};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, MouseButton, SharedString, deferred, div, hsla,
@@ -538,10 +541,39 @@ fn source_line(s: &SourceStats, max_bytes: u64) -> impl IntoElement {
         )
 }
 
-/// Opt this machine in as an accelerator — the setup wizard.
+/// Opt this machine in as an accelerator (local), and manage remote ones.
 pub fn accelerator(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     let t = theme::active();
     let mut col = div().flex().flex_col().gap_3();
+
+    // Operator key card.
+    col = col.child(
+        card()
+            .child(section_title("Your operator key"))
+            .child(
+                div()
+                    .text_xs()
+                    .font_family("monospace")
+                    .text_color(t.muted)
+                    .child("Authorise it on a daemon:  accelerator authorize <key>"),
+            )
+            .child(
+                div()
+                    .p_2()
+                    .bg(t.panel_hi)
+                    .border_1()
+                    .border_color(t.line)
+                    .text_xs()
+                    .font_family("monospace")
+                    .text_color(t.info)
+                    .child(app.state.operator_key.clone()),
+            )
+            .child(
+                btn("copy-op-key", "Copy operator key").on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.copy_operator_key(cx)),
+                ),
+            ),
+    );
 
     // Benchmark card.
     let bench = &app.state.benchmark;
@@ -566,10 +598,14 @@ pub fn accelerator(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             ),
     );
 
-    match &app.state.accelerator {
-        Some(acc) => col = col.child(accelerator_status(acc, cx)),
-        None => col = col.child(accelerator_form(app, cx)),
-    }
+    // Local accelerator: form or running status.
+    col = match &app.state.accelerator {
+        Some(acc) => col.child(accelerator_status(app, acc, cx)),
+        None => col.child(accelerator_form(app, cx)),
+    };
+
+    // Remote accelerators.
+    col = col.child(remote_accelerators(app, cx));
 
     col.into_any_element()
 }
@@ -577,20 +613,20 @@ pub fn accelerator(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
 fn accelerator_form(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     let t = theme::active();
     card()
-        .child(section_title("Start an accelerator"))
+        .child(section_title("Start a local accelerator"))
         .child(
             div()
                 .text_xs()
                 .font_family("monospace")
                 .text_color(t.muted)
                 .child(
-                    "RELAY: bandwidth-heavy hot-chunk cache + bootstrap.  \
-                     NAS: durable full replica of one share."
+                    "RELAY: hot-chunk cache + bootstrap.  NAS: durable on-disk replicas.  \
+                     One link per line — an accelerator carries any number of shares."
                         .to_string(),
                 ),
         )
         .child(field("Cache MiB", &app.accel_cache))
-        .child(field("Share link", &app.accel_link))
+        .child(field("Share link(s)", &app.accel_link))
         .child(field_suffixed(
             "Replica dir",
             &app.accel_dir,
@@ -614,7 +650,55 @@ fn accelerator_form(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         .into_any_element()
 }
 
-fn accelerator_status(acc: &AcceleratorState, cx: &mut Context<Gaggle>) -> AnyElement {
+/// One "share carried by an accelerator" row, with a Remove button.
+fn accel_share_row(
+    prefix: &str,
+    s: &AccelShareRow,
+    on_remove: impl Fn(&mut Gaggle, &ClickEvent, &mut gpui::Window, &mut Context<Gaggle>) + 'static,
+    cx: &mut Context<Gaggle>,
+) -> impl IntoElement {
+    let t = theme::active();
+    let key = format!("{prefix}-{}", s.manifest_id);
+    let meta = if let Some(e) = &s.error {
+        format!("!! {e}")
+    } else if let Some(n) = s.replica_chunks {
+        format!("{} files · {} · {n} chunks", s.files, human_bytes(s.total_bytes))
+    } else {
+        format!("{} files · {}", s.files, human_bytes(s.total_bytes))
+    };
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .py(px(2.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(s.name.clone()))
+                        .when(s.private, |el| el.child(chip("private", t.info))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family("monospace")
+                        .text_color(if s.error.is_some() { t.bad } else { t.muted })
+                        .child(meta),
+                ),
+        )
+        .child(
+            danger_btn((SharedString::from(key), 0), "Remove")
+                .on_click(cx.listener(on_remove)),
+        )
+}
+
+fn accelerator_status(app: &Gaggle, acc: &AcceleratorState, cx: &mut Context<Gaggle>) -> AnyElement {
     let t = theme::active();
     let mut c = card()
         .child(
@@ -622,7 +706,7 @@ fn accelerator_status(acc: &AcceleratorState, cx: &mut Context<Gaggle>) -> AnyEl
                 .flex()
                 .items_center()
                 .justify_between()
-                .child(section_title("Running"))
+                .child(section_title("Local accelerator"))
                 .child(chip(acc.role.label(), t.good)),
         )
         .child(kv("Peer id", short_peer(&acc.peer_id.to_string())))
@@ -650,14 +734,137 @@ fn accelerator_status(acc: &AcceleratorState, cx: &mut Context<Gaggle>) -> AnyEl
             ),
         ));
     }
-    if let Some(n) = acc.replica_chunks {
-        c = c.child(kv("Replica", format!("{n} chunks on disk")));
+
+    c = c.child(section_title("Shares"));
+    if acc.shares.is_empty() {
+        c = c.child(hint("no shares — add one below, or run as a plain relay"));
     }
+    for s in &acc.shares {
+        let mid = s.manifest_id.clone();
+        c = c.child(accel_share_row(
+            "acc-share",
+            s,
+            move |this, _, _, cx| this.accel_remove_share(mid.clone(), cx),
+            cx,
+        ));
+    }
+    c = c
+        .child(field("Add share link", &app.accel_add))
+        .child(
+            btn("accel-add-share", "Add share").on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| this.accel_add_share(cx)),
+            ),
+        );
+
     c.child(
         danger_btn("stop-accel", "Stop accelerator")
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop_accelerator(cx))),
     )
     .into_any_element()
+}
+
+fn remote_accelerators(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    let mut c = card().child(section_title("Remote accelerators"));
+
+    if app.state.remote_accelerators.is_empty() {
+        c = c.child(hint("none registered — add one by its admin URL below"));
+    }
+    for r in &app.state.remote_accelerators {
+        c = c.child(remote_row(app, r, cx));
+    }
+
+    c.child(
+        div()
+            .mt_1()
+            .pt_2()
+            .border_t_1()
+            .border_color(t.line)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(field("Label", &app.remote_label))
+            .child(field("Admin URL", &app.remote_url))
+            .child(
+                primary_btn("add-remote", "Add remote accelerator").on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.add_remote(cx)),
+                ),
+            ),
+    )
+    .into_any_element()
+}
+
+fn remote_row(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    let label = r.label.clone();
+    let dot = if r.reachable { t.good } else { t.bad };
+
+    let mut panel = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .py_2()
+        .border_t_1()
+        .border_color(t.line)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().w(px(8.0)).h(px(8.0)).bg(dot))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(r.label.clone()))
+                        .when_some(r.role, |el, role| el.child(chip(role.label(), t.muted))),
+                )
+                .child(danger_btn((SharedString::from(format!("rm-remote-{label}")), 0), "Forget").on_click(
+                    cx.listener({
+                        let label = label.clone();
+                        move |this, _: &ClickEvent, _, cx| this.remove_remote(label.clone(), cx)
+                    }),
+                )),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_family("monospace")
+                .text_color(t.muted)
+                .child(r.admin_url.clone()),
+        );
+
+    if let Some(pid) = &r.peer_id {
+        panel = panel.child(kv("Peer id", short_peer(pid)));
+    }
+    if let Some(err) = &r.error {
+        panel = panel.child(
+            div().text_xs().font_family("monospace").text_color(t.bad).child(format!("!! {err}")),
+        );
+    }
+
+    for s in &r.shares {
+        let label = label.clone();
+        let mid = s.manifest_id.clone();
+        panel = panel.child(accel_share_row(
+            &format!("rmt-{label}"),
+            s,
+            move |this, _, _, cx| this.remote_remove_share(label.clone(), mid.clone(), cx),
+            cx,
+        ));
+    }
+
+    panel
+        .child(field("Add share link", &app.remote_add))
+        .child(
+            btn((SharedString::from(format!("rmt-add-{label}")), 0), "Add share to this remote")
+                .on_click(cx.listener({
+                    let label = label.clone();
+                    move |this, _: &ClickEvent, _, cx| this.remote_add_share(label.clone(), cx)
+                })),
+        )
+        .into_any_element()
 }
 
 /// The theme selector: a trigger button with a small overlay menu.

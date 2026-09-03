@@ -26,4 +26,7 @@ pub enum Error {
 
     #[error("invite / capability: {0}")]
     Invite(String),
+
+    #[error("auth: {0}")]
+    Auth(String),
 }

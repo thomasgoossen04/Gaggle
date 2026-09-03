@@ -6,8 +6,12 @@
 //! [`gaggle_core::Invite`] and hand out a short code, fetch it back by that
 //! code. Bootstrap / registration / admin routes are still to come.
 
+pub mod admin;
 pub mod invite;
 
+pub use admin::{
+    AdminClient, AdminCommand, AdminState, DaemonStatus, ShareStatus, router as admin_router,
+};
 pub use invite::{InviteClient, InviteRegistry, router as invite_router};
 
 /// One-line status string for the accelerator daemon's start-up log.
