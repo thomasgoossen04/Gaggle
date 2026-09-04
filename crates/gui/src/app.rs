@@ -146,6 +146,8 @@ pub struct Gaggle {
     pub(crate) set_seed_cache: Entity<InputState>,
     /// A relay's `…/p2p/<id>` address — see [`Settings::public_relay`].
     pub(crate) set_relay: Entity<InputState>,
+    /// An accelerator's HTTP base URL — see [`Settings::rendezvous_url`].
+    pub(crate) set_rendezvous: Entity<InputState>,
     // Accelerator form.
     pub(crate) accel_cache: Entity<InputState>,
     pub(crate) accel_link: Entity<InputState>,
@@ -189,6 +191,7 @@ impl Gaggle {
         let set_resync = num(cx, window, fmt_minutes(s.auto_resync_secs), integer.clone());
         let set_seed_cache = num(cx, window, fmt_size_mib(s.seed_cache_bytes), integer.clone());
         let set_relay = text(cx, window, s.public_relay.clone().unwrap_or_default());
+        let set_rendezvous = text(cx, window, s.rendezvous_url.clone().unwrap_or_default());
         let accel_cache = num(cx, window, "256".into(), integer);
         let accel_link = text(cx, window, String::new());
         let accel_dir = text(cx, window, String::new());
@@ -264,6 +267,7 @@ impl Gaggle {
             set_resync,
             set_seed_cache,
             set_relay,
+            set_rendezvous,
             accel_cache,
             accel_link,
             accel_dir,
@@ -566,6 +570,7 @@ impl Gaggle {
         let resync = parse_minutes(&self.set_resync.read(cx).value());
         let seed_cache = parse_size_mib(&self.set_seed_cache.read(cx).value());
         let relay = self.set_relay.read(cx).value().trim().to_string();
+        let rendezvous = self.set_rendezvous.read(cx).value().trim().to_string();
 
         let mut next = self.state.settings.clone();
         if !dir.trim().is_empty() {
@@ -578,6 +583,7 @@ impl Gaggle {
         // Blank / unparseable keeps the current budget (core enforces a floor).
         next.seed_cache_bytes = seed_cache.unwrap_or(self.state.settings.seed_cache_bytes);
         next.public_relay = if relay.is_empty() { None } else { Some(relay) };
+        next.rendezvous_url = if rendezvous.is_empty() { None } else { Some(rendezvous) };
         self.app.update_settings(next);
         self.set_notice("Settings saved", cx);
     }

@@ -2,7 +2,8 @@
 //! [`Supervisor`], and serve the admin API until Ctrl-C.
 
 use anyhow::Context;
-use control_plane::admin::{AdminState, serve as serve_admin};
+use control_plane::admin::AdminState;
+use control_plane::{RendezvousRegistry, serve_daemon};
 use gaggle_core::AgentKeypair;
 use tokio::sync::mpsc;
 
@@ -63,13 +64,17 @@ pub async fn run(home: Home, overrides: Overrides) -> anyhow::Result<()> {
     let sup_task = tokio::spawn(supervisor.run(cmd_rx));
 
     let state = AdminState::new(authorized, AgentKeypair::from_seed(seed), cmd_tx, status_rx);
+    let rendezvous = RendezvousRegistry::new();
     let listener = tokio::net::TcpListener::bind(&config.admin_listen)
         .await
         .with_context(|| format!("binding admin API to {}", config.admin_listen))?;
-    tracing::info!(addr = %config.admin_listen, "admin API listening");
+    tracing::info!(
+        addr = %config.admin_listen,
+        "admin API + NAT rendezvous listening"
+    );
 
     tokio::select! {
-        r = serve_admin(listener, state) => r.context("admin server failed")?,
+        r = serve_daemon(listener, state, rendezvous) => r.context("admin/rendezvous server failed")?,
         _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C — shutting down"),
     }
     sup_task.abort();

@@ -4,9 +4,12 @@
 //!
 //! - [`PeerBehaviour`] — a standard peer (origin or subscriber): the chunk
 //!   [`request_response`] protocol, plus **Kademlia** for discovery,
-//!   **identify** so peers learn each other's addresses, a **relay client** and
-//!   **dcutr** so a peer behind NAT can be reached through a relay and then
-//!   upgraded to a direct connection.
+//!   **identify** so peers learn each other's addresses, **mDNS** so same-LAN
+//!   peers find each other instantly with no DHT/relay/NAT concerns at all,
+//!   **UPnP** to try for a directly-dialable public address with no relay
+//!   involved at all, and a **relay client** + **dcutr** so a peer behind NAT
+//!   that UPnP can't help (no IGD gateway, double NAT/CGNAT) can still be
+//!   reached through a relay and then upgraded to a direct connection.
 //! - [`RelayBehaviour`] — an accelerator in its relay role: a **relay server**
 //!   plus a Kademlia node that doubles as the swarm's bootstrap/rendezvous
 //!   point, plus the chunk [`request_response`] protocol so it can also serve a
@@ -20,7 +23,7 @@ use std::time::Duration;
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{StreamProtocol, dcutr, identify, kad, relay, request_response};
+use libp2p::{StreamProtocol, dcutr, identify, kad, mdns, relay, request_response, upnp};
 
 use crate::codec::GaggleCodec;
 use crate::proto::PROTOCOL;
@@ -89,6 +92,8 @@ pub(crate) struct PeerBehaviour {
     pub chunk_exchange: request_response::Behaviour<GaggleCodec>,
     pub kademlia: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
+    pub upnp: upnp::tokio::Behaviour,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
 }
@@ -96,15 +101,20 @@ pub(crate) struct PeerBehaviour {
 impl PeerBehaviour {
     /// `relay_client` is handed in by `SwarmBuilder::with_relay_client`, which
     /// also wires the matching circuit transport.
-    pub fn new(key: &Keypair, relay_client: relay::client::Behaviour) -> Self {
+    pub fn new(
+        key: &Keypair,
+        relay_client: relay::client::Behaviour,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let peer = key.public().to_peer_id();
-        Self {
+        Ok(Self {
             chunk_exchange: chunk_exchange(),
             kademlia: kademlia(peer, kad::Config::new(KAD_PROTOCOL)),
             identify: identify(key),
+            mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer)?,
+            upnp: upnp::tokio::Behaviour::default(),
             relay_client,
             dcutr: dcutr::Behaviour::new(peer),
-        }
+        })
     }
 }
 

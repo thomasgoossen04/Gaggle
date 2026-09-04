@@ -48,6 +48,11 @@ pub enum NodeEvent {
     /// A peer's identify report gave us a candidate for our own external
     /// address. dcutr needs at least one of these before it can hole-punch.
     ExternalAddressCandidate { address: Multiaddr },
+    /// `address` is now a confirmed external address for this node (e.g. UPnP
+    /// mapped the QUIC port on the gateway) — it is reported to peers via
+    /// identify, so a peer that connects afterward may be able to dial it
+    /// directly, with no relay/dcutr hop needed.
+    ExternalAddressConfirmed { address: Multiaddr },
 }
 
 type ReplyResult<T> = oneshot::Sender<anyhow::Result<T>>;
@@ -119,6 +124,17 @@ impl Node {
         Self::spawn_inner(Some(catalog), Some(keypair), None).await
     }
 
+    /// [`spawn`](Self::spawn) with an optional persistent identity and an
+    /// optional explicit listen [`Multiaddr`] — the download-only sibling of
+    /// [`spawn_serving_with`](Self::spawn_serving_with). `None` for either
+    /// keeps the default (fresh key / ephemeral port on every interface).
+    pub async fn spawn_with(
+        keypair: Option<crate::Keypair>,
+        listen: Option<Multiaddr>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(None, keypair, listen).await
+    }
+
     /// [`spawn_serving`](Self::spawn_serving) with an optional persistent
     /// identity and an optional explicit listen [`Multiaddr`] (e.g.
     /// `/ip4/0.0.0.0/udp/4001/quic-v1` for a public daemon). `None` for either
@@ -179,6 +195,9 @@ impl Node {
         self.events.subscribe()
     }
 
+    /// Every address this node can currently be dialed on: what it's actually
+    /// listening on, plus any confirmed external address (e.g. one UPnP
+    /// mapped on the gateway) that isn't a listener itself.
     pub async fn listen_addrs(&self) -> anyhow::Result<Vec<Multiaddr>> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::ListenAddrs(tx)).await?;
@@ -550,7 +569,13 @@ impl EventLoop {
     fn on_command(&mut self, command: Command) {
         match command {
             Command::ListenAddrs(reply) => {
-                let _ = reply.send(self.swarm.listeners().cloned().collect());
+                let mut addrs: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
+                for ext in self.swarm.external_addresses() {
+                    if !addrs.contains(ext) {
+                        addrs.push(ext.clone());
+                    }
+                }
+                let _ = reply.send(addrs);
             }
             Command::Bootstrap { addr, reply } => {
                 let Some(peer) = peer_id_of(&addr) else {
@@ -791,6 +816,10 @@ impl EventLoop {
             SwarmEvent::NewExternalAddrCandidate { address } => {
                 let _ = self.events.send(NodeEvent::ExternalAddressCandidate { address });
             }
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                tracing::info!(%address, "confirmed external address; reachable directly");
+                let _ = self.events.send(NodeEvent::ExternalAddressConfirmed { address });
+            }
             SwarmEvent::Behaviour(event) => self.on_behaviour_event(event),
             _ => {}
         }
@@ -848,6 +877,31 @@ impl EventLoop {
                     .send(NodeEvent::HolePunch { peer: event.remote_peer_id, direct });
             }
             PeerBehaviourEvent::RelayClient(_) => {}
+            PeerBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(found)) => {
+                for (peer, addr) in found {
+                    tracing::debug!(%peer, %addr, "mDNS discovered a LAN peer");
+                    self.learn_addr(peer, addr);
+                }
+            }
+            PeerBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(_)) => {}
+            PeerBehaviourEvent::Upnp(event) => match event {
+                libp2p::upnp::Event::NewExternalAddr(addr) => {
+                    tracing::debug!(%addr, "UPnP mapped a port on the gateway");
+                }
+                libp2p::upnp::Event::ExpiredExternalAddr(addr) => {
+                    tracing::debug!(%addr, "UPnP port mapping expired");
+                }
+                libp2p::upnp::Event::GatewayNotFound => {
+                    tracing::debug!(
+                        "no UPnP gateway found; relying on relay/dcutr for NAT traversal"
+                    );
+                }
+                libp2p::upnp::Event::NonRoutableGateway => {
+                    tracing::debug!(
+                        "UPnP gateway is not publicly routable (double NAT/CGNAT); relying on relay/dcutr"
+                    );
+                }
+            },
             _ => {}
         }
     }
@@ -926,7 +980,7 @@ impl EventLoop {
 /// The peer this address actually names — the *last* `/p2p/<id>` component,
 /// since a relay circuit address carries two (`/p2p/<relay>/p2p-circuit/p2p/<target>`)
 /// and the final one is always the real dial target.
-fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
+pub fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
     addr.iter().fold(None, |acc, p| match p {
         Protocol::P2p(id) => Some(id),
         _ => acc,

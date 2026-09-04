@@ -41,7 +41,7 @@ pub use gaggle_core::{
 };
 pub use libp2p::identity::Keypair;
 pub use libp2p::{Multiaddr, PeerId};
-pub use node::{Node, NodeEvent};
+pub use node::{Node, NodeEvent, peer_id_of};
 pub use proto::{PROTOCOL, Request, Response};
 pub use relay::{RelayConfig, RelayNode};
 pub use swarm::{

@@ -72,6 +72,17 @@ pub struct Settings {
     /// reachability, same as before).
     #[serde(default)]
     pub public_relay: Option<String>,
+    /// An accelerator's control-plane HTTP base URL (e.g. `http://host:8749` —
+    /// typically the same accelerator as `public_relay`, on the same host)
+    /// used as a NAT-traversal *rendezvous* point: not a data relay, just a
+    /// place for two peers who have never talked before to swap their current
+    /// candidate addresses and punch a direct hole through each side's NAT.
+    /// Every locally-seeded share polls it for incoming connection attempts,
+    /// and every subscription checks it for the origin's fresh address,
+    /// before falling back to whatever the share link/relay already offers.
+    /// `None` skips this.
+    #[serde(default)]
+    pub rendezvous_url: Option<String>,
 }
 
 /// A remote accelerator daemon registered in Settings — its admin URL and the
@@ -101,6 +112,7 @@ impl Default for Settings {
             remote_accelerators: Vec::new(),
             persist_shares: default_persist_shares(),
             public_relay: None,
+            rendezvous_url: None,
         }
     }
 }

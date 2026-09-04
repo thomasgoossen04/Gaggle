@@ -62,8 +62,13 @@ can browse.
 - **Multi-peer swarming.** Downloads pull from several sources at once, scheduling
   rarest-chunk-first with per-peer concurrency caps, and route around dead or partial
   sources automatically.
-- **NAT traversal built in.** Kademlia DHT peer discovery, libp2p relay circuits, and
-  `dcutr` hole-punching — two peers behind NAT still end up talking directly when possible.
+- **NAT traversal built in, relay-free when possible.** mDNS finds same-LAN peers
+  instantly; UPnP asks the router for a public port with no server involved at all; and
+  when both peers are behind NAT with no accelerator, an accelerator's control-plane can
+  act as a lightweight *rendezvous* point — the two peers swap current addresses and punch
+  a direct hole through each side's NAT, without ever routing chunk data through it. Kademlia
+  DHT discovery plus a full libp2p relay circuit + `dcutr` hole-punch remains the fallback
+  when none of that works.
 - **Delta sync.** Re-scanning a changed folder and re-syncing a subscribed copy only moves
   the chunks that actually changed — not the whole share again.
 - **Accelerators.** Optional always-on nodes that either cache hot chunks for many
@@ -80,8 +85,8 @@ Gaggle splits the network into two independent planes:
 - **Data plane** — peer-to-peer and peer-to-accelerator chunk transfer over QUIC
   (via `rust-libp2p`), independently multiplexed so many chunks move concurrently with no
   head-of-line blocking.
-- **Control plane** — plain HTTPS for the low-volume stuff: invite exchange and the
-  accelerator admin API.
+- **Control plane** — plain HTTPS for the low-volume stuff: invite exchange, NAT
+  rendezvous, and the accelerator admin API.
 
 Trust flows from the manifest: a share's manifest id is authenticated by a signed invite
 capability, and every chunk is verified against the manifest's Merkle root regardless of
@@ -186,6 +191,14 @@ Once authorized, add it as a **remote accelerator** from the GUI's Accelerator t
 its admin URL + the public key it printed) to manage its shares and watch its status from
 anywhere, without a `net`/libp2p connection between your machine and it — that traffic all
 goes over the signed HTTPS admin API.
+
+Any running accelerator (relay or NAS) doubles as a lightweight **NAT rendezvous** point —
+put its `http://host:port` (the same `admin_listen` address) into **Settings → Reachability
+→ Rendezvous URL** on both ends of a transfer, and two peers that have never talked before
+can swap current addresses and punch straight through each side's NAT, with no chunk data
+ever routed through the accelerator. It's a fallback of last resort's opposite: try this
+*before* reserving a full relay circuit above, since it costs the accelerator only a few KB
+of signaling instead of carrying the transfer.
 
 ## Development
 

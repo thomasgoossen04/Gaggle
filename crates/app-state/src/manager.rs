@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use control_plane::AdminClient;
+use control_plane::{AdminClient, PeerInfo, RendezvousClient};
 use gaggle_core::{
     AgentId, AgentKeypair, ChunkList, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
     ScanProgress, SignedCapability, SourceChunkStore, SyncOutcome, index_dir_with_progress,
@@ -22,7 +22,7 @@ use gaggle_core::{
 use net::accel::{nas_add_share, relay_add_share};
 use net::{
     CacheStats, Capability, Catalog, Invite, Multiaddr, Node, PeerId, RelayConfig, RelayNode, Scope,
-    ShareKeypair, ShareLink, SwarmConfig, SwarmProgress,
+    ShareKeypair, ShareLink, SwarmConfig, SwarmProgress, peer_id_of,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -632,6 +632,15 @@ impl Manager {
             self.last_remote_poll = Instant::now();
             for label in self.remotes.keys().cloned().collect::<Vec<_>>() {
                 self.spawn_remote_status(label);
+            }
+        }
+        // NAT rendezvous: check whether some subscriber is waiting to punch
+        // through to one of our served shares, and answer if so.
+        if let Some(url) = self.state.settings.rendezvous_url.clone() {
+            for seed in self.seeds.values() {
+                let node = Arc::clone(&seed.node);
+                let url = url.clone();
+                tokio::spawn(async move { answer_rendezvous_requests(&node, &url).await });
             }
         }
     }
@@ -1499,10 +1508,13 @@ impl Manager {
         let name = sanitize(&request.name).unwrap_or_else(|| hex(&request.manifest_id));
         let req = request.clone();
         let dir = chunk_dir.clone();
+        let rendezvous_url = self.state.settings.rendezvous_url.clone();
 
         let task = tokio::spawn(async move {
             let out = out_root.join(name);
-            if let Err(e) = run_download(node.as_ref(), id, req, dir, out, tx.clone()).await {
+            if let Err(e) =
+                run_download(node.as_ref(), id, req, dir, out, tx.clone(), rendezvous_url).await
+            {
                 let _ = tx.send(Command::WorkerFailed { id, error: format!("{e:#}") }).await;
             }
         });
@@ -1755,6 +1767,90 @@ async fn reserve_relay(node: &Node, relay_addr: &str) -> anyhow::Result<Multiadd
     Ok(circuit)
 }
 
+/// How long a subscriber waits for the origin to answer a rendezvous request
+/// before giving up and falling back to whatever's already in the share link.
+const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(8);
+const RENDEZVOUS_POLL_INTERVAL: Duration = Duration::from_millis(700);
+
+/// Subscriber side of the NAT-rendezvous handshake: register with `origin` at
+/// the accelerator hosting `rendezvous_url`, wait for it to answer with its
+/// own current candidate addresses, and dial them right away — that dial is
+/// this side's half of the punch (the origin does its own half when it
+/// answers, in [`answer_rendezvous_requests`]). Returns the origin's
+/// candidate addresses so the caller can add them to its normal dial list;
+/// a timeout or any transport error is just "rendezvous didn't help this
+/// time", never a hard failure for the download as a whole.
+async fn punch_via_rendezvous(
+    node: &Node,
+    rendezvous_url: &str,
+    origin: PeerId,
+) -> anyhow::Result<Vec<Multiaddr>> {
+    let client = RendezvousClient::new(rendezvous_url);
+    let origin_id = origin.to_string();
+    let me = PeerInfo {
+        peer_id: node.peer_id().to_string(),
+        addrs: node.reachable_addrs().await?.iter().map(Multiaddr::to_string).collect(),
+    };
+    let request_id = client.register(&origin_id, &me).await?;
+
+    let deadline = Instant::now() + RENDEZVOUS_TIMEOUT;
+    loop {
+        if let Some(answer) = client.poll_answer(&origin_id, &request_id).await? {
+            let addrs: Vec<Multiaddr> =
+                answer.addrs.iter().filter_map(|s| s.parse().ok()).collect();
+            for addr in &addrs {
+                // Best-effort, bounded — this is the punch itself, not a
+                // required step (`connect_all` retries these addresses right
+                // after anyway), and a dead/slow address must not stall this
+                // return past the caller's own timeout budget.
+                let _ = tokio::time::timeout(PUNCH_DIAL_TIMEOUT, node.bootstrap(addr.clone())).await;
+            }
+            return Ok(addrs);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("{origin_id} did not answer the rendezvous request in time");
+        }
+        tokio::time::sleep(RENDEZVOUS_POLL_INTERVAL).await;
+    }
+}
+
+/// Cap on one punch-dial attempt. Its job is just to get the outbound packet
+/// out (which happens as soon as the dial is issued, well before this
+/// resolves) — a NAT'd/dead address must not stall the whole rendezvous
+/// exchange while this awaits a connection that will never complete.
+const PUNCH_DIAL_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Origin side of the NAT-rendezvous handshake, polled once per share per
+/// [`Manager::tick`]: check whether any subscriber is waiting for `node` to
+/// show up, publish `node`'s own addresses as the answer, then dial each
+/// subscriber's candidate addresses (this side's half of the punch — done
+/// *after* answering, so a slow/dead punch dial can never delay the
+/// subscriber seeing the answer). Silent on any error — this is a
+/// best-effort optimization on top of whatever addresses are already in the
+/// share link, not something a share depends on.
+async fn answer_rendezvous_requests(node: &Node, rendezvous_url: &str) {
+    let client = RendezvousClient::new(rendezvous_url);
+    let my_id = node.peer_id().to_string();
+    let pending = match client.pending(&my_id).await {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let Ok(addrs) = node.reachable_addrs().await else { return };
+    let me = PeerInfo { peer_id: my_id.clone(), addrs: addrs.iter().map(Multiaddr::to_string).collect() };
+
+    for req in pending {
+        if let Err(e) = client.answer(&my_id, &req.request_id, &me).await {
+            tracing::debug!(error = %e, "rendezvous answer failed");
+            continue;
+        }
+        for addr_str in &req.subscriber.addrs {
+            if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                let _ = tokio::time::timeout(PUNCH_DIAL_TIMEOUT, node.bootstrap(addr)).await;
+            }
+        }
+    }
+}
+
 /// A throttled [`index_dir_with_progress`] callback that forwards
 /// `Command::ScanProgress` to the manager — at most a few times a second
 /// (always including the very first and last update), so a fast local scan
@@ -1849,12 +1945,26 @@ async fn run_download(
     chunk_dir: PathBuf,
     output_dir: PathBuf,
     tx: mpsc::Sender<Command>,
+    rendezvous_url: Option<String>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
     let activity = Arc::new(Mutex::new(Instant::now()));
     let work_activity = activity.clone();
 
     let work = async move {
+        let mut req = req;
+        if let Some(url) = rendezvous_url.as_deref()
+            && let Some(origin) = req.sources.iter().find_map(peer_id_of)
+        {
+            report_stage(&tx, &work_activity, id, "trying a direct NAT punch…");
+            if let Ok(extra) = punch_via_rendezvous(node, url, origin).await {
+                for addr in extra {
+                    if !req.sources.contains(&addr) {
+                        req.sources.push(addr);
+                    }
+                }
+            }
+        }
         report_stage(
             &tx,
             &work_activity,

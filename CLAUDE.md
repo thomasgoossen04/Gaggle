@@ -47,11 +47,20 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   RAM and a NAS from disk through the same type); it may hold a *partial* store and
   reports what it has via `Request::GetInventory`.
 - **`Node`** — a standard peer: the chunk protocol wired together with a **Kademlia**
-  DHT (`ShareKey` = `Manifest::id`; `provide` / `find_providers`), **identify**, a
-  **relay client** and **dcutr**. It resolves a route to a discovered peer (routing
+  DHT (`ShareKey` = `Manifest::id`; `provide` / `find_providers`), **identify**, **mDNS**,
+  **UPnP**, a **relay client** and **dcutr**. mDNS (`libp2p::mdns::tokio`, deliberately
+  skips loopback interfaces) finds same-LAN peers within milliseconds with zero DHT
+  round trip and no NAT/relay concerns — the fastest and most reliable path when it
+  applies. It resolves a route to a discovered peer (routing
   table → learned addresses → `get_closest_peers`) before requesting, and reaches
   NAT'd peers through a relay circuit, upgrading to a direct connection when dcutr's
-  hole-punch lands.
+  hole-punch lands. The UPnP behaviour (`libp2p::upnp::tokio`) tries to map the QUIC
+  port on the gateway as soon as it listens; a successful mapping becomes a confirmed
+  external address (`NodeEvent::ExternalAddressConfirmed`) that identify then reports
+  to peers, so two UPnP-capable devices on plain home routers connect directly with
+  **no relay involved at all**. It's opportunistic, not a replacement for relay/dcutr —
+  it does nothing behind a router with UPnP disabled, double NAT, or CGNAT, so those
+  cases still need the relay fallback.
 - **Multi-peer swarming** (`swarm::fetch_share_from_swarm`, `Node::download_share_multi`)
   — pulls one share from several sources at once. Queries each source's inventory,
   builds a per-chunk availability map, and schedules chunk requests **rarest-first**
@@ -180,6 +189,27 @@ share, and can be driven remotely:
   listing every carried share with Remove and an "Add share" field, and a
   "Remote accelerators" section (reachable dot, role, per-share rows, "Add
   remote" form + per-remote "Add share").
+- **NAT rendezvous ("ICE-lite")** — a relay-free path for two peers with no shared
+  network path and no working UPnP: `control_plane::rendezvous` (`PeerInfo`,
+  `RendezvousRegistry`, `router`, `RendezvousClient`) is a small, unauthenticated,
+  in-memory HTTP mailbox keyed by the *origin*'s libp2p peer id — a subscriber
+  `POST /rendezvous/{origin}`s its own candidate addresses and gets a `request_id`
+  back, the origin polls `GET /rendezvous/{origin}/pending`, dials the subscriber's
+  addresses itself (`Node::bootstrap`, timeout-bounded so a dead address can't stall
+  the exchange) and `POST`s its own addresses as the answer, and the subscriber
+  polls `GET /rendezvous/{origin}/{request_id}` until it sees that answer and dials
+  it the same way — each side's outbound dial is what opens its own NAT pinhole for
+  the other's inbound one, so no chunk data (or even a relay circuit) ever touches
+  the accelerator. `control_plane::serve_daemon` merges this router onto the same
+  listener as the signed admin API (unauthenticated — any subscriber may need it,
+  not just the operator), so any already-running accelerator (relay or NAS) is a
+  rendezvous point for free. `app-state`'s `Settings.rendezvous_url` points at one;
+  `Manager::tick` answers pending requests for every locally-seeded share once per
+  tick, and `run_download` tries a rendezvous punch (bounded by `RENDEZVOUS_TIMEOUT`,
+  currently 8s) before falling back to whatever's already in the share link/relay.
+  `net::peer_id_of` (made `pub`) and `Node::spawn_with` (the download-only sibling of
+  `spawn_serving_with`, for a caller that wants an explicit listen address without
+  serving anything) support this from the `net` side.
 
 - **`gui`** — a gpui shell over `App`: Shares (add public / private folder, copy link,
   rescan, per-row ▸ panel with the invite form), Transfers (progress bars,
@@ -206,7 +236,18 @@ remote reporting unreachable + persisting. `crates/net/tests/accelerator.rs` add
 one-relay-two-shares, mixed public/private on one relay, `remove_share`, and
 persistent-identity tests. `crates/control-plane/tests/admin.rs` round-trips a
 signed request through the admin router (authorised ok; bad key / stale ts → 401;
-add-share reaches the supervisor channel). `crates/core/tests/snapshot.rs` adds a
+add-share reaches the supervisor channel). `crates/control-plane/tests/rendezvous.rs`
+round-trips a subscriber/origin pair through a live rendezvous server, including two
+subscribers waiting on the same origin at once. `a_share_reachable_only_through_nat_rendezvous_still_completes`
+in `app-state/tests/transfer_manager.rs` subscribes with only a deliberately-bogus,
+unreachable address for the origin (same peer id, garbage transport) and still
+completes — proof the transfer's reachability came from the rendezvous exchange, not
+the address in the link. `crates/net/tests/discovery.rs`'s dcutr test now pins every
+node to `127.0.0.1` (`Node::spawn_with`/`spawn_serving_with` + a loopback-only
+`RelayNode::spawn_with_opts`) — mDNS deliberately skips loopback, so without this a
+same-host relay/dcutr test races against (and loses to) mDNS finding the peer
+directly, which is correct behavior in production but starves the relay path this
+test exists to cover. `crates/core/tests/snapshot.rs` adds a
 `sync_share` delta-apply test and an `index_dir` test (locations cover every chunk; a
 `SourceChunkStore` over them rebuilds the tree byte-for-byte). `store.rs` unit-tests
 `SourceChunkStore` read-through + caching, its no-op `put`, and its refusal to serve a
@@ -296,7 +337,7 @@ Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), eight members un
 |---|---|---|
 | `crates/core` → **`gaggle-core`** | lib | Manifest format, chunking, merkle trees, dedup. Pure logic, no async, dependency-light. |
 | `crates/net` → `net` | lib | libp2p swarm: QUIC transport, Kademlia DHT, relay + dcutr NAT traversal. |
-| `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). |
+| `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, NAT rendezvous (`rendezvous::{router, RendezvousRegistry, RendezvousClient}`), and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). `serve_daemon` merges the admin + rendezvous routers onto one listener. |
 | `crates/app-state` → `app-state` | lib | UI-framework-agnostic application state + transfer manager. Testable headless. |
 | `crates/ui-kit` → `gaggle-ui-kit` | lib | Shared `gpui` look: the colour `theme` (`Palette`, `DARK`/`LIGHT`, `active()`) + stateless `widgets`. Depends only on `gpui` + `gpui-component`. Used by `gui` and `launcher`. |
 | `crates/accelerator` → `accelerator` | **bin** | Headless daemon; `--role relay\|nas` selects bandwidth-heavy vs storage-heavy behaviour. |

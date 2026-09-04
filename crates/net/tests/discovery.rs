@@ -7,7 +7,7 @@ use std::fs;
 use std::time::Duration;
 
 use gaggle_core::{ChunkStore, Hash, MemoryChunkStore, snapshot_dir};
-use net::{Catalog, Node, NodeEvent, RelayNode, ShareKey};
+use net::{Catalog, Multiaddr, Node, NodeEvent, RelayConfig, RelayNode, ShareKey};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -115,7 +115,15 @@ async fn share_is_discovered_through_the_dht() {
 
 #[tokio::test]
 async fn peer_behind_a_relay_is_reachable_and_upgrades_to_direct() {
-    let relay = RelayNode::spawn().await.unwrap();
+    // mDNS (deliberately) skips loopback interfaces, so keeping every node in
+    // this test on `127.0.0.1` stops mDNS from short-circuiting the very
+    // relay/dcutr path being tested — on a box with a real LAN interface, two
+    // same-host nodes would otherwise find each other directly and dcutr
+    // would have nothing to upgrade.
+    let loopback: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+    let relay = RelayNode::spawn_with_opts(RelayConfig::default(), None, Some(loopback.clone()))
+        .await
+        .unwrap();
     let relay_addr = relay.listen_addr().await.unwrap();
 
     // Origin reaches the relay and takes a circuit reservation. The circuit
@@ -124,10 +132,13 @@ async fn peer_behind_a_relay_is_reachable_and_upgrades_to_direct() {
     let mut origin_store = MemoryChunkStore::new();
     let snapshot = snapshot_dir(share.path(), "relayed", 1, &mut origin_store).unwrap();
     let manifest = snapshot.manifest.clone();
-    let origin =
-        Node::spawn_serving(Catalog::new(snapshot.manifest, snapshot.chunk_lists, origin_store))
-            .await
-            .unwrap();
+    let origin = Node::spawn_serving_with(
+        Catalog::new(snapshot.manifest, snapshot.chunk_lists, origin_store),
+        None,
+        Some(loopback.clone()),
+    )
+    .await
+    .unwrap();
     let mut origin_events = origin.events();
     origin.bootstrap(relay_addr.clone()).await.unwrap();
     wait_external_candidate(&mut origin_events).await;
@@ -140,7 +151,7 @@ async fn peer_behind_a_relay_is_reachable_and_upgrades_to_direct() {
     .unwrap();
 
     // Subscriber also knows the relay, and is handed the circuit address.
-    let subscriber = Node::spawn().await.unwrap();
+    let subscriber = Node::spawn_with(None, Some(loopback)).await.unwrap();
     let mut upgrades = subscriber.events();
     subscriber.bootstrap(relay_addr.clone()).await.unwrap();
     wait_external_candidate(&mut upgrades).await;

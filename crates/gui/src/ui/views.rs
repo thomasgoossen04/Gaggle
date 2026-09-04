@@ -1033,6 +1033,7 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             card()
                 .child(section_title("Reachability"))
                 .child(field("Public relay p2p address", &app.set_relay))
+                .child(field("Rendezvous URL (accelerator admin API)", &app.set_rendezvous))
                 .child(
                     div().mt_1().flex().child(
                         primary_btn("apply-settings-relay", "Save settings").on_click(
@@ -1046,6 +1047,13 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                      node creates also reserves a slot on it and adds that address to the \
                      link, so it stays dialable even from a network with no path to this \
                      machine directly. Leave blank for LAN/VPN-only sharing.",
+                ))
+                .child(hint(
+                    "Rendezvous URL: that same accelerator's HTTP address (e.g. \
+                     http://host:8749 — usually the admin_listen host:port). Two peers \
+                     that have never talked before use it to swap current addresses and \
+                     punch a direct hole through NAT — no data flows through it, just a \
+                     few KB of signaling. Works even without a relay reservation above.",
                 )),
         )
         .child(
@@ -1066,6 +1074,10 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 .child(kv(
                     "Public relay",
                     s.public_relay.clone().unwrap_or_else(|| "not set".into()),
+                ))
+                .child(kv(
+                    "Rendezvous URL",
+                    s.rendezvous_url.clone().unwrap_or_else(|| "not set".into()),
                 )),
         )
         .child(hint(

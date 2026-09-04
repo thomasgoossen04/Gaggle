@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app_state::{
-    AcceleratorRequest, AcceleratorRole, App, AppEvent, AppState, Scope, Settings, ShareLink,
-    SubscribeRequest, TransferStatus,
+    AcceleratorRequest, AcceleratorRole, App, AppEvent, AppState, Multiaddr, Scope, Settings,
+    ShareLink, SubscribeRequest, TransferStatus,
 };
 use net::RelayNode;
 use tempfile::TempDir;
@@ -951,4 +951,73 @@ async fn an_unreachable_relay_surfaces_a_visible_warning_instead_of_failing_sile
         !seed.share_addrs.iter().any(|a| a.to_string().contains("p2p-circuit")),
         "no circuit address should have been added when the reservation failed"
     );
+}
+
+async fn serve_rendezvous() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        control_plane::rendezvous::serve(listener, control_plane::RendezvousRegistry::new())
+            .await
+            .unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The subscriber is handed only a bogus, unreachable address for the origin
+/// (same peer id, garbage transport) — a stand-in for two peers with no
+/// direct/relay path at all. With both sides pointed at the same rendezvous
+/// service, the origin's background poll (`Manager::tick`) answers the
+/// subscriber's request with its real address and the download still
+/// completes, proving the transfer's reachability came from the rendezvous
+/// exchange and not from the (deliberately broken) address in the link.
+#[tokio::test]
+async fn a_share_reachable_only_through_nat_rendezvous_still_completes() {
+    let rendezvous_url = serve_rendezvous().await;
+
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.update_settings(Settings {
+        rendezvous_url: Some(rendezvous_url.clone()),
+        ..Settings::default()
+    });
+    wait_for(&seeder, 5, |s| s.settings.rendezvous_url.is_some()).await;
+    seeder.add_local_share(folder.path());
+
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let manifest_id = seed.manifest_id;
+    let seed_bytes = seed.total_bytes;
+    let real_addr = seed.share_addr.clone().unwrap().to_string();
+    let peer_id = real_addr.rsplit("/p2p/").next().unwrap();
+    let bogus_addr: Multiaddr = format!("/ip4/203.0.113.1/udp/1/quic-v1/p2p/{peer_id}").parse().unwrap();
+
+    let out = TempDir::new().unwrap();
+    let leech = App::new(None).await.unwrap();
+    leech.update_settings(Settings {
+        download_dir: out.path().to_path_buf(),
+        rendezvous_url: Some(rendezvous_url),
+        ..Settings::default()
+    });
+    wait_for(&leech, 5, |s| s.settings.rendezvous_url.is_some()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![bogus_addr],
+        credential: None,
+    });
+
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    assert_eq!(row.done_bytes, row.total_bytes);
+    assert_eq!(row.total_bytes, seed_bytes);
+
+    let output = row.output_dir.clone().unwrap();
+    dir_matches(folder.path(), &output);
 }
