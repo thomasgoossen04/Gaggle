@@ -4,7 +4,7 @@
 use gpui::prelude::*;
 use gpui::{
     ClickEvent, Context, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Window, div, px,
+    Window, WindowControlArea, div, px,
 };
 use gpui_component::InteractiveElementExt as _;
 
@@ -60,8 +60,16 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                 .pl(if is_macos { px(78.0) } else { px(16.0) })
                 .pr_1()
                 .py_3()
-                // Drag-to-move: arm on press, fire the compositor move on the
-                // first drag, so clicks on the tabs / controls still land.
+                // Windows doesn't drive drag-to-move through `start_window_move`
+                // (that's a no-op on that platform's `PlatformWindow` impl) —
+                // instead it hit-tests `WM_NCHITTEST` against declared
+                // `WindowControlArea`s and drags natively on `HTCAPTION`. This is
+                // a no-op on macOS/Linux, which use the mouse-driven
+                // `start_window_move` below instead.
+                .window_control_area(WindowControlArea::Drag)
+                // Drag-to-move (macOS/Linux): arm on press, fire the compositor
+                // move on the first drag, so clicks on the tabs / controls still
+                // land.
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, _| this.dragging = true),
@@ -113,15 +121,27 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                         .items_center()
                         .gap_1()
                         .when(!is_macos, |el| {
-                            el.child(win_btn("win-min", "—", false).on_click(cx.listener(
-                                |_, _: &ClickEvent, window, _| window.minimize_window(),
-                            )))
-                            .child(win_btn("win-max", max_glyph, false).on_click(cx.listener(
-                                |_, _: &ClickEvent, window, _| window.zoom_window(),
-                            )))
-                            .child(win_btn("win-close", "✕", true).on_click(cx.listener(
-                                |_, _: &ClickEvent, window, _| window.remove_window(),
-                            )))
+                            el.child(
+                                win_btn("win-min", "—", false)
+                                    .window_control_area(WindowControlArea::Min)
+                                    .on_click(cx.listener(|_, _: &ClickEvent, window, _| {
+                                        window.minimize_window()
+                                    })),
+                            )
+                            .child(
+                                win_btn("win-max", max_glyph, false)
+                                    .window_control_area(WindowControlArea::Max)
+                                    .on_click(cx.listener(|_, _: &ClickEvent, window, _| {
+                                        window.zoom_window()
+                                    })),
+                            )
+                            .child(
+                                win_btn("win-close", "✕", true)
+                                    .window_control_area(WindowControlArea::Close)
+                                    .on_click(cx.listener(|_, _: &ClickEvent, window, _| {
+                                        window.remove_window()
+                                    })),
+                            )
                         }),
                 ),
         )

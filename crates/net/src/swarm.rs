@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 
 use anyhow::Context;
-use gaggle_core::{ChunkList, ChunkStore, Hash};
+use gaggle_core::{ChunkList, ChunkStore, FileEntry, Hash};
 use libp2p::PeerId;
 use libp2p::futures::StreamExt;
 use libp2p::futures::stream::FuturesUnordered;
@@ -171,18 +171,42 @@ where
     }
 
     tracing::info!(files = manifest.files.len(), "fetching chunk lists");
+    // One round trip per file, so this must be pipelined rather than
+    // sequential: a share with thousands of files (e.g. a modded game
+    // install) run one-at-a-time over a relayed/high-latency connection can
+    // take minutes just for this step, well past what looks like "nothing is
+    // happening" — and past `STALL_TIMEOUT` in the app layer, which only
+    // watches chunk-transfer progress, not this phase. A chunk list is a
+    // small metadata reply (unlike a chunk's payload bytes), so this can
+    // fan out far more aggressively per source than `per_peer_parallelism`
+    // (which bounds concurrent *chunk* transfers) without risking memory or
+    // bandwidth blowup — a single QUIC connection multiplexes this fine.
+    const LIST_FETCH_CONCURRENCY: usize = 64;
+    let list_concurrency =
+        (LIST_FETCH_CONCURRENCY * sources.len()).max(1).min(manifest.files.len().max(1));
     let mut chunk_lists: BTreeMap<String, ChunkList> = BTreeMap::new();
-    for file in &manifest.files {
-        let list = match from_any(sources, &request, Request::GetChunkList(file.root)).await? {
-            Response::ChunkList(list) => list,
-            Response::NotFound => anyhow::bail!("no source has the chunk list for {}", file.path),
-            other => {
-                anyhow::bail!("asked for the chunk list of {}, got {}", file.path, other.kind())
-            }
-        };
-        list.verify(&file.root, file.size)
-            .with_context(|| format!("chunk list for {} failed verification", file.path))?;
-        chunk_lists.insert(file.path.clone(), list);
+    let mut files_iter = manifest.files.iter();
+    let mut list_fetches = FuturesUnordered::new();
+    // `&request` (not `request`) so this closure is reusable — a `Copy`
+    // reference, unlike `F` itself, can be captured into each call's `async
+    // move` block without consuming the closure's environment.
+    let request_ref = &request;
+    let fetch_one = |file: &FileEntry| {
+        let (root, path, size) = (file.root, file.path.clone(), file.size);
+        async move {
+            let list = fetch_chunk_list(sources, request_ref, root, &path, size).await?;
+            anyhow::Ok((path, list))
+        }
+    };
+    for file in files_iter.by_ref().take(list_concurrency) {
+        list_fetches.push(fetch_one(file));
+    }
+    while let Some(result) = list_fetches.next().await {
+        let (path, list) = result?;
+        chunk_lists.insert(path, list);
+        if let Some(file) = files_iter.next() {
+            list_fetches.push(fetch_one(file));
+        }
     }
 
     // 2. The de-duplicated set of chunks we still need, and each chunk's length.
@@ -419,6 +443,29 @@ where
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no sources to ask")))
+}
+
+/// Fetch and verify one file's chunk list against its manifest-declared
+/// `(root, size)`.
+async fn fetch_chunk_list<F, Fut>(
+    sources: &[PeerId],
+    request: &F,
+    root: Hash,
+    path: &str,
+    size: u64,
+) -> anyhow::Result<ChunkList>
+where
+    F: Fn(PeerId, Request) -> Fut,
+    Fut: Future<Output = anyhow::Result<Response>>,
+{
+    let list = match from_any(sources, request, Request::GetChunkList(root)).await? {
+        Response::ChunkList(list) => list,
+        Response::NotFound => anyhow::bail!("no source has the chunk list for {path}"),
+        other => anyhow::bail!("asked for the chunk list of {path}, got {}", other.kind()),
+    };
+    list.verify(&root, size)
+        .with_context(|| format!("chunk list for {path} failed verification"))?;
+    Ok(list)
 }
 
 /// Assemble a serving [`Catalog`](crate::Catalog) from a finished

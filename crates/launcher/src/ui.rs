@@ -9,7 +9,7 @@ use gaggle_ui_kit::widgets::{btn, hazard_bar, primary_btn, progress_bar, win_btn
 use gpui::prelude::*;
 use gpui::{
     ClickEvent, Context, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Timer, Window, WindowAppearance, div, px,
+    Timer, Window, WindowAppearance, WindowControlArea, div, px,
 };
 use gpui_component::ThemeMode;
 
@@ -150,6 +150,12 @@ impl Render for Launcher {
                     .pl(if is_macos { px(72.0) } else { px(12.0) })
                     .pr_1()
                     .py_1()
+                    // Windows drags via `WM_NCHITTEST` against declared
+                    // `WindowControlArea`s, not `start_window_move` (a no-op on
+                    // that platform) — see the matching comment in
+                    // `gui::ui::chrome::header`. No-op on macOS/Linux, which use
+                    // the mouse-driven `start_window_move` below instead.
+                    .window_control_area(WindowControlArea::Drag)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, _| this.dragging = true),
@@ -174,9 +180,13 @@ impl Render for Launcher {
                             }),
                     )
                     .when(!is_macos, |el| {
-                        el.child(win_btn("win-close", "✕", true).on_click(cx.listener(
-                            |_, _: &ClickEvent, window, _| window.remove_window(),
-                        )))
+                        el.child(
+                            win_btn("win-close", "✕", true)
+                                .window_control_area(WindowControlArea::Close)
+                                .on_click(cx.listener(|_, _: &ClickEvent, window, _| {
+                                    window.remove_window()
+                                })),
+                        )
                     }),
             )
             .child(hazard_bar());
