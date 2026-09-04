@@ -6,8 +6,16 @@ members = [
     "crates/control-plane",
     "crates/accelerator",
     "crates/app-state",
+    "crates/ui-kit",
     "crates/gui",
+    "crates/launcher",
 ]
+
+[workspace.package]
+# One release version for the whole workspace. The runtime "2.0.<commit>" string
+# is produced by the per-binary `build.rs` (see crates/gui, crates/launcher).
+version = "2.0.0"
+edition = "2024"
 
 [workspace.dependencies]
 tokio = { version = "1.53", features = ["full"] }
@@ -20,3 +28,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # Per-OS standard directories (config / data / downloads). Resolves XDG on
 # Linux, ~/Library/Application Support on macOS, and %APPDATA% on Windows.
 dirs = "6"
+
+[profile.release]
+# Smaller distributable binaries. No LTO on purpose — it roughly doubles the
+# gpui release-compile time in CI for little runtime gain here.
+strip = true

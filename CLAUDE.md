@@ -219,19 +219,48 @@ cargo run -p accelerator -- run --role relay   # run the daemon (relay role)
 cargo run -p accelerator -- run --role nas     # ... or the cache/NAS replica role
 cargo run -p accelerator -- identity           # print its persistent public key
 cargo run -p accelerator -- authorize <hex>    # let an operator drive the admin API
-cargo run -p gui                            # run the desktop app
+cargo run -p gui                            # run the desktop app (binary: gaggle-gui)
+cargo run -p launcher                       # run the installer/updater (binary: gaggle-launcher)
+cargo run -p launcher -- check              # headless: is an update available? (exit 10 = yes)
+cargo run -p launcher -- --channel beta     # track pre-release builds (remembered in launcher.json)
 ```
 
 `RUST_LOG=info` (or `debug`, `trace`) controls the `accelerator` daemon's logging via
 `tracing-subscriber`'s `EnvFilter`; it defaults to `info` when unset.
 
-First build of `-p gui` is slow: it pulls the full `gpui` graphics stack, and on Linux
-needs the usual system libs for a windowed GPU app (Vulkan/`libxkbcommon`/Wayland/X11,
-fontconfig). The other five crates build in seconds.
+First build of `-p gui` / `-p launcher` is slow: they pull the full `gpui` graphics
+stack, and on Linux need the usual system libs for a windowed GPU app
+(Vulkan/`libxkbcommon`/Wayland/X11, fontconfig). The other crates build in seconds.
+
+## Versioning & releases
+
+`[workspace.package] version = "2.0.0"` in the root `Cargo.toml`; every member sets
+`version.workspace = true` / `edition.workspace = true`. The **runtime** version string
+is `2.0.<short-commit-hash>` (`…-beta` on the beta channel), emitted as `GAGGLE_VERSION`
+by a `build.rs` in `crates/gui` and `crates/launcher` (falls back to `2.0.unknown` with
+no git history).
+
+**Two release channels**, both driven by `.github/workflows/release.yml` (push to
+`main` *or* `beta`). Each push builds + zips `gaggle-gui` + `gaggle-launcher` for
+linux-x86_64 / windows-x86_64 / macos-aarch64 / macos-x86_64, runs
+`.github/scripts/make_latest.py <version> <tag> <channel> dist` to compose `latest.json`,
+and publishes a GitHub Release:
+
+| Branch | Version | Tag | Release | Descriptor URL |
+|---|---|---|---|---|
+| `main` | `2.0.<hash>` | `v2.0.<hash>` | normal, `make_latest` | `.../releases/latest/download/latest.json` |
+| `beta` | `2.0.<hash>-beta` | rolling `beta` (deleted + recreated each push) | **pre-release** | `.../releases/download/beta/latest.json` |
+
+The launcher tracks a channel (`Channel::{Stable,Beta}` in `crates/launcher/src/channel.rs`),
+persisted in `<data-dir>/Gaggle/launcher.json`, chosen via the in-window `CH: STABLE|BETA`
+toggle or `gaggle-launcher --channel beta` (remembered) / `$GAGGLE_UPDATE_CHANNEL`.
+`--manifest-url` / `$GAGGLE_UPDATE_URL` still override the URL entirely. `installed.json`
+records the installed version **and** channel, so flipping channels always shows an
+update. Branch setup: `git branch beta main && git push -u origin beta` once `main` exists.
 
 ## Workspace layout & dependency graph
 
-Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), six members under
+Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), eight members under
 `crates/`:
 
 | Crate (package name) | Kind | Role |
@@ -240,12 +269,15 @@ Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), six members unde
 | `crates/net` → `net` | lib | libp2p swarm: QUIC transport, Kademlia DHT, relay + dcutr NAT traversal. |
 | `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). |
 | `crates/app-state` → `app-state` | lib | UI-framework-agnostic application state + transfer manager. Testable headless. |
+| `crates/ui-kit` → `gaggle-ui-kit` | lib | Shared `gpui` look: the colour `theme` (`Palette`, `DARK`/`LIGHT`, `active()`) + stateless `widgets`. Depends only on `gpui` + `gpui-component`. Used by `gui` and `launcher`. |
 | `crates/accelerator` → `accelerator` | **bin** | Headless daemon; `--role relay\|nas` selects bandwidth-heavy vs storage-heavy behaviour. |
-| `crates/gui` → `gui` | **bin** | `gpui` + `gpui-component` desktop frontend. |
+| `crates/gui` → `gui` (binary `gaggle-gui`) | **bin** | `gpui` + `gpui-component` desktop frontend. |
+| `crates/launcher` → `launcher` (binary `gaggle-launcher`) | **bin** | Installer / updater / launcher: fetches `latest.json`, installs `gaggle-gui` under the per-user data dir, launches it. `gpui` window styled from `gaggle-ui-kit`; `updater.rs` is the headless engine. |
 
 Dependency direction: `gaggle-core` is the leaf. `net` → core. `control-plane` → core.
 `app-state` → core + net + control-plane (the `AdminClient` for remote accelerators).
-`accelerator` → core + net + control-plane. `gui` → app-state. `ShareLink` lives in
+`accelerator` → core + net + control-plane. `gaggle-ui-kit` → (gpui only).
+`gui` → app-state + gaggle-ui-kit. `launcher` → gaggle-ui-kit. `ShareLink` lives in
 `net` so the daemon config and the admin API can both round-trip its tokens.
 
 **The `crates/core` directory holds a package named `gaggle-core`, imported as

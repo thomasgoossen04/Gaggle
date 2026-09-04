@@ -1,0 +1,145 @@
+name: release
+
+on:
+  push:
+    branches: [main, beta]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, name: linux-x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   name: windows-x86_64 }
+          - { os: macos-14,       target: aarch64-apple-darwin,     name: macos-aarch64 }
+          - { os: macos-13,       target: x86_64-apple-darwin,      name: macos-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # build.rs derives 2.0.<hash> from git
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          # Keep the cache warm across pushes even when only source changes.
+          cache-on-failure: true
+
+      - name: Linux GUI system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libssl-dev libfontconfig1-dev libfreetype6-dev \
+            libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libvulkan-dev
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p gui -p launcher
+
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          ARCHIVE="dist/gaggle-${{ matrix.name }}.zip"
+          zip -j "$ARCHIVE" "$BIN/gaggle-gui" "$BIN/gaggle-launcher"
+          shasum -a 256 "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $archive = "dist/gaggle-${{ matrix.name }}.zip"
+          Compress-Archive -Force -Path "$bin/gaggle-gui.exe","$bin/gaggle-launcher.exe" -DestinationPath $archive
+          (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() | Out-File -NoNewline "$archive.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+
+      - name: Resolve channel (stable on main, beta on beta)
+        run: |
+          set -euo pipefail
+          HASH="$(git rev-parse --short=7 HEAD)"
+          if [ "${{ github.ref_name }}" = "beta" ]; then
+            {
+              echo "VERSION=2.0.${HASH}-beta"
+              echo "TAG=beta"
+              echo "CHANNEL=beta"
+              echo "PRERELEASE=true"
+              echo "MAKE_LATEST=false"
+            } >> "$GITHUB_ENV"
+          else
+            {
+              echo "VERSION=2.0.${HASH}"
+              echo "TAG=v2.0.${HASH}"
+              echo "CHANNEL=stable"
+              echo "PRERELEASE=false"
+              echo "MAKE_LATEST=true"
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Compose latest.json
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/make_latest.py "$VERSION" "$TAG" "$CHANNEL" dist > dist/latest.json
+          echo "--- latest.json ---"
+          cat dist/latest.json
+
+      - name: Reset the rolling beta release
+        if: github.ref_name == 'beta'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete beta --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.VERSION }}
+          prerelease: ${{ env.PRERELEASE }}
+          make_latest: ${{ env.MAKE_LATEST }}
+          fail_on_unmatched_files: true
+          body: "Automated ${{ env.CHANNEL }} release from `${{ github.ref_name }}` @ ${{ github.sha }}"
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/latest.json

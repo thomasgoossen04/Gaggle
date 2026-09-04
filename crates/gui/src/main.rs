@@ -6,8 +6,9 @@
 //!   actions. Delegates every pixel to [`ui`].
 //! - [`ui`] — stateless element builders: [`ui::widgets`] (themed primitives),
 //!   [`ui::chrome`] (title bar + status bar), [`ui::views`] (the four tabs).
-//! - [`theme`] — swappable colour [`theme::Palette`]s (`DARK`, `LIGHT`); every
-//!   widget paints from [`theme::active()`].
+//! - [`theme`] — the [`app_state::Theme`]-aware `activate` wrapper over the
+//!   shared [`gaggle_ui_kit::theme`] palette; every widget paints from
+//!   [`theme::active()`].
 //! - [`clipboard`] — Linux clipboard writes that survive the click.
 //! - [`util`] — pure formatters.
 //!
@@ -35,7 +36,15 @@ fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|base| base.join("gaggle").join("settings.json"))
 }
 
+/// `2.0.<short-commit-hash>`, baked in by `build.rs`.
+const VERSION: &str = env!("GAGGLE_VERSION");
+
 fn main() -> anyhow::Result<()> {
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("gaggle-gui {VERSION}");
+        return Ok(());
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

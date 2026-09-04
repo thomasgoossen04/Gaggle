@@ -1,10 +1,15 @@
 [package]
 name = "gui"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gaggle-gui"
+path = "src/main.rs"
 
 [dependencies]
 app-state = { path = "../app-state" }
+gaggle-ui-kit = { path = "../ui-kit" }
 tokio.workspace = true
 anyhow.workspace = true
 dirs.workspace = true

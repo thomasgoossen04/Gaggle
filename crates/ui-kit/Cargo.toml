@@ -1,0 +1,8 @@
+[package]
+name = "gaggle-ui-kit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui = "0.2.2"
+gpui-component = "0.5"
