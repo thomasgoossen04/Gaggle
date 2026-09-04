@@ -55,6 +55,13 @@ pub struct Settings {
     /// Remote accelerator daemons this node manages over their admin API.
     #[serde(default)]
     pub remote_accelerators: Vec<RemoteAccelerator>,
+    /// Remember the share/transfer list across restarts: on the next launch,
+    /// every seeded folder is re-indexed and re-served, and every
+    /// subscription is re-issued (resuming from whatever partial chunks
+    /// already made it to disk). On by default; turn off for a session that
+    /// should start empty every time.
+    #[serde(default = "default_persist_shares")]
+    pub persist_shares: bool,
 }
 
 /// A remote accelerator daemon registered in Settings — its admin URL and the
@@ -82,6 +89,7 @@ impl Default for Settings {
             theme: Theme::System,
             auto_resync_secs: None,
             remote_accelerators: Vec::new(),
+            persist_shares: default_persist_shares(),
         }
     }
 }
@@ -89,6 +97,11 @@ impl Default for Settings {
 /// Default seed hot-chunk cache budget: 256 MiB.
 fn default_seed_cache_bytes() -> u64 {
     256 << 20
+}
+
+/// Shares/transfers are remembered across restarts by default.
+fn default_persist_shares() -> bool {
+    true
 }
 
 impl Settings {
@@ -138,7 +151,9 @@ mod tests {
 
         // A config written before this field existed still loads.
         let legacy = r#"{"download_dir":"/tmp/x","theme":"light"}"#;
-        assert_eq!(serde_json::from_str::<Settings>(legacy).unwrap().seed_cache_bytes, 256 << 20);
+        let loaded = serde_json::from_str::<Settings>(legacy).unwrap();
+        assert_eq!(loaded.seed_cache_bytes, 256 << 20);
+        assert!(loaded.persist_shares, "persistence defaults on for a pre-existing config");
     }
 
     #[test]

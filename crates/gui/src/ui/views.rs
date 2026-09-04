@@ -15,7 +15,7 @@ use crate::app::{ConfirmKind, Gaggle, Tab};
 use crate::theme;
 use crate::ui::widgets::{
     Tri, btn, card, checkmark, chip, danger_btn, field, field_suffixed, hint, kv, primary_btn,
-    section_title, status_pill, suffix_btn,
+    progress_bar, section_title, status_pill, suffix_btn,
 };
 use crate::util::{cap, human_bytes, human_rate};
 
@@ -73,12 +73,24 @@ fn share_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl 
                 )
                 .child(status_pill(row.status)),
         )
+        .when(row.status == TransferStatus::Scanning, |el| {
+            el.child(progress_bar(row.progress()))
+        })
         .child(
             div()
                 .text_xs()
                 .font_family("monospace")
                 .text_color(t.muted)
-                .child(format!("{} FILES · {}", row.files, human_bytes(row.total_bytes))),
+                .child(if row.status == TransferStatus::Scanning {
+                    format!(
+                        "SCANNING… {} / {} · {} FILES",
+                        human_bytes(row.done_bytes),
+                        human_bytes(row.total_bytes),
+                        row.files
+                    )
+                } else {
+                    format!("{} FILES · {}", row.files, human_bytes(row.total_bytes))
+                }),
         )
         .child(div().text_xs().font_family("monospace").text_color(t.info).child(addr))
         .child(
@@ -951,6 +963,27 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             ),
         )
         .child(
+            card().child(section_title("Startup")).child(
+                div()
+                    .id("toggle-persist-shares")
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_persist_shares(cx)
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family("monospace")
+                            .text_color(t.muted)
+                            .child("REMEMBER SHARES & TRANSFERS ON RESTART"),
+                    )
+                    .child(checkmark(if s.persist_shares { Tri::On } else { Tri::Off })),
+            ),
+        )
+        .child(
             card()
                 .child(section_title("Downloads & limits"))
                 .child(field_suffixed(
@@ -992,7 +1025,8 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         .child(hint(
             "Blank a limit field to clear it (unlimited / off). Seed RAM is the \
              hot-chunk cache each shared folder keeps — it streams from disk, so a \
-             big share needs only a small buffer.",
+             big share needs only a small buffer. With shares remembered on restart, \
+             every seeded folder and subscription comes back on its own next launch.",
         ))
         .into_any_element()
 }

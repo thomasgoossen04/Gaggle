@@ -2,7 +2,7 @@
 //! transfer and reports it through [`AppState`].
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app_state::{
@@ -89,6 +89,18 @@ async fn app_downloading_into(out_dir: &Path) -> App {
     app
 }
 
+/// Like [`app_downloading_into`] but with a real config path, so its share
+/// list persists across a restart.
+async fn app_downloading_into_with_config(out_dir: &Path, config_path: PathBuf) -> App {
+    let app = App::new(Some(config_path)).await.unwrap();
+    app.update_settings(Settings {
+        download_dir: out_dir.to_path_buf(),
+        ..Settings::default()
+    });
+    wait_for(&app, 5, |s| s.settings.download_dir == out_dir).await;
+    app
+}
+
 #[tokio::test]
 async fn share_a_folder_then_subscribe_and_complete() {
     let folder = sample_folder();
@@ -128,6 +140,40 @@ async fn share_a_folder_then_subscribe_and_complete() {
 
     let output = row.output_dir.clone().unwrap();
     dir_matches(folder.path(), &output);
+}
+
+#[tokio::test]
+async fn adding_a_share_passes_through_a_scanning_phase() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    let mut events = seeder.events();
+
+    seeder.add_local_share(folder.path());
+
+    // The row is created with `Scanning` before the background scan/serve
+    // work has even started — `TransferAdded` fires at exactly that point, so
+    // checking the snapshot right after it (no other `.await` in between)
+    // deterministically catches the scanning phase rather than racing it.
+    let added_id = timeout(Duration::from_secs(20), async {
+        loop {
+            if let AppEvent::TransferAdded(id) = events.recv().await.expect("events channel closed") {
+                return id;
+            }
+        }
+    })
+    .await
+    .expect("TransferAdded not observed in time");
+
+    let scanning = seeder.snapshot().get(added_id).cloned().expect("row exists");
+    assert_eq!(scanning.status, TransferStatus::Scanning);
+
+    let done = wait_for(&seeder, 20, |s| {
+        s.get(added_id).is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let seed = done.get(added_id).unwrap();
+    assert!(seed.total_bytes > 20 * 1024 * 1024 && seed.files == 3);
+    assert_eq!(seed.done_bytes, seed.total_bytes);
 }
 
 #[tokio::test]
@@ -336,6 +382,99 @@ async fn settings_persist_across_a_restart() {
     let s = reopened.snapshot().settings;
     assert_eq!(s.download_cap_bps, Some(5_000_000));
     assert_eq!(s.storage_cap_bytes, Some(100 << 30));
+}
+
+#[tokio::test]
+async fn a_seeded_share_is_restored_after_a_restart() {
+    let folder = sample_folder();
+    let seed_cfg = TempDir::new().unwrap();
+    let seed_path = seed_cfg.path().join("settings.json");
+
+    let manifest_id = {
+        let seeder = App::new(Some(seed_path.clone())).await.unwrap();
+        seeder.add_local_share(folder.path());
+        let seeded = wait_for(&seeder, 20, |s| {
+            s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+        })
+        .await;
+        seeded.seeds().next().unwrap().manifest_id
+    }; // seeder dropped without ever calling `remove` — persistence is the only reason it can come back.
+
+    // Restarting against the same config re-seeds the folder on its own, with
+    // the same identity (no `add_local_share` call this time).
+    let reseeded_app = App::new(Some(seed_path)).await.unwrap();
+    let reseeded = wait_for(&reseeded_app, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let reseed = reseeded.seeds().next().unwrap();
+    assert_eq!(reseed.manifest_id, manifest_id, "a restored share keeps the same identity");
+}
+
+#[tokio::test]
+async fn a_download_is_restored_after_a_restart() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let (addr, manifest_id) = (seed.share_addr.clone().unwrap(), seed.manifest_id);
+
+    // A completed download restores the same way a seed does — a fresh row
+    // reappears and finishes, without ever calling `subscribe` again. Two real
+    // transfers happen here (the original, then the restored one), so this
+    // gets a generous budget for a heavily loaded `cargo test --workspace` run.
+    let out = TempDir::new().unwrap();
+    let dl_cfg = TempDir::new().unwrap();
+    let dl_path = dl_cfg.path().join("settings.json");
+    {
+        let leech = app_downloading_into_with_config(out.path(), dl_path.clone()).await;
+        leech.subscribe(SubscribeRequest {
+            name: "modpack".into(),
+            manifest_id,
+            sources: vec![addr],
+            credential: None,
+        });
+        wait_for(&leech, 120, |s| {
+            s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+        })
+        .await;
+    }
+
+    let releech = App::new(Some(dl_path)).await.unwrap();
+    let restored = wait_for(&releech, 120, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    assert_eq!(restored.downloads().next().unwrap().manifest_id, manifest_id);
+}
+
+#[tokio::test]
+async fn persist_shares_false_skips_restoring() {
+    let folder = sample_folder();
+    let cfg = TempDir::new().unwrap();
+    let path = cfg.path().join("settings.json");
+
+    {
+        let app = App::new(Some(path.clone())).await.unwrap();
+        app.update_settings(Settings { persist_shares: false, ..Settings::default() });
+        wait_for(&app, 5, |s| !s.settings.persist_shares).await;
+        app.add_local_share(folder.path());
+        wait_for(&app, 20, |s| {
+            s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete)
+        })
+        .await;
+    }
+
+    let reopened = App::new(Some(path)).await.unwrap();
+    // Persistence, if it were going to restore anything, kicks in on the very
+    // first tick of the manager task — give it a generous window and confirm
+    // nothing shows up.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(reopened.snapshot().seeds().count(), 0, "persistence was off — nothing should come back");
 }
 
 #[tokio::test]

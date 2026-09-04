@@ -27,6 +27,10 @@ pub enum TransferKind {
 pub enum TransferStatus {
     /// Accepted, not started yet.
     Queued,
+    /// Seed only: the local folder is being walked and chunked. See
+    /// [`TransferRow::progress`] for a live fraction (`done_bytes`/`total_bytes`
+    /// count scanned bytes, not transferred ones, while in this state).
+    Scanning,
     /// Resolving routes / fetching the manifest.
     Connecting,
     /// Chunks are moving.
@@ -47,6 +51,7 @@ impl TransferStatus {
     pub fn label(self) -> &'static str {
         match self {
             TransferStatus::Queued => "Queued",
+            TransferStatus::Scanning => "Scanning",
             TransferStatus::Connecting => "Connecting",
             TransferStatus::Active => "Active",
             TransferStatus::Paused => "Paused",

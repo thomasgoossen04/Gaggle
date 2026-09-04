@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use control_plane::AdminClient;
 use gaggle_core::{
     AgentId, AgentKeypair, ChunkList, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
-    SignedCapability, SourceChunkStore, SyncOutcome, index_dir, snapshot_dir, sync_share,
-    write_share,
+    ScanProgress, SignedCapability, SourceChunkStore, SyncOutcome, index_dir_with_progress,
+    snapshot_dir, sync_share, write_share,
 };
 use net::accel::{nas_add_share, relay_add_share};
 use net::{
@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use crate::persist::{PersistedSeed, PersistedState};
 use crate::settings::Settings;
 use crate::state::{
     AccelShareRow, AcceleratorRole, AcceleratorState, AppState, BenchmarkResult, MintedInvite,
@@ -55,8 +56,9 @@ pub enum AppEvent {
     AcceleratorFailed(String),
 }
 
-/// Everything needed to start pulling a remote share.
-#[derive(Debug, Clone)]
+/// Everything needed to start pulling a remote share. `Serialize`/`Deserialize`
+/// so it round-trips through the persisted share list ([`crate::persist`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubscribeRequest {
     /// Display name (also the download sub-folder).
     pub name: String,
@@ -136,6 +138,9 @@ enum Command {
         file_paths: Vec<String>,
     },
     WorkerFailed { id: TransferId, error: String },
+    /// A local folder scan ([`add_share`](Manager::add_share) /
+    /// [`rescan_share`](Manager::rescan_share)) made progress.
+    ScanProgress { id: TransferId, files_total: usize, bytes_done: u64, bytes_total: u64 },
     DownloadProgress { id: TransferId, p: SwarmProgress, base_bytes: u64 },
     DownloadDone { id: TransferId, outcome: Box<DownloadOutcome> },
     UpdateSeen { id: TransferId, version: u64 },
@@ -561,6 +566,7 @@ fn derive_share_seed(operator_seed: &[u8; 32], manifest_id: Hash) -> [u8; 32] {
 
 impl Manager {
     async fn run(mut self) {
+        self.restore_persisted();
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -720,6 +726,9 @@ impl Manager {
                 {
                     tracing::warn!(error = %e, "could not save settings");
                 }
+                // Persistence may have just been turned on (or off) — either
+                // way, make sure the file matches reality going forward.
+                self.persist_shares();
                 self.publish();
             }
             Command::Shutdown => {}
@@ -751,6 +760,7 @@ impl Manager {
                     row.share_addr = Some(addr);
                 }
                 self.recount();
+                self.persist_shares();
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
             }
@@ -769,6 +779,7 @@ impl Manager {
                     row.status = TransferStatus::Complete;
                     row.error = None;
                 }
+                self.persist_shares();
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
             }
@@ -783,6 +794,15 @@ impl Manager {
                 self.recount();
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferFailed(id, error));
+            }
+            Command::ScanProgress { id, files_total, bytes_done, bytes_total } => {
+                if let Some(row) = self.state.transfers.get_mut(&id) {
+                    row.files = files_total;
+                    row.total_bytes = bytes_total;
+                    row.done_bytes = bytes_done;
+                }
+                self.publish();
+                let _ = self.events.send(AppEvent::TransferProgress(id));
             }
             Command::DownloadProgress { id, p, base_bytes } => {
                 let now = Instant::now();
@@ -1159,23 +1179,37 @@ impl Manager {
     }
 
     fn add_share(&mut self, dir: PathBuf, private: bool) {
+        let share_seed = private.then(|| ShareKeypair::generate().to_seed());
+        self.start_seed(dir, share_seed, 1);
+    }
+
+    /// Re-scan `dir` and start serving it again exactly as it was before a
+    /// restart — same version, and (for a private share) the same signing
+    /// key, so already-minted invites and any manifest ids a peer has pinned
+    /// still line up. Shared by [`add_share`](Self::add_share) (a fresh
+    /// share: `version: 1`, a freshly generated `share_seed`) and
+    /// [`restore_persisted`](Self::restore_persisted).
+    fn start_seed(&mut self, dir: PathBuf, share_seed: Option<[u8; 32]>, version: u64) {
         let id = self.alloc_id();
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string());
-        self.insert_row(new_row(id, name.clone(), TransferKind::Seeding));
+        let mut row = new_row(id, name.clone(), TransferKind::Seeding);
+        row.status = TransferStatus::Scanning;
+        self.insert_row(row);
 
         let tx = self.self_tx.clone();
         let cache_bytes = self.state.settings.seed_cache_bytes;
         tokio::spawn(async move {
             let scan_dir = dir.clone();
             let scan_name = name.clone();
+            let progress = scan_progress_sink(tx.clone(), id);
             let built = tokio::task::spawn_blocking(move || {
                 // Stream chunks from the source folder on demand, holding only a
                 // bounded hot-chunk cache in RAM — no whole-folder buffer, no
                 // second copy on disk.
-                let idx = index_dir(&scan_dir, scan_name, 1)?;
+                let idx = index_dir_with_progress(&scan_dir, scan_name, version, progress)?;
                 let store =
                     SourceChunkStore::new(&scan_dir, idx.locations.clone(), cache_bytes);
                 anyhow::Ok((idx, store))
@@ -1188,7 +1222,6 @@ impl Manager {
                 Err(e) => return fail(&tx, id, format!("snapshot task panicked: {e}")).await,
             };
 
-            let share_seed = private.then(|| ShareKeypair::generate().to_seed());
             let info = ShareInfo {
                 name: snap.manifest.name.clone(),
                 manifest_id: snap.manifest.id(),
@@ -1233,15 +1266,16 @@ impl Manager {
         let cache_bytes = self.state.settings.seed_cache_bytes;
 
         if let Some(row) = self.state.transfers.get_mut(&id) {
-            row.status = TransferStatus::Connecting;
+            row.status = TransferStatus::Scanning;
             row.error = None;
         }
         self.publish();
 
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
+            let progress = scan_progress_sink(tx.clone(), id);
             let built = tokio::task::spawn_blocking(move || {
-                let idx = index_dir(&dir, name, next_version)?;
+                let idx = index_dir_with_progress(&dir, name, next_version, progress)?;
                 let store = SourceChunkStore::new(&dir, idx.locations.clone(), cache_bytes);
                 anyhow::Ok((idx, store))
             })
@@ -1410,6 +1444,7 @@ impl Manager {
         let chunk_dir = self.partial_dir(request.manifest_id);
         self.spawn_download(id, request, chunk_dir);
         self.recount();
+        self.persist_shares();
         self.publish();
         let _ = self.events.send(AppEvent::TransferAdded(id));
     }
@@ -1501,6 +1536,7 @@ impl Manager {
 
         self.state.transfers.remove(&id);
         self.recount();
+        self.persist_shares();
         self.publish();
     }
 
@@ -1542,6 +1578,72 @@ impl Manager {
     fn partial_dir(&self, manifest_id: Hash) -> PathBuf {
         self.state.settings.download_dir.join(".gaggle-partial").join(hex(&manifest_id))
     }
+
+    /// `shares.json`, next to the settings file. `None` when there is no
+    /// config path (e.g. a headless/test `App`) — persistence is simply
+    /// unavailable then, same as `Settings` itself.
+    fn shares_path(&self) -> Option<PathBuf> {
+        self.config_path.as_deref()?.parent().map(|dir| dir.join("shares.json"))
+    }
+
+    /// Re-run every persisted seed/subscription from the last session. Called
+    /// once, before the manager's command loop starts. A malformed or
+    /// unreadable file is silently ignored — it just means an empty start,
+    /// same as if persistence had never run.
+    fn restore_persisted(&mut self) {
+        if !self.state.settings.persist_shares {
+            return;
+        }
+        let Some(path) = self.shares_path() else { return };
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let persisted: PersistedState = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not parse persisted shares");
+                return;
+            }
+        };
+        for seed in persisted.seeds {
+            self.start_seed(seed.dir, seed.share_seed, seed.version.max(1));
+        }
+        for request in persisted.subscriptions {
+            self.subscribe(request);
+        }
+    }
+
+    /// Rewrite `shares.json` from the live seed/download/subscription maps.
+    /// A no-op when persistence is off or there is no config path. Best
+    /// -effort, like `Settings::save` — a write failure is logged, not fatal.
+    fn persist_shares(&self) {
+        if !self.state.settings.persist_shares {
+            return;
+        }
+        let Some(path) = self.shares_path() else { return };
+        let persisted = PersistedState {
+            seeds: self
+                .seeds
+                .values()
+                .map(|s| PersistedSeed { dir: s.dir.clone(), share_seed: s.share_seed, version: s.version })
+                .collect(),
+            subscriptions: self
+                .downloads
+                .values()
+                .map(|j| j.request.clone())
+                .chain(self.subs.values().map(|s| s.request.clone()))
+                .collect(),
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match serde_json::to_vec_pretty(&persisted) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&path, bytes) {
+                    tracing::warn!(path = %path.display(), error = %e, "could not save persisted shares");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not serialize persisted shares"),
+        }
+    }
 }
 
 fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
@@ -1569,6 +1671,29 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
 
 async fn fail(tx: &mpsc::Sender<Command>, id: TransferId, error: String) {
     let _ = tx.send(Command::WorkerFailed { id, error }).await;
+}
+
+/// A throttled [`index_dir_with_progress`] callback that forwards
+/// `Command::ScanProgress` to the manager — at most a few times a second
+/// (always including the very first and last update), so a fast local scan
+/// doesn't flood the command channel. Called from inside `spawn_blocking`, so
+/// it sends with `blocking_send`.
+fn scan_progress_sink(tx: mpsc::Sender<Command>, id: TransferId) -> impl FnMut(ScanProgress) {
+    let mut last_sent = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    move |p: ScanProgress| {
+        let done = p.files_total == 0 || p.files_done >= p.files_total;
+        if done || last_sent.elapsed() >= Duration::from_millis(150) {
+            last_sent = Instant::now();
+            let _ = tx.blocking_send(Command::ScanProgress {
+                id,
+                files_total: p.files_total,
+                bytes_done: p.bytes_done,
+                bytes_total: p.bytes_total,
+            });
+        }
+    }
 }
 
 /// Delete a download's scratch chunk store off-thread, and the shared
@@ -2023,5 +2148,40 @@ mod tests {
         assert_eq!(sanitize("a/b/weird:*name").as_deref(), Some("weird__name"));
         assert_eq!(sanitize("..").as_deref(), None);
         assert_eq!(sanitize("").as_deref(), None);
+    }
+
+    #[test]
+    fn scan_progress_sink_always_sends_the_first_and_final_update() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut sink = scan_progress_sink(tx, 42);
+
+        // The very first call is always sent (the sink is seeded with a
+        // backdated `last_sent`), even though nothing has actually elapsed.
+        sink(ScanProgress { files_done: 0, files_total: 2, bytes_done: 0, bytes_total: 200 });
+        // A same-instant follow-up mid-scan tick may legitimately be
+        // throttled away — only the first and last update are guaranteed.
+        sink(ScanProgress { files_done: 1, files_total: 2, bytes_done: 100, bytes_total: 200 });
+        // The final ("done") tick always goes through regardless of timing.
+        sink(ScanProgress { files_done: 2, files_total: 2, bytes_done: 200, bytes_total: 200 });
+
+        let mut seen = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            seen.push(cmd);
+        }
+        assert!(seen.len() >= 2, "expected at least the first and last update, got {}", seen.len());
+
+        let Command::ScanProgress { id, files_total, bytes_done, bytes_total } = &seen[0] else {
+            panic!("expected a ScanProgress command");
+        };
+        assert_eq!(*id, 42);
+        assert_eq!(*files_total, 2);
+        assert_eq!(*bytes_done, 0);
+        assert_eq!(*bytes_total, 200);
+
+        let Command::ScanProgress { bytes_done, bytes_total, .. } = seen.last().unwrap() else {
+            panic!("expected a ScanProgress command");
+        };
+        assert_eq!(*bytes_done, 200);
+        assert_eq!(*bytes_total, 200);
     }
 }

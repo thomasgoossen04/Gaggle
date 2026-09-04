@@ -13,7 +13,8 @@ use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputState};
 
 pub use gaggle_ui_kit::widgets::{
-    btn, card, chip, danger_btn, hazard_bar, hint, kv, primary_btn, section_title, win_btn,
+    btn, card, chip, danger_btn, hazard_bar, hint, kv, primary_btn, progress_bar, section_title,
+    win_btn,
 };
 
 use crate::theme;

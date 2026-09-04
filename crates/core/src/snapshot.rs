@@ -44,6 +44,19 @@ pub struct IndexedSnapshot {
     pub locations: HashMap<Hash, ChunkLocation>,
 }
 
+/// How far a scan ([`index_dir_with_progress`]) has gotten through the tree.
+/// `files_total` / `bytes_total` are fixed once the walk finishes (before any
+/// chunking starts); `files_done` / `bytes_done` grow monotonically as each
+/// file is read and chunked, so `bytes_done as f64 / bytes_total as f64` is a
+/// stable fraction for a progress bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanProgress {
+    pub files_done: usize,
+    pub files_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
 /// Chunk every regular file under `root`, populate `store`, and build the
 /// manifest + chunk lists. Chunk size adapts to each file (see
 /// [`ChunkerConfig::for_file_size`]).
@@ -53,9 +66,15 @@ pub fn snapshot_dir(
     version: u64,
     store: &mut dyn ChunkStore,
 ) -> Result<Snapshot> {
-    scan_tree(root, name, version, |_rel, cwd| {
-        store.put(cwd.chunk.hash, cwd.data);
-    })
+    scan_tree(
+        root,
+        name,
+        version,
+        |_rel, cwd| {
+            store.put(cwd.chunk.hash, cwd.data);
+        },
+        |_| {},
+    )
 }
 
 /// Like [`snapshot_dir`] but instead of storing chunk bytes it records a
@@ -64,14 +83,33 @@ pub fn snapshot_dir(
 /// large folder with only a bounded in-RAM hot-chunk cache — no second copy on
 /// disk, no whole-folder buffer.
 pub fn index_dir(root: &Path, name: impl Into<String>, version: u64) -> Result<IndexedSnapshot> {
+    index_dir_with_progress(root, name, version, |_| {})
+}
+
+/// Like [`index_dir`], but calls `on_progress` as the walk proceeds — once
+/// with the totals right after the directory walk finishes (`files_done: 0`),
+/// then again after every file is fully chunked. Lets a caller show a live
+/// progress bar while a large folder is being scanned.
+pub fn index_dir_with_progress(
+    root: &Path,
+    name: impl Into<String>,
+    version: u64,
+    on_progress: impl FnMut(ScanProgress),
+) -> Result<IndexedSnapshot> {
     let mut locations: HashMap<Hash, ChunkLocation> = HashMap::new();
-    let snap = scan_tree(root, name, version, |rel, cwd| {
-        locations.entry(cwd.chunk.hash).or_insert(ChunkLocation {
-            path: rel.to_owned(),
-            offset: cwd.chunk.offset,
-            len: cwd.chunk.len,
-        });
-    })?;
+    let snap = scan_tree(
+        root,
+        name,
+        version,
+        |rel, cwd| {
+            locations.entry(cwd.chunk.hash).or_insert(ChunkLocation {
+                path: rel.to_owned(),
+                offset: cwd.chunk.offset,
+                len: cwd.chunk.len,
+            });
+        },
+        on_progress,
+    )?;
     Ok(IndexedSnapshot {
         manifest: snap.manifest,
         chunk_lists: snap.chunk_lists,
@@ -82,12 +120,15 @@ pub fn index_dir(root: &Path, name: impl Into<String>, version: u64) -> Result<I
 
 /// The shared walk-and-chunk pass behind [`snapshot_dir`] and [`index_dir`].
 /// `on_chunk` is handed each chunk (with its bytes) as it is produced, together
-/// with the owning file's manifest-relative path.
+/// with the owning file's manifest-relative path. `on_progress` is called once
+/// up front with the totals (from a cheap metadata-only pre-pass) and then
+/// again after every file finishes chunking.
 fn scan_tree(
     root: &Path,
     name: impl Into<String>,
     version: u64,
     mut on_chunk: impl FnMut(&str, ChunkWithData),
+    mut on_progress: impl FnMut(ScanProgress),
 ) -> Result<Snapshot> {
     if !root.is_dir() {
         return Err(Error::Io(std::io::Error::new(
@@ -106,8 +147,16 @@ fn scan_tree(
         manifest.dirs.push(rel_path(root, dir)?);
     }
 
+    // A metadata-only pre-pass so progress can report a stable total up front;
+    // negligible next to the chunking/hashing pass below (stat, not a read).
+    let files_total = files.len();
+    let bytes_total: u64 =
+        files.iter().filter_map(|p| fs::symlink_metadata(p).ok()).map(|m| m.len()).sum();
+    on_progress(ScanProgress { files_done: 0, files_total, bytes_done: 0, bytes_total });
+
     let mut chunk_lists = BTreeMap::new();
-    for path in &files {
+    let mut bytes_done = 0u64;
+    for (files_done, path) in files.iter().enumerate() {
         let rel = rel_path(root, path)?;
         let meta = fs::symlink_metadata(path)?;
         let size = meta.len();
@@ -131,6 +180,9 @@ fn scan_tree(
         }
         manifest.files.push(FileEntry { path: rel.clone(), size, root: list.root(), mode: mode_of(&meta) });
         chunk_lists.insert(rel, list);
+
+        bytes_done += size;
+        on_progress(ScanProgress { files_done: files_done + 1, files_total, bytes_done, bytes_total });
     }
 
     manifest.canonicalize();

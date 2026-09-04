@@ -472,6 +472,22 @@ impl Gaggle {
         self.set_notice("Settings saved", cx);
     }
 
+    pub(crate) fn toggle_persist_shares(&mut self, cx: &mut Context<Self>) {
+        let next = !self.state.settings.persist_shares;
+        // Reflect it locally right away, same as `set_theme` — the manager's
+        // echo would otherwise take a poll cycle to show the new state.
+        self.state.settings.persist_shares = next;
+        self.app.update_settings(Settings { persist_shares: next, ..self.state.settings.clone() });
+        self.set_notice(
+            if next {
+                "Shares & transfers will be remembered across restarts"
+            } else {
+                "Shares & transfers will no longer be remembered"
+            },
+            cx,
+        );
+    }
+
     pub(crate) fn run_benchmark(&mut self, cx: &mut Context<Self>) {
         self.app.benchmark();
         self.set_notice("Benchmarking the download volume…", cx);

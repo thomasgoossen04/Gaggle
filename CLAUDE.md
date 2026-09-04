@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Keep `README.md` current.** It's the user-facing overview + quick-start guide (what
+Gaggle is, its feature list, install/build instructions, and short usage walkthroughs for
+sharing/joining/accelerating). Whenever a change here would change what a user reads
+there — a new or renamed feature, a changed install/release flow, a different GUI
+workflow for something the README walks through — update `README.md` in the same change.
+It stays high-level and user-facing; this file stays the detailed dev-facing one.
+
 ## What this is
 
 Gaggle is a hybrid-P2P application for sharing very large folders (100GB+, e.g. modded

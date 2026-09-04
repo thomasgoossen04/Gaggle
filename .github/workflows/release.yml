@@ -56,7 +56,7 @@ jobs:
             libwayland-dev libvulkan-dev
 
       - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} -p gui -p launcher
+        run: cargo build --release --locked --target ${{ matrix.target }} -p gui -p launcher -p accelerator
 
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
@@ -74,6 +74,12 @@ jobs:
           cp "$BIN/gaggle-launcher" "$STANDALONE"
           shasum -a 256 "$STANDALONE" | awk '{print $1}' > "$STANDALONE.sha256"
 
+          # And the headless accelerator daemon, standalone — the common case
+          # is pulling it straight onto a server with curl, not the GUI zip.
+          ACCEL="dist/gaggle-accelerator-${{ matrix.name }}"
+          cp "$BIN/accelerator" "$ACCEL"
+          shasum -a 256 "$ACCEL" | awk '{print $1}' > "$ACCEL.sha256"
+
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -89,6 +95,11 @@ jobs:
           $standalone = "dist/gaggle-launcher-${{ matrix.name }}.exe"
           Copy-Item "$bin/gaggle-launcher.exe" $standalone
           (Get-FileHash $standalone -Algorithm SHA256).Hash.ToLower() | Out-File -NoNewline "$standalone.sha256"
+
+          # And the headless accelerator daemon, standalone.
+          $accel = "dist/gaggle-accelerator-${{ matrix.name }}.exe"
+          Copy-Item "$bin/accelerator.exe" $accel
+          (Get-FileHash $accel -Algorithm SHA256).Hash.ToLower() | Out-File -NoNewline "$accel.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -158,4 +169,5 @@ jobs:
             dist/*.zip
             dist/*.zip.sha256
             dist/gaggle-launcher-*
+            dist/gaggle-accelerator-*
             dist/latest.json

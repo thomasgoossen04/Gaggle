@@ -5,8 +5,8 @@ use std::fs;
 use std::path::Path;
 
 use gaggle_core::{
-    DiskChunkStore, Manifest, MemoryChunkStore, SourceChunkStore, index_dir, snapshot_dir,
-    sync_share, write_share,
+    DiskChunkStore, Manifest, MemoryChunkStore, ScanProgress, SourceChunkStore, index_dir,
+    index_dir_with_progress, snapshot_dir, sync_share, write_share,
 };
 
 /// Deterministic pseudo-random bytes (splitmix64).
@@ -250,4 +250,42 @@ fn sync_share_applies_only_the_delta_to_an_existing_tree() {
     let mut check = MemoryChunkStore::new();
     let again = snapshot_dir(out.path(), "share", 2, &mut check).unwrap();
     assert_eq!(again.manifest.id(), v2.manifest.id());
+}
+
+#[test]
+fn index_dir_with_progress_reports_stable_totals_and_ends_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "a.bin", &pattern(3 * 1024 * 1024, 1));
+    write(root, "b.bin", &pattern(1024 * 1024, 2));
+    write(root, "c.bin", &pattern(512 * 1024, 3));
+
+    let mut updates: Vec<ScanProgress> = Vec::new();
+    let idx = index_dir_with_progress(root, "share", 1, |p| updates.push(p)).unwrap();
+
+    // At least the up-front totals call plus one per file.
+    assert!(updates.len() >= 4, "{updates:?}");
+
+    let first = updates[0];
+    assert_eq!(first.files_done, 0);
+    assert_eq!(first.bytes_done, 0);
+    assert_eq!(first.files_total, 3);
+    let bytes_total = first.bytes_total;
+    assert_eq!(bytes_total, 3 * 1024 * 1024 + 1024 * 1024 + 512 * 1024);
+
+    // Totals never change mid-scan; done counters only grow.
+    let mut last = first;
+    for p in &updates[1..] {
+        assert_eq!(p.files_total, 3);
+        assert_eq!(p.bytes_total, bytes_total);
+        assert!(p.files_done >= last.files_done);
+        assert!(p.bytes_done >= last.bytes_done);
+        last = *p;
+    }
+
+    // The final update reports everything done, matching the finished scan.
+    let last = *updates.last().unwrap();
+    assert_eq!(last.files_done, 3);
+    assert_eq!(last.bytes_done, bytes_total);
+    assert_eq!(last.bytes_done, idx.manifest.files.iter().map(|f| f.size).sum::<u64>());
 }

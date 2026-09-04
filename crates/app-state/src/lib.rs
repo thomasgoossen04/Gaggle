@@ -10,6 +10,7 @@
 //! Nothing here depends on `gpui`; the `gui` crate is a thin renderer on top.
 
 mod manager;
+mod persist;
 mod settings;
 mod state;
 
