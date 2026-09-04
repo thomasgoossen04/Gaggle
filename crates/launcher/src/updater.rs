@@ -5,14 +5,16 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 use crate::channel::Channel;
+use crate::desktop;
 use crate::manifest::{Asset, Manifest, platform_key};
 use crate::paths;
 
@@ -90,7 +92,11 @@ pub struct Installed {
 
 /// Pure decision. Commit hashes aren't ordered, so *any* version difference — or
 /// a channel switch — is treated as a newer/needed release.
-pub fn decide(installed: Option<&Installed>, remote_version: &str, remote_channel: Channel) -> Status {
+pub fn decide(
+    installed: Option<&Installed>,
+    remote_version: &str,
+    remote_channel: Channel,
+) -> Status {
     match installed {
         None => Status::NotInstalled {
             version: remote_version.to_string(),
@@ -124,12 +130,24 @@ pub fn installed_record() -> Option<Installed> {
 /// Fetch + parse the descriptor. Accepts `http(s)://…`, `file://<path>`, or a
 /// bare local path (the last two for local testing).
 pub fn fetch_manifest(url: &str) -> Result<Manifest> {
+    fetch_manifest_with_timeout(url, None)
+}
+
+/// Like [`fetch_manifest`], but with an optional request timeout — used for
+/// the pre-launch "should we auto-launch?" probe so a slow/dead network can't
+/// hang what should feel like an instant open.
+fn fetch_manifest_with_timeout(url: &str, timeout: Option<Duration>) -> Result<Manifest> {
     let raw = if let Some(path) = url.strip_prefix("file://") {
         std::fs::read_to_string(path).with_context(|| format!("read {path}"))?
     } else if !url.contains("://") {
         std::fs::read_to_string(url).with_context(|| format!("read {url}"))?
     } else {
-        ureq::get(url)
+        let agent = match timeout {
+            Some(t) => ureq::AgentBuilder::new().timeout(t).build(),
+            None => ureq::agent(),
+        };
+        agent
+            .get(url)
             .call()
             .with_context(|| format!("GET {url}"))?
             .into_string()
@@ -144,6 +162,8 @@ pub struct Updater {
     state: Arc<Mutex<Status>>,
     url: String,
     channel: Channel,
+    /// The user's "create desktop shortcut" opt-in, read by `install_blocking`.
+    desktop_shortcut: Arc<AtomicBool>,
 }
 
 impl Updater {
@@ -153,6 +173,7 @@ impl Updater {
             state: Arc::new(Mutex::new(Status::Idle)),
             url: channel.manifest_url().to_string(),
             channel,
+            desktop_shortcut: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -163,6 +184,7 @@ impl Updater {
             state: Arc::new(Mutex::new(Status::Idle)),
             url,
             channel: Channel::Stable,
+            desktop_shortcut: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -171,17 +193,27 @@ impl Updater {
         self.channel
     }
 
+    /// Opt in (or out) of creating a desktop shortcut on the next install.
+    /// The apps-menu / Start Menu entry is always created regardless.
+    pub fn set_desktop_shortcut(&self, wanted: bool) {
+        self.desktop_shortcut.store(wanted, Ordering::Relaxed);
+    }
+
     /// Fetch + parse the descriptor for this updater's URL.
     pub fn fetch(&self) -> Result<Manifest> {
         fetch_manifest(&self.url)
     }
 
+    /// Like [`Updater::fetch`], but bounded to a few seconds — used for the
+    /// pre-launch "is this still current?" probe, which should never make a
+    /// dead network stall opening the app.
+    pub fn fetch_quick(&self) -> Result<Manifest> {
+        fetch_manifest_with_timeout(&self.url, Some(Duration::from_secs(4)))
+    }
+
     /// Current status (cloned).
     pub fn state(&self) -> Status {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn set(&self, s: Status) {
@@ -195,8 +227,7 @@ impl Updater {
             this.set(Status::Checking);
             match fetch_manifest(&this.url) {
                 Ok(m) => {
-                    let mut st =
-                        decide(installed_record().as_ref(), &m.version, this.channel);
+                    let mut st = decide(installed_record().as_ref(), &m.version, this.channel);
                     if let Status::UpdateAvailable { notes, .. } = &mut st {
                         *notes = m.notes.clone();
                     }
@@ -230,6 +261,16 @@ impl Updater {
         let res = install_archive(&archive, &m.version, self.channel);
         let _ = std::fs::remove_file(&archive);
         res?;
+
+        let opts = desktop::Shortcuts {
+            desktop: self.desktop_shortcut.load(Ordering::Relaxed),
+        };
+        if let Ok(bin) = paths::installed_launcher()
+            && let Err(e) = desktop::install(&bin, opts)
+        {
+            eprintln!("warning: could not create shortcuts: {e}");
+        }
+
         Ok(m.version)
     }
 
@@ -250,6 +291,32 @@ impl Updater {
     }
 }
 
+/// Spawn the installed GUI with no window/status bookkeeping — the silent
+/// hand-off path `main.rs` takes when there's nothing for the launcher to show.
+pub fn launch_installed() -> Result<()> {
+    launch_gui()
+}
+
+/// Should `gaggle-launcher run` skip its window and go straight to the GUI?
+///
+/// Pure and unit-tested: `fetched` is `None` for "the update check failed"
+/// (treated as offline — launch whatever's on disk) and `Some(status)` for
+/// "the check succeeded, and here's what `decide` made of it".
+pub fn wants_auto_launch(
+    installed_present: bool,
+    gui_present: bool,
+    fetched: Option<Status>,
+) -> bool {
+    if !installed_present || !gui_present {
+        return false;
+    }
+    match fetched {
+        None => true,
+        Some(Status::UpToDate { .. }) => true,
+        Some(_) => false,
+    }
+}
+
 /// Stream `asset.url` to a temp file, hashing as it goes; verify the SHA-256.
 fn download_to_temp(asset: &Asset, progress: &dyn Fn(u64, u64)) -> Result<PathBuf> {
     let resp = ureq::get(&asset.url)
@@ -261,8 +328,8 @@ fn download_to_temp(asset: &Asset, progress: &dyn Fn(u64, u64)) -> Result<PathBu
         .unwrap_or(asset.size);
 
     let path = std::env::temp_dir().join(format!("gaggle-dl-{}.zip", std::process::id()));
-    let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("create {}", path.display()))?;
+    let mut file =
+        std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
     let mut reader = resp.into_reader();
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -321,7 +388,9 @@ fn extract_into(zip_path: &Path, dir: &Path) -> Result<usize> {
         if entry.is_dir() {
             continue;
         }
-        let Some(name) = entry.enclosed_name().and_then(|p| p.file_name().map(|f| f.to_owned()))
+        let Some(name) = entry
+            .enclosed_name()
+            .and_then(|p| p.file_name().map(|f| f.to_owned()))
         else {
             continue;
         };
@@ -331,8 +400,8 @@ fn extract_into(zip_path: &Path, dir: &Path) -> Result<usize> {
             let _ = std::fs::remove_file(&old);
             let _ = std::fs::rename(&dest, &old);
         }
-        let mut out = std::fs::File::create(&dest)
-            .with_context(|| format!("create {}", dest.display()))?;
+        let mut out =
+            std::fs::File::create(&dest).with_context(|| format!("create {}", dest.display()))?;
         std::io::copy(&mut entry, &mut out)?;
         #[cfg(unix)]
         {
@@ -407,18 +476,54 @@ mod tests {
             Status::NotInstalled { .. }
         ));
         assert!(matches!(
-            decide(Some(&rec("2.0.abc1234", "stable")), "2.0.abc1234", Channel::Stable),
+            decide(
+                Some(&rec("2.0.abc1234", "stable")),
+                "2.0.abc1234",
+                Channel::Stable
+            ),
             Status::UpToDate { .. }
         ));
         assert!(matches!(
-            decide(Some(&rec("2.0.abc1234", "stable")), "2.0.def5678", Channel::Stable),
+            decide(
+                Some(&rec("2.0.abc1234", "stable")),
+                "2.0.def5678",
+                Channel::Stable
+            ),
             Status::UpdateAvailable { .. }
         ));
         // Same version string but a different channel ⇒ a channel switch is an update.
         assert!(matches!(
-            decide(Some(&rec("2.0.abc1234", "stable")), "2.0.abc1234", Channel::Beta),
+            decide(
+                Some(&rec("2.0.abc1234", "stable")),
+                "2.0.abc1234",
+                Channel::Beta
+            ),
             Status::UpdateAvailable { .. }
         ));
+    }
+
+    #[test]
+    fn wants_auto_launch_truth_table() {
+        let up_to_date = Some(Status::UpToDate {
+            version: "2.0.abc".into(),
+        });
+        let update_available = Some(Status::UpdateAvailable {
+            version: "2.0.def".into(),
+            notes: String::new(),
+        });
+
+        // Nothing installed, or GUI binary missing ⇒ never skip the window.
+        assert!(!wants_auto_launch(false, true, up_to_date.clone()));
+        assert!(!wants_auto_launch(true, false, up_to_date.clone()));
+
+        // Installed + up to date ⇒ silent hand-off.
+        assert!(wants_auto_launch(true, true, up_to_date));
+
+        // Installed + the check failed (offline) ⇒ launch what's on disk.
+        assert!(wants_auto_launch(true, true, None));
+
+        // Installed but an update is available ⇒ show the window.
+        assert!(!wants_auto_launch(true, true, update_available));
     }
 
     #[test]
@@ -467,7 +572,10 @@ mod tests {
         assert_eq!(n, 2);
         assert!(dest.join("gaggle-gui").is_file());
         assert!(dest.join("gaggle-launcher").is_file());
-        assert!(!dest.join("nested").exists(), "structure should be flattened");
+        assert!(
+            !dest.join("nested").exists(),
+            "structure should be flattened"
+        );
 
         #[cfg(unix)]
         {

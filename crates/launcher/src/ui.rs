@@ -22,6 +22,7 @@ pub struct Launcher {
     updater: Updater,
     dragging: bool,
     mode: Option<ThemeMode>,
+    desktop_shortcut: bool,
 }
 
 impl Launcher {
@@ -44,13 +45,24 @@ impl Launcher {
             updater,
             dragging: false,
             mode: None,
+            desktop_shortcut: false,
         }
+    }
+
+    /// Flip the "create desktop shortcut" opt-in and forward it to the
+    /// [`Updater`], which reads it at install time.
+    fn toggle_desktop_shortcut(&mut self, cx: &mut Context<Self>) {
+        self.desktop_shortcut = !self.desktop_shortcut;
+        self.updater.set_desktop_shortcut(self.desktop_shortcut);
+        cx.notify();
     }
 
     /// Label + effect of the one primary button for the current status.
     fn primary(&self) -> Option<(&'static str, PrimaryAction)> {
         match self.updater.state() {
-            Status::UpToDate { .. } | Status::Ready { .. } => Some(("Launch", PrimaryAction::Launch)),
+            Status::UpToDate { .. } | Status::Ready { .. } => {
+                Some(("Launch", PrimaryAction::Launch))
+            }
             Status::UpdateAvailable { .. } => Some(("Update now", PrimaryAction::Install)),
             Status::NotInstalled { .. } => Some(("Install", PrimaryAction::Install)),
             Status::Error(_) => Some(("Retry", PrimaryAction::Check)),
@@ -100,7 +112,10 @@ fn bar_frac(status: &Status) -> Option<f32> {
         Status::Installing => Some(0.97),
         Status::Launching => Some(1.0),
         Status::UpToDate { .. } | Status::Ready { .. } => Some(1.0),
-        Status::Idle | Status::NotInstalled { .. } | Status::UpdateAvailable { .. } | Status::Error(_) => None,
+        Status::Idle
+        | Status::NotInstalled { .. }
+        | Status::UpdateAvailable { .. }
+        | Status::Error(_) => None,
     }
 }
 
@@ -155,9 +170,9 @@ impl Render for Launcher {
                                 Channel::Stable => "// GAGGLE UPDATER",
                             }),
                     )
-                    .child(win_btn("win-close", "✕", true).on_click(cx.listener(
-                        |_, _: &ClickEvent, window, _| window.remove_window(),
-                    ))),
+                    .child(win_btn("win-close", "✕", true).on_click(
+                        cx.listener(|_, _: &ClickEvent, window, _| window.remove_window()),
+                    )),
             )
             .child(hazard_bar());
 
@@ -250,9 +265,7 @@ impl Render for Launcher {
                 .text_size(px(9.0))
                 .cursor_pointer()
                 .child(label)
-                .on_click(
-                    cx.listener(move |this, _: &ClickEvent, _, cx| this.set_channel(val, cx)),
-                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_channel(val, cx)))
         };
         let chan_row = div()
             .absolute()
@@ -268,8 +281,61 @@ impl Render for Launcher {
                     .text_color(t.muted)
                     .child("CH"),
             )
-            .child(pill(cx, "ch-stable", "STABLE", Channel::Stable, cur == Channel::Stable))
-            .child(pill(cx, "ch-beta", "BETA", Channel::Beta, cur == Channel::Beta));
+            .child(pill(
+                cx,
+                "ch-stable",
+                "STABLE",
+                Channel::Stable,
+                cur == Channel::Stable,
+            ))
+            .child(pill(
+                cx,
+                "ch-beta",
+                "BETA",
+                Channel::Beta,
+                cur == Channel::Beta,
+            ));
+
+        // Desktop-shortcut opt-in — only meaningful right before an
+        // install/update actually happens (the apps-menu entry is always made).
+        if matches!(
+            status,
+            Status::NotInstalled { .. } | Status::UpdateAvailable { .. }
+        ) {
+            let checked = self.desktop_shortcut;
+            let box_ = div()
+                .size(px(11.0))
+                .border_1()
+                .border_color(if checked { t.accent } else { t.line })
+                .bg(if checked { t.accent } else { t.panel_hi })
+                .when(checked, |d| {
+                    d.flex().items_center().justify_center().child(
+                        div()
+                            .text_size(px(8.0))
+                            .text_color(t.on_accent)
+                            .font_weight(FontWeight::BOLD)
+                            .child("X"),
+                    )
+                });
+            let toggle = div()
+                .id("desktop-shortcut")
+                .flex()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .child(box_)
+                .child(
+                    div()
+                        .font_family("monospace")
+                        .text_size(px(9.0))
+                        .text_color(t.muted)
+                        .child("DESKTOP SHORTCUT"),
+                )
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_desktop_shortcut(cx)),
+                );
+            body = body.child(toggle);
+        }
 
         body = body.child(buttons).child(chan_row).child(
             div()

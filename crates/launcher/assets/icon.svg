@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="48" fill="#14171a"/>
+  <rect x="10" y="10" width="236" height="236" rx="40" fill="none" stroke="#ffb800" stroke-width="6"/>
+  <text x="128" y="168" font-family="'DejaVu Sans Mono', 'Courier New', monospace" font-weight="bold"
+        font-size="120" fill="#ffb800" text-anchor="middle">GG</text>
+</svg>

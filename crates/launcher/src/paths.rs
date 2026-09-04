@@ -30,6 +30,18 @@ pub fn gui_binary() -> Result<PathBuf> {
     Ok(install_dir()?.join(name))
 }
 
+/// The installed launcher executable path (`.exe` on Windows) — the release
+/// zip extracts a copy of `gaggle-launcher` alongside `gaggle-gui`, and
+/// shortcuts point at this copy so they keep working across self-updates.
+pub fn installed_launcher() -> Result<PathBuf> {
+    let name = if cfg!(windows) {
+        "gaggle-launcher.exe"
+    } else {
+        "gaggle-launcher"
+    };
+    Ok(install_dir()?.join(name))
+}
+
 /// `<data-dir>/Gaggle/installed.json` — the record of what version is on disk.
 pub fn installed_json() -> Result<PathBuf> {
     Ok(data_root()?.join("installed.json"))

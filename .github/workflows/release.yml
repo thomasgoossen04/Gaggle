@@ -68,6 +68,12 @@ jobs:
           zip -j "$ARCHIVE" "$BIN/gaggle-gui" "$BIN/gaggle-launcher"
           shasum -a 256 "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
 
+          # Also publish the standalone launcher on its own, so getting the
+          # installer doesn't require unzipping the full app bundle first.
+          STANDALONE="dist/gaggle-launcher-${{ matrix.name }}"
+          cp "$BIN/gaggle-launcher" "$STANDALONE"
+          shasum -a 256 "$STANDALONE" | awk '{print $1}' > "$STANDALONE.sha256"
+
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -77,6 +83,12 @@ jobs:
           $archive = "dist/gaggle-${{ matrix.name }}.zip"
           Compress-Archive -Force -Path "$bin/gaggle-gui.exe","$bin/gaggle-launcher.exe" -DestinationPath $archive
           (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() | Out-File -NoNewline "$archive.sha256"
+
+          # Also publish the standalone launcher on its own, so getting the
+          # installer doesn't require unzipping the full app bundle first.
+          $standalone = "dist/gaggle-launcher-${{ matrix.name }}.exe"
+          Copy-Item "$bin/gaggle-launcher.exe" $standalone
+          (Get-FileHash $standalone -Algorithm SHA256).Hash.ToLower() | Out-File -NoNewline "$standalone.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -145,4 +157,5 @@ jobs:
           files: |
             dist/*.zip
             dist/*.zip.sha256
+            dist/gaggle-launcher-*
             dist/latest.json

@@ -246,7 +246,11 @@ linux-x86_64 / windows-x86_64 / macos-aarch64 / macos-x86_64 (the Intel macOS
 build is cross-compiled on the Apple Silicon runner — no x86_64 macOS runners
 exist), runs
 `.github/scripts/make_latest.py <version> <tag> <channel> dist` to compose `latest.json`,
-and publishes a GitHub Release:
+and publishes a GitHub Release. Alongside each `gaggle-<platform>.zip` (+ `.sha256`) the
+release also carries the **standalone launcher** as its own asset,
+`gaggle-launcher-<platform>[.exe]` (+ `.sha256`) — so getting the installer is a single
+direct download, no unzip needed. `make_latest.py`/`latest.json` are unaffected: the
+self-update descriptor still points at the zips.
 
 | Branch | Version | Tag | Release | Descriptor URL |
 |---|---|---|---|---|
@@ -259,6 +263,22 @@ toggle or `gaggle-launcher --channel beta` (remembered) / `$GAGGLE_UPDATE_CHANNE
 `--manifest-url` / `$GAGGLE_UPDATE_URL` still override the URL entirely. `installed.json`
 records the installed version **and** channel, so flipping channels always shows an
 update. Branch setup: `git branch beta main && git push -u origin beta` once `main` exists.
+
+**Native install (`crates/launcher/src/desktop.rs`)** — on every install/update the
+launcher creates OS-native shortcuts that point at itself (`paths::installed_launcher()`),
+so opening the app from a shortcut always re-checks for updates first: a Linux
+`~/.local/share/applications/gaggle.desktop` apps-menu entry, a Windows Start Menu
+`.lnk` (built via PowerShell's `WScript.Shell` COM object, no extra crate), and a real
+`~/Applications/Gaggle.app` bundle on macOS (a small shim executable + `Info.plist` +
+`.icns`, so the bundle survives self-updates without re-bundling). The apps-menu / Start
+Menu entry is always created; a desktop shortcut is opt-in (`Updater::set_desktop_shortcut`,
+a checkbox in the launcher window, or `gaggle-launcher --desktop-shortcut`). Icons are a
+placeholder "GG" wordmark under `crates/launcher/assets/` (`icon.{svg,png,ico,icns}`,
+`include_bytes!`'d so the *standalone* launcher binary can create shortcuts with no zip
+alongside it). `gaggle-launcher run` (the default, e.g. from a shortcut) silently hands off
+straight to the installed GUI — no window — when it's already the latest version, or when
+the update check fails but something is installed (`updater::wants_auto_launch`, pure and
+unit-tested); otherwise it opens the window as before.
 
 ## Workspace layout & dependency graph
 

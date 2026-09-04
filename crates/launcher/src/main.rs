@@ -4,6 +4,7 @@
 //! main GUI. `check` / `update` are headless for scripting.
 
 mod channel;
+mod desktop;
 mod manifest;
 mod paths;
 mod ui;
@@ -36,6 +37,10 @@ struct Cli {
     /// selected channel's URL).
     #[arg(long, global = true, value_name = "URL")]
     manifest_url: Option<String>,
+    /// Also create a desktop shortcut (the apps-menu / Start Menu entry is
+    /// always created). Only takes effect on an install/update.
+    #[arg(long, global = true)]
+    desktop_shortcut: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -71,15 +76,36 @@ fn main() -> anyhow::Result<()> {
         Some(url) => Updater::with_url(url),
         None => Updater::for_channel(ch),
     };
+    if cli.desktop_shortcut {
+        up.set_desktop_shortcut(true);
+    }
 
     match cli.cmd.unwrap_or(Cmd::Run) {
-        Cmd::Run => {
-            run_window(up);
-            Ok(())
-        }
+        Cmd::Run => run(up),
         Cmd::Check => headless_check(&up),
         Cmd::Update => headless_update(&up),
     }
+}
+
+/// Default entry point: silently hand off to the installed GUI when there's
+/// nothing to show the user (already current, or offline with something
+/// installed); otherwise open the launcher window.
+fn run(up: Updater) -> anyhow::Result<()> {
+    let installed = updater::installed_record();
+    let gui_present = paths::gui_binary().map(|p| p.exists()).unwrap_or(false);
+    let fetched = up
+        .fetch_quick()
+        .ok()
+        .map(|m| updater::decide(installed.as_ref(), &m.version, up.channel()));
+
+    if updater::wants_auto_launch(installed.is_some(), gui_present, fetched)
+        && updater::launch_installed().is_ok()
+    {
+        return Ok(());
+    }
+
+    run_window(up);
+    Ok(())
 }
 
 fn headless_check(up: &Updater) -> anyhow::Result<()> {
