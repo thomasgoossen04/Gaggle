@@ -128,7 +128,7 @@ enum Command {
     Shutdown,
 
     // Internal, from worker tasks.
-    LocalShareReady { id: TransferId, node: Arc<Node>, addr: Multiaddr, info: ShareInfo },
+    LocalShareReady { id: TransferId, node: Arc<Node>, addrs: Vec<Multiaddr>, info: ShareInfo },
     RescanDone {
         id: TransferId,
         manifest_id: Hash,
@@ -432,7 +432,10 @@ struct SeedEntry {
     version: u64,
     name: String,
     manifest_id: Hash,
-    addr: Multiaddr,
+    /// Every dialable address for this share's node, ranked best-first — a
+    /// share link embeds them all so a subscriber on any network (LAN, a VPN
+    /// overlay, same machine) can connect.
+    addrs: Vec<Multiaddr>,
     /// `Some` for a private share — the per-share Ed25519 seed.
     share_seed: Option<[u8; 32]>,
 }
@@ -733,7 +736,7 @@ impl Manager {
             }
             Command::Shutdown => {}
 
-            Command::LocalShareReady { id, node, addr, info } => {
+            Command::LocalShareReady { id, node, addrs, info } => {
                 self.seeds.insert(
                     id,
                     SeedEntry {
@@ -742,7 +745,7 @@ impl Manager {
                         version: info.version,
                         name: info.name.clone(),
                         manifest_id: info.manifest_id,
-                        addr: addr.clone(),
+                        addrs: addrs.clone(),
                         share_seed: info.share_seed,
                     },
                 );
@@ -757,7 +760,8 @@ impl Manager {
                     row.source_dir = Some(info.dir);
                     row.file_paths = Arc::new(info.file_paths);
                     row.status = TransferStatus::Complete;
-                    row.share_addr = Some(addr);
+                    row.share_addr = addrs.first().cloned();
+                    row.share_addrs = addrs;
                 }
                 self.recount();
                 self.persist_shares();
@@ -1201,6 +1205,7 @@ impl Manager {
 
         let tx = self.self_tx.clone();
         let cache_bytes = self.state.settings.seed_cache_bytes;
+        let public_relay = self.state.settings.public_relay.clone();
         tokio::spawn(async move {
             let scan_dir = dir.clone();
             let scan_name = name.clone();
@@ -1243,12 +1248,24 @@ impl Manager {
                     return fail(&tx, id, format!("could not make the share private: {e:#}")).await;
                 }
             }
-            let addr = match node.listen_addr().await {
-                Ok(a) => a,
+            let mut addrs = match node.reachable_addrs().await {
+                Ok(a) if !a.is_empty() => a,
+                Ok(_) => return fail(&tx, id, "no listen address".to_string()).await,
                 Err(e) => return fail(&tx, id, format!("no listen address: {e:#}")).await,
             };
+            if let Some(relay_addr) = &public_relay {
+                match reserve_relay(&node, relay_addr).await {
+                    Ok(circuit) => addrs.push(circuit),
+                    Err(e) => tracing::warn!(
+                        id,
+                        error = %format!("{e:#}"),
+                        "could not reserve a slot on the configured relay; \
+                         share link will only carry local addresses"
+                    ),
+                }
+            }
             let _ = tx
-                .send(Command::LocalShareReady { id, node: Arc::new(node), addr, info })
+                .send(Command::LocalShareReady { id, node: Arc::new(node), addrs, info })
                 .await;
         });
     }
@@ -1328,7 +1345,7 @@ impl Manager {
             cap = cap.expiring_at(exp);
         }
         let invite = Invite::new(kp.public(), seed.manifest_id, seed.name.clone(), kp.issue(cap));
-        let token = ShareLink::new(seed.name.clone(), seed.manifest_id, vec![seed.addr.clone()])
+        let token = ShareLink::new(seed.name.clone(), seed.manifest_id, seed.addrs.clone())
             .with_invite(invite)
             .encode();
         self.state.minted_invite = Some(MintedInvite { transfer: id, token });
@@ -1659,6 +1676,7 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
         speed_bps: 0,
         sources: Vec::new(),
         share_addr: None,
+        share_addrs: Vec::new(),
         output_dir: None,
         error: None,
         version: 0,
@@ -1671,6 +1689,21 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
 
 async fn fail(tx: &mpsc::Sender<Command>, id: TransferId, error: String) {
     let _ = tx.send(Command::WorkerFailed { id, error }).await;
+}
+
+/// Reserve a circuit slot on the relay at `relay_addr` (a `…/p2p/<id>`
+/// multiaddr, [`Settings::public_relay`](crate::Settings::public_relay)) and
+/// return the resulting `/p2p-circuit/…/p2p/<self>` address — dialable even
+/// when `node` sits behind a NAT with no other path reachable from a
+/// subscriber, with dcutr opportunistically upgrading to a direct connection
+/// once both sides have connected through the relay.
+async fn reserve_relay(node: &Node, relay_addr: &str) -> anyhow::Result<Multiaddr> {
+    let addr: Multiaddr = relay_addr.trim().parse()?;
+    // `bootstrap` both dials the relay (blocking until the connection is
+    // live — the reservation needs one) and joins its DHT, so the origin
+    // also becomes discoverable through the relay's bootstrap/rendezvous role.
+    let relay = node.bootstrap(addr.clone()).await?;
+    node.reserve_relay_slot(relay, addr).await
 }
 
 /// A throttled [`index_dir_with_progress`] callback that forwards
@@ -1717,10 +1750,7 @@ async fn run_download(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
 
-    let mut peers = Vec::with_capacity(req.sources.len());
-    for addr in &req.sources {
-        peers.push(node.connect(addr.clone()).await?);
-    }
+    let peers = node.connect_all(&req.sources).await?;
     if let Some(cred) = &req.credential {
         node.authenticate_all(&peers, cred).await?;
     }
@@ -1785,10 +1815,7 @@ async fn run_resync(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
 
-    let mut peers = Vec::with_capacity(req.sources.len());
-    for addr in &req.sources {
-        peers.push(node.connect(addr.clone()).await?);
-    }
+    let peers = node.connect_all(&req.sources).await?;
     if let Some(cred) = &req.credential {
         node.authenticate_all(&peers, cred).await?;
     }

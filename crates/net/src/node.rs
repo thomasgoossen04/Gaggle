@@ -185,17 +185,24 @@ impl Node {
         Ok(rx.await?)
     }
 
-    /// The best listen address (LAN/WAN-reachable if the node has one, else
-    /// loopback) with this node's `/p2p/<id>` appended — the form to hand to
-    /// another node.
-    pub async fn listen_addr(&self) -> anyhow::Result<Multiaddr> {
-        let p2p = Protocol::P2p(self.peer_id);
+    /// Every listen address this node has, each with `/p2p/<id>` appended,
+    /// ranked best-first (a real LAN address, then any other reachable one —
+    /// a public IP or a VPN overlay like Tailscale — then loopback last). A
+    /// share link embeds the whole list so a subscriber on any of those
+    /// networks can connect, instead of gambling on one guessed-best address.
+    pub async fn reachable_addrs(&self) -> anyhow::Result<Vec<Multiaddr>> {
         let mut addrs = self.listen_addrs().await?;
         crate::prefer_reachable(&mut addrs);
-        addrs
+        Ok(addrs.into_iter().map(|a| a.with(Protocol::P2p(self.peer_id))).collect())
+    }
+
+    /// The single best listen address (LAN/WAN-reachable if the node has one,
+    /// else loopback) with this node's `/p2p/<id>` appended.
+    pub async fn listen_addr(&self) -> anyhow::Result<Multiaddr> {
+        self.reachable_addrs()
+            .await?
             .into_iter()
             .next()
-            .map(|addr| addr.with(p2p))
             .ok_or_else(|| anyhow::anyhow!("node has no listen address yet"))
     }
 
@@ -207,6 +214,24 @@ impl Node {
             .ok_or_else(|| anyhow::anyhow!("address {addr} has no /p2p/<peer-id>"))?;
         self.add_peer_address(peer, addr).await?;
         Ok(peer)
+    }
+
+    /// [`connect`](Self::connect) every address in `addrs` — a share link may
+    /// list several for the same origin (LAN, VPN overlay, loopback) so a
+    /// subscriber can reach it from whatever network it is actually on — and
+    /// return the distinct peer ids named, in first-seen order. A later dial
+    /// tries every address registered for a peer, so listing more addresses
+    /// only adds fallback paths, never a wrong pick.
+    pub async fn connect_all(&self, addrs: &[Multiaddr]) -> anyhow::Result<Vec<PeerId>> {
+        let mut seen = HashSet::new();
+        let mut peers = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let peer = self.connect(addr.clone()).await?;
+            if seen.insert(peer) {
+                peers.push(peer);
+            }
+        }
+        Ok(peers)
     }
 
     /// Connect to a bootstrap node (its multiaddr must carry `/p2p/<id>`), add it
@@ -883,10 +908,13 @@ impl EventLoop {
     }
 }
 
+/// The peer this address actually names — the *last* `/p2p/<id>` component,
+/// since a relay circuit address carries two (`/p2p/<relay>/p2p-circuit/p2p/<target>`)
+/// and the final one is always the real dial target.
 fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|p| match p {
+    addr.iter().fold(None, |acc, p| match p {
         Protocol::P2p(id) => Some(id),
-        _ => None,
+        _ => acc,
     })
 }
 

@@ -1008,6 +1008,25 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         )
         .child(
             card()
+                .child(section_title("Reachability"))
+                .child(field("Public relay p2p address", &app.set_relay))
+                .child(
+                    div().mt_1().flex().child(
+                        primary_btn("apply-settings-relay", "Save settings").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.apply_settings(cx)),
+                        ),
+                    ),
+                )
+                .child(hint(
+                    "A relay's dialable …/p2p/<id> address (e.g. one you run on a public \
+                     VPS with `accelerator run --role relay`). When set, every share this \
+                     node creates also reserves a slot on it and adds that address to the \
+                     link, so it stays dialable even from a network with no path to this \
+                     machine directly. Leave blank for LAN/VPN-only sharing.",
+                )),
+        )
+        .child(
+            card()
                 .child(section_title("In effect"))
                 .child(kv("Folder", s.download_dir.display().to_string()))
                 .child(kv("Download cap", cap(s.download_cap_bps)))
@@ -1020,6 +1039,10 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                         Some(v) => format!("every {} min", v / 60),
                         None => "off".into(),
                     },
+                ))
+                .child(kv(
+                    "Public relay",
+                    s.public_relay.clone().unwrap_or_else(|| "not set".into()),
                 )),
         )
         .child(hint(

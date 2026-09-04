@@ -57,19 +57,39 @@ pub use transfer::{DownloadedShare, fetch_manifest_and_lists, fetch_share};
 /// this still yields a loopback listener too — same-machine use keeps working).
 pub(crate) const LISTEN_QUIC: &str = "/ip4/0.0.0.0/udp/0/quic-v1";
 
-/// Sort `addrs` so a LAN/WAN-reachable address sorts before a loopback one.
-/// Used to pick the address handed to a remote peer (an invite link, a
-/// relay's advertised address) when a node listens on every interface.
+/// Sort `addrs` best-reachable-first: a real private-LAN address, then any
+/// other non-loopback address (public IPs, VPN overlays like Tailscale's
+/// `100.64.0.0/10` CGNAT range), then link-local, then loopback last. Used to
+/// pick the address handed to a remote peer (an invite link, a relay's
+/// advertised address) when a node listens on every interface — favouring the
+/// plain LAN address means a same-network transfer doesn't accidentally route
+/// through an overlay network the other side may not have reachable.
 pub(crate) fn prefer_reachable(addrs: &mut [Multiaddr]) {
-    addrs.sort_by_key(|a| if is_loopback(a) { 1u8 } else { 0u8 });
+    addrs.sort_by_key(addr_rank);
 }
 
-fn is_loopback(addr: &Multiaddr) -> bool {
-    addr.iter().any(|p| match p {
-        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_loopback(),
-        libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback(),
-        _ => false,
-    })
+fn addr_rank(addr: &Multiaddr) -> u8 {
+    addr.iter()
+        .find_map(|p| match p {
+            libp2p::multiaddr::Protocol::Ip4(ip) => Some(if ip.is_loopback() {
+                3
+            } else if ip.is_link_local() {
+                2
+            } else if ip.is_private() {
+                0
+            } else {
+                1
+            }),
+            libp2p::multiaddr::Protocol::Ip6(ip) => Some(if ip.is_loopback() {
+                3
+            } else if (ip.segments()[0] & 0xfe00) == 0xfc00 {
+                0 // unique local, fc00::/7
+            } else {
+                1
+            }),
+            _ => None,
+        })
+        .unwrap_or(1)
 }
 
 /// The DHT key a share is announced and discovered under: the manifest's
@@ -187,4 +207,22 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// One-line status string for the accelerator daemon's start-up log.
 pub fn describe() -> &'static str {
     "net: libp2p QUIC + Kademlia DHT + relay/dcutr + rarest-first swarm + hot-cache + invite ACLs"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefer_reachable_ranks_lan_before_overlay_before_loopback() {
+        let loopback: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+        let tailscale: Multiaddr = "/ip4/100.88.1.2/udp/4001/quic-v1".parse().unwrap();
+        let lan: Multiaddr = "/ip4/192.168.1.23/udp/4001/quic-v1".parse().unwrap();
+        let link_local: Multiaddr = "/ip4/169.254.1.2/udp/4001/quic-v1".parse().unwrap();
+
+        let mut addrs = vec![loopback.clone(), tailscale.clone(), link_local.clone(), lan.clone()];
+        prefer_reachable(&mut addrs);
+
+        assert_eq!(addrs, vec![lan, tailscale, link_local, loopback]);
+    }
 }

@@ -122,6 +122,8 @@ pub struct Gaggle {
     pub(crate) set_resync: Entity<InputState>,
     /// Seed hot-chunk cache budget, in MiB.
     pub(crate) set_seed_cache: Entity<InputState>,
+    /// A relay's `…/p2p/<id>` address — see [`Settings::public_relay`].
+    pub(crate) set_relay: Entity<InputState>,
     // Accelerator form.
     pub(crate) accel_cache: Entity<InputState>,
     pub(crate) accel_link: Entity<InputState>,
@@ -164,6 +166,7 @@ impl Gaggle {
         let set_store = num(cx, window, fmt_size_gib(s.storage_cap_bytes), decimal);
         let set_resync = num(cx, window, fmt_minutes(s.auto_resync_secs), integer.clone());
         let set_seed_cache = num(cx, window, fmt_size_mib(s.seed_cache_bytes), integer.clone());
+        let set_relay = text(cx, window, s.public_relay.clone().unwrap_or_default());
         let accel_cache = num(cx, window, "256".into(), integer);
         let accel_link = text(cx, window, String::new());
         let accel_dir = text(cx, window, String::new());
@@ -209,6 +212,7 @@ impl Gaggle {
             set_store,
             set_resync,
             set_seed_cache,
+            set_relay,
             accel_cache,
             accel_link,
             accel_dir,
@@ -391,15 +395,16 @@ impl Gaggle {
     }
 
     pub(crate) fn copy_link(&mut self, row: &TransferRow, cx: &mut Context<Self>) {
-        let Some(addr) = row.share_addr.clone() else {
+        if row.share_addrs.is_empty() {
             self.set_notice("Share is still coming online — try again in a moment", cx);
             return;
-        };
+        }
         if row.private {
             self.set_notice("Private share — mint an invite from the row's ▸ panel", cx);
             return;
         }
-        let link = ShareLink::new(row.name.clone(), row.manifest_id, vec![addr]).encode();
+        let link =
+            ShareLink::new(row.name.clone(), row.manifest_id, row.share_addrs.clone()).encode();
         self.copy_text(link, "Share link copied to clipboard", cx);
     }
 
@@ -457,6 +462,7 @@ impl Gaggle {
         let store = parse_size_gib(&self.set_store.read(cx).value());
         let resync = parse_minutes(&self.set_resync.read(cx).value());
         let seed_cache = parse_size_mib(&self.set_seed_cache.read(cx).value());
+        let relay = self.set_relay.read(cx).value().trim().to_string();
 
         let mut next = self.state.settings.clone();
         if !dir.trim().is_empty() {
@@ -468,6 +474,7 @@ impl Gaggle {
         next.auto_resync_secs = resync;
         // Blank / unparseable keeps the current budget (core enforces a floor).
         next.seed_cache_bytes = seed_cache.unwrap_or(self.state.settings.seed_cache_bytes);
+        next.public_relay = if relay.is_empty() { None } else { Some(relay) };
         self.app.update_settings(next);
         self.set_notice("Settings saved", cx);
     }

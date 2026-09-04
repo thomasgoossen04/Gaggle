@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::Context;
 use gaggle_core::{ChunkStore, DiskChunkStore, Hash};
 
-use crate::{Catalog, Keypair, Multiaddr, Node, RelayNode, ShareLink};
+use crate::{Catalog, Keypair, Node, RelayNode, ShareLink};
 
 /// What a caller needs to show for an accelerated share.
 #[derive(Debug, Clone)]
@@ -31,12 +31,10 @@ pub async fn relay_add_share(
 ) -> anyhow::Result<ShareMeta> {
     anyhow::ensure!(!link.sources.is_empty(), "share link names no sources");
 
-    let mut upstream_ids = Vec::with_capacity(link.sources.len());
     for addr in &link.sources {
-        let addr: Multiaddr = addr.clone();
         relay.add_upstream(addr.clone()).await?;
-        upstream_ids.push(meta.connect(addr).await?);
     }
+    let upstream_ids = meta.connect_all(&link.sources).await?;
     if let Some(cred) = link.credential() {
         meta.authenticate_all(&upstream_ids, cred).await?;
     }
@@ -83,10 +81,7 @@ pub async fn nas_add_share(
     anyhow::ensure!(!link.sources.is_empty(), "share link names no sources");
 
     let scratch = Node::spawn().await?;
-    let mut peers = Vec::with_capacity(link.sources.len());
-    for addr in &link.sources {
-        peers.push(scratch.connect(addr.clone()).await?);
-    }
+    let peers = scratch.connect_all(&link.sources).await?;
     if let Some(cred) = link.credential() {
         scratch.authenticate_all(&peers, cred).await?;
     }

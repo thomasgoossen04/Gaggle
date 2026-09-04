@@ -87,6 +87,10 @@ pub struct TransferRow {
     pub sources: Vec<SourceStats>,
     /// For a seed: a dialable `/quic-v1/…/p2p/<id>` address to hand out.
     pub share_addr: Option<Multiaddr>,
+    /// For a seed: every dialable address (LAN, VPN overlay, loopback),
+    /// ranked best-first — what a share link actually embeds, so a
+    /// subscriber on any of those networks can connect.
+    pub share_addrs: Vec<Multiaddr>,
     /// For a completed download: where the files were written.
     pub output_dir: Option<PathBuf>,
     pub error: Option<String>,

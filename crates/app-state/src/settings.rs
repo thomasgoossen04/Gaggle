@@ -62,6 +62,16 @@ pub struct Settings {
     /// should start empty every time.
     #[serde(default = "default_persist_shares")]
     pub persist_shares: bool,
+    /// A relay's dialable `…/p2p/<id>` address (e.g. one running on a public
+    /// VPS via `accelerator run --role relay --listen /ip4/0.0.0.0/udp/4001/quic-v1`).
+    /// When set, every local share this node creates also reserves a circuit
+    /// slot on it and adds that `/p2p-circuit` address to the share link — so
+    /// the link is dialable even when this machine is behind a NAT with no
+    /// shared network path to the recipient, with dcutr opportunistically
+    /// upgrading to a direct connection. `None` skips this (LAN/VPN-only
+    /// reachability, same as before).
+    #[serde(default)]
+    pub public_relay: Option<String>,
 }
 
 /// A remote accelerator daemon registered in Settings — its admin URL and the
@@ -90,6 +100,7 @@ impl Default for Settings {
             auto_resync_secs: None,
             remote_accelerators: Vec::new(),
             persist_shares: default_persist_shares(),
+            public_relay: None,
         }
     }
 }

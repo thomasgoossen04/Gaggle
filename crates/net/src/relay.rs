@@ -169,16 +169,21 @@ impl RelayNode {
         Ok(rx.await?)
     }
 
+    /// Every dialable `/quic-v1/p2p/<id>` listen address, ranked best-first
+    /// (LAN, then any other reachable address, then loopback last).
+    pub async fn reachable_addrs(&self) -> anyhow::Result<Vec<Multiaddr>> {
+        let mut addrs = self.listen_addrs().await?;
+        crate::prefer_reachable(&mut addrs);
+        Ok(addrs.into_iter().map(|a| a.with(Protocol::P2p(self.peer_id))).collect())
+    }
+
     /// The best dialable `/quic-v1/p2p/<id>` listen address (LAN/WAN-reachable
     /// if the relay has one, else loopback), if any.
     pub async fn listen_addr(&self) -> anyhow::Result<Multiaddr> {
-        let p2p = Protocol::P2p(self.peer_id);
-        let mut addrs = self.listen_addrs().await?;
-        crate::prefer_reachable(&mut addrs);
-        addrs
+        self.reachable_addrs()
+            .await?
             .into_iter()
             .next()
-            .map(|a| a.with(p2p))
             .ok_or_else(|| anyhow::anyhow!("relay has no listen address yet"))
     }
 

@@ -9,6 +9,7 @@ use app_state::{
     AcceleratorRequest, AcceleratorRole, App, AppEvent, AppState, Scope, Settings, ShareLink,
     SubscribeRequest, TransferStatus,
 };
+use net::RelayNode;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -861,4 +862,62 @@ async fn a_registered_remote_accelerator_shows_up_and_reports_unreachable() {
     // Persisted to settings.
     let reloaded = Settings::load(&dir.path().join("settings.json")).unwrap();
     assert!(reloaded.remote_accelerators.iter().any(|r| r.label == "vps"));
+}
+
+/// With `Settings::public_relay` configured, a new share reserves a circuit
+/// slot on it and the link carries that `/p2p-circuit` address alongside the
+/// local ones. Subscribing with *only* that address (as if the two nodes
+/// shared no network path at all) still completes the transfer — the whole
+/// point of the setting.
+#[tokio::test]
+async fn a_share_reachable_only_through_a_public_relay_still_completes() {
+    let relay = RelayNode::spawn().await.unwrap();
+    let relay_addr = relay.listen_addr().await.unwrap().to_string();
+
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.update_settings(Settings { public_relay: Some(relay_addr), ..Settings::default() });
+    wait_for(&seeder, 5, |s| s.settings.public_relay.is_some()).await;
+    seeder.add_local_share(folder.path());
+
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| {
+            r.status == TransferStatus::Complete
+                && r.share_addrs.iter().any(|a| a.to_string().contains("p2p-circuit"))
+        })
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let circuit = seed
+        .share_addrs
+        .iter()
+        .find(|a| a.to_string().contains("p2p-circuit"))
+        .cloned()
+        .expect("no relay circuit address in the share link");
+    let manifest_id = seed.manifest_id;
+    let seed_bytes = seed.total_bytes;
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    // Only the relay circuit address — proves the transfer does not depend on
+    // the direct LAN/loopback address also being in the link.
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![circuit],
+        credential: None,
+    });
+
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    assert_eq!(row.done_bytes, row.total_bytes);
+    assert_eq!(row.total_bytes, seed_bytes);
+
+    let output = row.output_dir.clone().unwrap();
+    dir_matches(folder.path(), &output);
+
+    relay.shutdown().await;
 }
