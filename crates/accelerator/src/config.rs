@@ -72,8 +72,9 @@ impl Home {
 #[serde(default)]
 pub struct AcceleratorConfig {
     pub role: Role,
-    /// Multiaddr to listen on. Empty = ephemeral loopback (dev). Use
-    /// `/ip4/0.0.0.0/udp/4001/quic-v1` for a reachable daemon.
+    /// Multiaddr to listen on. Empty = ephemeral port on every local
+    /// interface. Set e.g. `/ip4/0.0.0.0/udp/4001/quic-v1` for a stable port
+    /// to open in a firewall/router.
     pub listen: String,
     /// `host:port` for the admin HTTP API.
     pub admin_listen: String,

@@ -122,7 +122,7 @@ impl Node {
     /// [`spawn_serving`](Self::spawn_serving) with an optional persistent
     /// identity and an optional explicit listen [`Multiaddr`] (e.g.
     /// `/ip4/0.0.0.0/udp/4001/quic-v1` for a public daemon). `None` for either
-    /// keeps the default (fresh key / ephemeral loopback).
+    /// keeps the default (fresh key / ephemeral port on every interface).
     pub async fn spawn_serving_with(
         catalog: Catalog,
         keypair: Option<crate::Keypair>,
@@ -185,12 +185,14 @@ impl Node {
         Ok(rx.await?)
     }
 
-    /// The first listen address with this node's `/p2p/<id>` appended — the form
-    /// to hand to another node.
+    /// The best listen address (LAN/WAN-reachable if the node has one, else
+    /// loopback) with this node's `/p2p/<id>` appended — the form to hand to
+    /// another node.
     pub async fn listen_addr(&self) -> anyhow::Result<Multiaddr> {
         let p2p = Protocol::P2p(self.peer_id);
-        self.listen_addrs()
-            .await?
+        let mut addrs = self.listen_addrs().await?;
+        crate::prefer_reachable(&mut addrs);
+        addrs
             .into_iter()
             .next()
             .map(|addr| addr.with(p2p))

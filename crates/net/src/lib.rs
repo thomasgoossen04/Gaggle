@@ -50,8 +50,27 @@ pub use swarm::{
 };
 pub use transfer::{DownloadedShare, fetch_manifest_and_lists, fetch_share};
 
-/// The loopback QUIC address every node listens on (port chosen by the OS).
-pub(crate) const LISTEN_QUIC: &str = "/ip4/127.0.0.1/udp/0/quic-v1";
+/// The default QUIC listen address (port chosen by the OS): every local
+/// interface, not just loopback, so a `Node`/`RelayNode` started with no
+/// explicit `listen` is reachable from the LAN out of the box (libp2p-quic
+/// enumerates concrete interface addresses for `0.0.0.0` via `if-watch`, so
+/// this still yields a loopback listener too — same-machine use keeps working).
+pub(crate) const LISTEN_QUIC: &str = "/ip4/0.0.0.0/udp/0/quic-v1";
+
+/// Sort `addrs` so a LAN/WAN-reachable address sorts before a loopback one.
+/// Used to pick the address handed to a remote peer (an invite link, a
+/// relay's advertised address) when a node listens on every interface.
+pub(crate) fn prefer_reachable(addrs: &mut [Multiaddr]) {
+    addrs.sort_by_key(|a| if is_loopback(a) { 1u8 } else { 0u8 });
+}
+
+fn is_loopback(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_loopback(),
+        libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
+}
 
 /// The DHT key a share is announced and discovered under: the manifest's
 /// [content id](Manifest::id).

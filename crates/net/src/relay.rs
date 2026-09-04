@@ -93,7 +93,7 @@ pub struct RelayNode {
 
 impl RelayNode {
     /// Start the relay with the default cache budget, listening on an ephemeral
-    /// loopback QUIC port.
+    /// QUIC port on every local interface.
     pub async fn spawn() -> anyhow::Result<Self> {
         Self::spawn_with(RelayConfig::default()).await
     }
@@ -169,11 +169,13 @@ impl RelayNode {
         Ok(rx.await?)
     }
 
-    /// The first dialable `/quic-v1/p2p/<id>` listen address, if any.
+    /// The best dialable `/quic-v1/p2p/<id>` listen address (LAN/WAN-reachable
+    /// if the relay has one, else loopback), if any.
     pub async fn listen_addr(&self) -> anyhow::Result<Multiaddr> {
         let p2p = Protocol::P2p(self.peer_id);
-        self.listen_addrs()
-            .await?
+        let mut addrs = self.listen_addrs().await?;
+        crate::prefer_reachable(&mut addrs);
+        addrs
             .into_iter()
             .next()
             .map(|a| a.with(p2p))
