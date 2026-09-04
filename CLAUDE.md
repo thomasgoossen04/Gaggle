@@ -419,7 +419,13 @@ four tabs + expandable detail panels) · `theme.rs` (swappable
 `Palette`s — `DARK`, `LIGHT`; every widget paints from `theme::active()`, a
 thread-local) · `clipboard.rs` · `util.rs`. Add a theme = one more `static Palette` +
 a branch in `theme::activate`. The window is decorationless (`WindowDecorations::Client`
-+ `window_border()`); the header draws its own min/max/close and drag-to-move.
++ `window_border()`); the header draws its own min/max/close and drag-to-move, except on
+macOS, where those are the real (still-native) traffic lights repositioned under the
+header by `WindowOptions::titlebar` — a bare `titlebar: None` there silently drops
+`NSResizableWindowMask`/`NSClosableWindowMask`/`NSMiniaturizableWindowMask`, so the window
+can't be resized or closed/minimized/maximized at all on macOS; it must stay
+`Some(TitlebarOptions { title: None, appears_transparent: true, traffic_light_position })`.
+The launcher's splash window (`launcher/src/main.rs`, `ui.rs`) follows the same pattern.
 
 ## GUI dependency note
 

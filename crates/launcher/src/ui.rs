@@ -134,6 +134,9 @@ impl Render for Launcher {
         let status = self.updater.state();
 
         // --- slim drag strip + close ---------------------------------------
+        // macOS keeps the native (repositioned) close button — see the
+        // `titlebar` comment in `main.rs` — so our own would just duplicate it.
+        let is_macos = cfg!(target_os = "macos");
         let strip = div()
             .flex()
             .flex_col()
@@ -144,7 +147,7 @@ impl Render for Launcher {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .pl_3()
+                    .pl(if is_macos { px(72.0) } else { px(12.0) })
                     .pr_1()
                     .py_1()
                     .on_mouse_down(
@@ -170,9 +173,11 @@ impl Render for Launcher {
                                 Channel::Stable => "// GAGGLE UPDATER",
                             }),
                     )
-                    .child(win_btn("win-close", "✕", true).on_click(
-                        cx.listener(|_, _: &ClickEvent, window, _| window.remove_window()),
-                    )),
+                    .when(!is_macos, |el| {
+                        el.child(win_btn("win-close", "✕", true).on_click(cx.listener(
+                            |_, _: &ClickEvent, window, _| window.remove_window(),
+                        )))
+                    }),
             )
             .child(hazard_bar());
 

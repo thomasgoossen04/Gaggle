@@ -14,8 +14,8 @@ use channel::Channel;
 use clap::{Parser, Subcommand};
 use gpui::prelude::*;
 use gpui::{
-    Application, Bounds, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, px, size,
+    Application, Bounds, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowDecorations, WindowOptions, point, px, size,
 };
 use updater::Updater;
 
@@ -158,7 +158,15 @@ fn run_window(up: Updater) {
         let win_size = size(px(380.0), px(300.0));
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, win_size, cx))),
-            titlebar: None,
+            // See the matching comment in `gui::main` — `titlebar: None` drops
+            // `NSClosableWindowMask` on macOS too, so the window can't even be
+            // closed there. `ui::Launcher::render` hides the custom close
+            // button on macOS in favor of the (still native) repositioned one.
+            titlebar: Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(9.0), px(9.0))),
+            }),
             window_decorations: Some(WindowDecorations::Client),
             window_background: WindowBackgroundAppearance::Transparent,
             window_min_size: Some(win_size),

@@ -41,6 +41,12 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
     };
 
     let max_glyph = if window.is_maximized() { "❐" } else { "▢" };
+    // macOS gets the real (still-native, still-functional) traffic lights,
+    // repositioned under our header by `WindowOptions::titlebar` in `main.rs`
+    // — drawing our own min/max/close there would just duplicate them, and
+    // `window_control_area` (used on Windows) is a no-op on macOS anyway. Room
+    // is left on the left so the wordmark clears the native buttons instead.
+    let is_macos = cfg!(target_os = "macos");
 
     div()
         .flex()
@@ -54,7 +60,7 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                 .flex()
                 .items_center()
                 .justify_between()
-                .pl_4()
+                .pl(if is_macos { px(78.0) } else { px(16.0) })
                 .pr_1()
                 .py_2()
                 // Drag-to-move: arm on press, fire the compositor move on the
@@ -108,15 +114,17 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                         .flex()
                         .items_center()
                         .gap_1()
-                        .child(win_btn("win-min", "—", false).on_click(cx.listener(
-                            |_, _: &ClickEvent, window, _| window.minimize_window(),
-                        )))
-                        .child(win_btn("win-max", max_glyph, false).on_click(cx.listener(
-                            |_, _: &ClickEvent, window, _| window.zoom_window(),
-                        )))
-                        .child(win_btn("win-close", "✕", true).on_click(cx.listener(
-                            |_, _: &ClickEvent, window, _| window.remove_window(),
-                        ))),
+                        .when(!is_macos, |el| {
+                            el.child(win_btn("win-min", "—", false).on_click(cx.listener(
+                                |_, _: &ClickEvent, window, _| window.minimize_window(),
+                            )))
+                            .child(win_btn("win-max", max_glyph, false).on_click(cx.listener(
+                                |_, _: &ClickEvent, window, _| window.zoom_window(),
+                            )))
+                            .child(win_btn("win-close", "✕", true).on_click(cx.listener(
+                                |_, _: &ClickEvent, window, _| window.remove_window(),
+                            )))
+                        }),
                 ),
         )
         .child(hazard_bar())

@@ -27,7 +27,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    Application, WindowBackgroundAppearance, WindowDecorations, WindowOptions, px, size,
+    Application, TitlebarOptions, WindowBackgroundAppearance, WindowDecorations, WindowOptions,
+    point, px, size,
 };
 
 fn config_path() -> Option<PathBuf> {
@@ -62,8 +63,21 @@ fn main() -> anyhow::Result<()> {
 
         let app = app.clone();
         let opts = WindowOptions {
-            // Drop the server titlebar; we draw our own controls in the header.
-            titlebar: None,
+            // Hide the native title *bar chrome* but keep a `Some(TitlebarOptions)`:
+            // on macOS, a bare `titlebar: None` makes gpui build the window
+            // without `NSResizableWindowMask` / `NSClosableWindowMask` /
+            // `NSMiniaturizableWindowMask` at all, so the window can't be
+            // resized and the traffic lights don't exist to click — it silently
+            // only "works" on Linux/Windows, whose resize/close/minimize don't
+            // key off this. `traffic_light_position` just re-homes the (still
+            // native, still functional) macOS buttons under our own header;
+            // `ui::chrome::header` hides our custom win-min/max/close cluster
+            // on macOS so there's only one set of controls.
+            titlebar: Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(9.0), px(9.0))),
+            }),
             window_decorations: Some(WindowDecorations::Client),
             // Transparent so `window_border`'s drop shadow has somewhere to fall.
             window_background: WindowBackgroundAppearance::Transparent,

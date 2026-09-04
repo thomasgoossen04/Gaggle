@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 /// Placeholder "GG" wordmark, generated from `assets/icon.svg`.
+#[cfg(target_os = "linux")]
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 #[cfg(windows)]
 const ICON_ICO: &[u8] = include_bytes!("../assets/icon.ico");
