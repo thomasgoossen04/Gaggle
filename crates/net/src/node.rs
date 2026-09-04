@@ -513,6 +513,15 @@ struct EventLoop {
     grants: HashMap<PeerId, Grant>,
 
     peer_addrs: HashMap<PeerId, HashSet<Multiaddr>>,
+    /// Set after the first successful [`Command::Bootstrap`] connection kicks
+    /// off a Kademlia self-lookup. That lookup walks the whole routing table,
+    /// redialing every peer address we've ever learned — including long-dead
+    /// ones (other peers' private-LAN addresses, expired relay circuits). Once
+    /// primed, leave further refreshes to Kademlia's own periodic bootstrap
+    /// timer instead of re-triggering a full one on every reconnect (a public
+    /// relay/rendezvous reconnect, an mDNS churn event, ...), which was
+    /// producing repeated bursts of doomed outgoing-connection attempts.
+    bootstrapped: bool,
 
     // In-flight bookkeeping.
     pending_connect: HashMap<PeerId, ReplyResult<PeerId>>,
@@ -539,6 +548,7 @@ impl EventLoop {
             access: Access::Public,
             grants: HashMap::new(),
             peer_addrs: HashMap::new(),
+            bootstrapped: false,
             pending_connect: HashMap::new(),
             pending_provide: HashMap::new(),
             pending_find: HashMap::new(),
@@ -789,7 +799,10 @@ impl EventLoop {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 tracing::info!(peer = %peer_id, "connected");
                 if let Some(reply) = self.pending_connect.remove(&peer_id) {
-                    let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+                    if !self.bootstrapped {
+                        self.bootstrapped = true;
+                        let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+                    }
                     let _ = reply.send(Ok(peer_id));
                 }
                 self.flush_awaiting(peer_id);

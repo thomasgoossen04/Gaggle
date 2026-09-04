@@ -320,10 +320,10 @@ so opening the app from a shortcut always re-checks for updates first: a Linux
 `~/Applications/Gaggle.app` bundle on macOS (a small shim executable + `Info.plist` +
 `.icns`, so the bundle survives self-updates without re-bundling). The apps-menu / Start
 Menu entry is always created; a desktop shortcut is opt-in (`Updater::set_desktop_shortcut`,
-a checkbox in the launcher window, or `gaggle-launcher --desktop-shortcut`). Icons are a
-placeholder "GG" wordmark under `crates/launcher/assets/` (`icon.{svg,png,ico,icns}`,
-`include_bytes!`'d so the *standalone* launcher binary can create shortcuts with no zip
-alongside it). `gaggle-launcher run` (the default, e.g. from a shortcut) silently hands off
+a checkbox in the launcher window, or `gaggle-launcher --desktop-shortcut`). Icons are the
+Gaggle goose mark under `crates/launcher/assets/` (`icon.{svg,png,ico,icns}`, traced from
+`logo.jpg`; `include_bytes!`'d so the *standalone* launcher binary can create shortcuts
+with no zip alongside it). `gaggle-launcher run` (the default, e.g. from a shortcut) silently hands off
 straight to the installed GUI — no window — when it's already the latest version, or when
 the update check fails but something is installed (`updater::wants_auto_launch`, pure and
 unit-tested); otherwise it opens the window as before.

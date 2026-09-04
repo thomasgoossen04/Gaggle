@@ -22,7 +22,12 @@ pub struct ShareLink {
     /// Dialable `…/p2p/<id>` addresses of seeds.
     pub sources: Vec<Multiaddr>,
     /// Present for a private share.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// No `skip_serializing_if` here on purpose: the wire encoding is
+    /// `postcard`, a positional (non-self-describing) format, where omitting
+    /// a field from the byte stream desyncs every field after it rather than
+    /// just leaving a JSON key out — `Option`'s own tag byte is already the
+    /// compact way to represent "absent" here.
     pub invite: Option<Invite>,
 }
 
@@ -41,10 +46,15 @@ impl ShareLink {
         self.invite.as_ref().map(|i| &i.credential)
     }
 
-    /// Encode as a single `gaggleshare1<base64url>` token.
+    /// Encode as a single `gaggleshare1<base64url>` token. The payload is
+    /// `postcard`-encoded (not JSON) before base64 — every field type here
+    /// (`Hash`, `Multiaddr`, the embedded `Invite`'s `SharePublicKey` /
+    /// `Signature`, ...) serializes to raw bytes rather than hex/JSON text in
+    /// a non-human-readable format, which is most of why this token is much
+    /// shorter than a JSON-based one would be.
     pub fn encode(&self) -> String {
-        let json = serde_json::to_vec(self).expect("a ShareLink always serializes");
-        format!("{PREFIX}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+        let bytes = postcard::to_allocvec(self).expect("a ShareLink always serializes");
+        format!("{PREFIX}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
     }
 
     /// Parse a token produced by [`encode`](Self::encode).
@@ -53,10 +63,10 @@ impl ShareLink {
             .trim()
             .strip_prefix(PREFIX)
             .ok_or_else(|| anyhow::anyhow!("not a Gaggle share link (missing `{PREFIX}` prefix)"))?;
-        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(body.as_bytes())
             .map_err(|e| anyhow::anyhow!("share link is not valid base64url: {e}"))?;
-        let link: ShareLink = serde_json::from_slice(&json)
+        let link: ShareLink = postcard::from_bytes(&bytes)
             .map_err(|e| anyhow::anyhow!("share link payload is malformed: {e}"))?;
         anyhow::ensure!(!link.sources.is_empty(), "share link names no sources");
         Ok(link)

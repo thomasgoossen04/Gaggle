@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{Error, Result};
 use crate::hash::Hash;
@@ -26,13 +26,90 @@ const CAP_DOMAIN: &[u8] = b"gaggle-capability-v1\0";
 const INVITE_PREFIX: &str = "gaggle1";
 
 /// What a capability grants access to within a share.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "paths")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// Every file in the share.
     All,
     /// Only these manifest paths (sorted, de-duplicated).
     Files(Vec<String>),
+}
+
+/// The adjacently-tagged JSON shape `Scope` used to use directly via derive.
+/// Kept as a shadow type — used only in human-readable mode — because
+/// [`Capability::signing_bytes`] hashes this exact shape: changing it would
+/// invalidate every previously-issued signature. The compact (`postcard`)
+/// wire encoding below does not go through this type at all.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "paths")]
+enum ScopeJson {
+    All,
+    Files(Vec<String>),
+}
+
+impl From<&Scope> for ScopeJson {
+    fn from(s: &Scope) -> Self {
+        match s {
+            Scope::All => ScopeJson::All,
+            Scope::Files(paths) => ScopeJson::Files(paths.clone()),
+        }
+    }
+}
+
+impl From<ScopeJson> for Scope {
+    fn from(s: ScopeJson) -> Self {
+        match s {
+            ScopeJson::All => Scope::All,
+            ScopeJson::Files(paths) => Scope::Files(paths),
+        }
+    }
+}
+
+/// A plain externally-tagged shape for `Scope` — the default serde enum
+/// representation, and the compact one `postcard` (a positional,
+/// non-self-describing format) actually supports: adjacent tagging needs
+/// `deserialize_any`, which postcard refuses on purpose.
+#[derive(Serialize, Deserialize)]
+enum ScopeCompact {
+    All,
+    Files(Vec<String>),
+}
+
+impl From<&Scope> for ScopeCompact {
+    fn from(s: &Scope) -> Self {
+        match s {
+            Scope::All => ScopeCompact::All,
+            Scope::Files(paths) => ScopeCompact::Files(paths.clone()),
+        }
+    }
+}
+
+impl From<ScopeCompact> for Scope {
+    fn from(s: ScopeCompact) -> Self {
+        match s {
+            ScopeCompact::All => Scope::All,
+            ScopeCompact::Files(paths) => Scope::Files(paths),
+        }
+    }
+}
+
+impl Serialize for Scope {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            ScopeJson::from(self).serialize(s)
+        } else {
+            ScopeCompact::from(self).serialize(s)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Scope {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        if d.is_human_readable() {
+            ScopeJson::deserialize(d).map(Into::into)
+        } else {
+            ScopeCompact::deserialize(d).map(Into::into)
+        }
+    }
 }
 
 impl Scope {
@@ -193,12 +270,16 @@ impl Invite {
         Ok(())
     }
 
-    /// Encode as a single `gaggle1<base64url>` token.
+    /// Encode as a single `gaggle1<base64url>` token. The payload is
+    /// `postcard`-encoded (not JSON) before base64: every field type here
+    /// (`Hash`, `SharePublicKey`, `Signature`, ...) serializes to raw bytes
+    /// rather than hex/JSON text in a non-human-readable format, which is most
+    /// of why this token is much shorter than a JSON-based one would be.
     pub fn to_url(&self) -> String {
-        let json = serde_json::to_vec(self).expect("an Invite always serializes");
+        let bytes = postcard::to_allocvec(self).expect("an Invite always serializes");
         format!(
             "{INVITE_PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
         )
     }
 
@@ -208,10 +289,10 @@ impl Invite {
         let body = token
             .strip_prefix(INVITE_PREFIX)
             .ok_or_else(|| Error::Invite(format!("invite must start with `{INVITE_PREFIX}`")))?;
-        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(body.as_bytes())
             .map_err(|e| Error::Invite(format!("invite is not valid base64url: {e}")))?;
-        let invite: Invite = serde_json::from_slice(&json)
+        let invite: Invite = postcard::from_bytes(&bytes)
             .map_err(|e| Error::Invite(format!("invite payload is malformed: {e}")))?;
         Ok(invite)
     }

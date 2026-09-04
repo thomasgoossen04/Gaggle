@@ -14,7 +14,7 @@ use app_state::{
     Theme, TransferId, TransferKind, TransferRow,
 };
 use gpui::prelude::*;
-use gpui::{ClipboardItem, Entity, PathPromptOptions, SharedString, Timer, Window, div};
+use gpui::{ClipboardItem, Entity, FocusHandle, PathPromptOptions, SharedString, Timer, Window, div};
 use gpui_component::input::InputState;
 
 use crate::util::{
@@ -127,6 +127,11 @@ pub struct Gaggle {
     pub(crate) tree_expanded: HashSet<String>,
     /// A Remove button is awaiting confirmation.
     pub(crate) confirm: Option<Confirm>,
+    /// Holds keyboard focus while [`Self::confirm`] is armed, so the modal's
+    /// `on_key_down` (Enter → confirm) actually receives key events — gpui
+    /// routes keys to whatever's focused, and nothing else in this app calls
+    /// `window.focus`, so without this Enter would fall through to the root.
+    pub(crate) confirm_focus: FocusHandle,
     /// The Settings theme dropdown is open.
     pub(crate) theme_menu_open: bool,
     /// Last `ThemeMode` pushed into gpui-component, so `render` can re-sync it
@@ -257,6 +262,7 @@ impl Gaggle {
             invite_sel: HashSet::new(),
             tree_expanded: HashSet::new(),
             confirm: None,
+            confirm_focus: cx.focus_handle(),
             theme_menu_open: false,
             theme_mode: Some(initial_mode),
             dragging: false,
@@ -336,7 +342,7 @@ impl Gaggle {
     }
 
     /// Arm the Remove confirmation for row `id`.
-    pub(crate) fn ask_remove(&mut self, id: TransferId, cx: &mut Context<Self>) {
+    pub(crate) fn ask_remove(&mut self, id: TransferId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.state.get(id) else { return };
         let kind = match row.kind {
             TransferKind::Seeding => ConfirmKind::Share,
@@ -345,6 +351,8 @@ impl Gaggle {
             }
         };
         self.confirm = Some(Confirm { id, name: row.name.clone(), kind });
+        // So the modal's on_key_down (Enter → confirm) receives events.
+        self.confirm_focus.focus(window);
         cx.notify();
     }
 

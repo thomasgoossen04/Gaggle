@@ -7,8 +7,8 @@ use app_state::{
 };
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, ClickEvent, Context, FontWeight, MouseButton, SharedString, deferred, div, hsla,
-    px, relative, uniform_list,
+    AnyElement, ClickEvent, Context, FontWeight, KeyDownEvent, MouseButton, SharedString,
+    deferred, div, hsla, px, relative, uniform_list,
 };
 
 use crate::app::{ConfirmKind, Gaggle, Tab};
@@ -107,7 +107,7 @@ fn share_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl 
                     )),
                 )
                 .child(danger_btn(("rm", id as usize), "Remove").on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| this.ask_remove(id, cx),
+                    move |this, _: &ClickEvent, window, cx| this.ask_remove(id, window, cx),
                 ))),
         );
 
@@ -512,7 +512,7 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                     )))
                 })
                 .child(danger_btn(("drm", id as usize), "Remove").on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| this.ask_remove(id, cx),
+                    move |this, _: &ClickEvent, window, cx| this.ask_remove(id, window, cx),
                 ))),
         );
 
@@ -1170,8 +1170,11 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
         // Clicks inside the card must not fall through to the backdrop.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
+    // Delete-with-files is a separate, more destructive click — Enter only
+    // ever triggers the same action as a plain "Remove".
     let overlay = div()
         .id("confirm-overlay")
+        .track_focus(&app.confirm_focus)
         .absolute()
         .inset_0()
         .flex()
@@ -1182,6 +1185,11 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
             MouseButton::Left,
             cx.listener(|this, _, _, cx| this.confirm_cancel(cx)),
         )
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            if event.keystroke.key == "enter" {
+                this.confirm_go(false, cx);
+            }
+        }))
         .child(card);
 
     Some(deferred(overlay).into_any_element())

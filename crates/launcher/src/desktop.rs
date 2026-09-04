@@ -10,7 +10,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Placeholder "GG" wordmark, generated from `assets/icon.svg`.
+/// The Gaggle goose mark, traced from `assets/logo.jpg` into `assets/icon.svg`
+/// and rasterized from there.
 #[cfg(target_os = "linux")]
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 #[cfg(windows)]

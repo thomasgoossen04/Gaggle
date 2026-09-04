@@ -21,6 +21,11 @@ edition = "2024"
 tokio = { version = "1.53", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# Compact binary serde format — used for the wire encoding of share links /
+# invite tokens (base64'd after this) so they stay short; every hand-rolled
+# Serialize impl in gaggle-core (Hash, SharePublicKey, Signature, ...) already
+# branches on `is_human_readable()` to emit raw bytes for exactly this case.
+postcard = { version = "1.1", features = ["use-std"] }
 anyhow = "1.0.104"
 thiserror = "2.0.20"
 tracing = "0.1.44"
