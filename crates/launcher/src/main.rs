@@ -3,6 +3,14 @@
 //! Default (no subcommand) opens a small decorationless window styled like the
 //! main GUI. `check` / `update` are headless for scripting.
 
+// No console by default (a plain Windows binary launches with one attached,
+// which is what flashes up behind the window from a desktop shortcut); `main`
+// re-attaches to the parent's console on start when one exists (i.e. this was
+// run from an existing terminal), so `check`/`update`'s printed output still
+// reaches a script or an interactive shell. Debug builds keep the normal
+// console — `cargo run` is still the place for panics and stray `println!`s.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod channel;
 mod desktop;
 mod manifest;
@@ -55,7 +63,24 @@ enum Cmd {
     Update,
 }
 
+/// Re-attach to the console of whatever launched this process, if any — a
+/// no-op no-console build (`windows_subsystem = "windows"`) otherwise has no
+/// way to print `check`/`update`'s output when run from an existing shell.
+/// Launched from a desktop shortcut (no parent console) this is a silent
+/// no-op, which is exactly the point.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> anyhow::Result<()> {
+    attach_parent_console();
     let cli = Cli::parse();
 
     // Resolve the channel: --channel > $GAGGLE_UPDATE_CHANNEL > persisted > stable.

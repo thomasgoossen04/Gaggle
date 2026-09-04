@@ -921,3 +921,34 @@ async fn a_share_reachable_only_through_a_public_relay_still_completes() {
 
     relay.shutdown().await;
 }
+
+/// A configured relay that can't actually be reached must not fail silently —
+/// the share still comes up (local addresses only), but with a visible
+/// warning on the row, since a swallowed background-task error would leave
+/// the user staring at a link that mysteriously doesn't work off-machine.
+#[tokio::test]
+async fn an_unreachable_relay_surfaces_a_visible_warning_instead_of_failing_silently() {
+    // Nothing listens on this port — the reservation must fail.
+    let bad_relay = format!("/ip4/127.0.0.1/udp/1/quic-v1/p2p/{}", app_state::PeerId::random());
+
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.update_settings(Settings { public_relay: Some(bad_relay), ..Settings::default() });
+    wait_for(&seeder, 5, |s| s.settings.public_relay.is_some()).await;
+    seeder.add_local_share(folder.path());
+
+    let seeded = wait_for(&seeder, 40, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    assert!(
+        seed.error.as_ref().is_some_and(|e| e.contains("relay")),
+        "an unreachable relay should leave a visible warning on the row, got {:?}",
+        seed.error
+    );
+    assert!(
+        !seed.share_addrs.iter().any(|a| a.to_string().contains("p2p-circuit")),
+        "no circuit address should have been added when the reservation failed"
+    );
+}

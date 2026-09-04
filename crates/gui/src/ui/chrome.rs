@@ -34,10 +34,7 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
             .child(label.to_uppercase())
             // Swallow the press so the title bar never reads it as a drag.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.tab = tab;
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.switch_tab(tab, cx)))
     };
 
     let max_glyph = if window.is_maximized() { "❐" } else { "▢" };
@@ -106,7 +103,8 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                                 .child(tab_btn(app, cx, Tab::Transfers, "Transfers"))
                                 .child(tab_btn(app, cx, Tab::Shares, "Shares"))
                                 .child(tab_btn(app, cx, Tab::Accelerator, "Accelerator"))
-                                .child(tab_btn(app, cx, Tab::Settings, "Settings")),
+                                .child(tab_btn(app, cx, Tab::Settings, "Settings"))
+                                .child(tab_btn(app, cx, Tab::Logs, "Logs")),
                         ),
                 )
                 .child(

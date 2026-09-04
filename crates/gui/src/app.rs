@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_state::{
-    AcceleratorRequest, App, AppState, Scope, Settings, ShareLink, Theme, TransferId, TransferKind,
-    TransferRow,
+    AcceleratorRequest, App, AppState, LogHandle, LogLevel, LogLine, Scope, Settings, ShareLink,
+    Theme, TransferId, TransferKind, TransferRow,
 };
 use gpui::prelude::*;
 use gpui::{ClipboardItem, Entity, PathPromptOptions, SharedString, Timer, Window, div};
@@ -28,6 +28,7 @@ pub enum Tab {
     Shares,
     Accelerator,
     Settings,
+    Logs,
 }
 
 /// How long a minted invite stays valid.
@@ -94,6 +95,13 @@ pub struct Gaggle {
     pub(crate) state: AppState,
     pub(crate) tab: Tab,
     pub(crate) notice: Option<SharedString>,
+    /// The process's captured `tracing` output — see the Logs tab.
+    pub(crate) log_handle: LogHandle,
+    /// The last-polled snapshot of `log_handle`, refreshed only while the
+    /// Logs tab is open.
+    pub(crate) logs: Vec<LogLine>,
+    /// Logs tab: only show lines at or above this severity.
+    pub(crate) log_min_level: LogLevel,
     /// Rows whose detail panel (swarm inspector / invite form) is open.
     pub(crate) expanded: HashSet<TransferId>,
     pub(crate) invite_expiry: ExpiryChoice,
@@ -138,7 +146,7 @@ pub struct Gaggle {
 }
 
 impl Gaggle {
-    pub fn new(app: Arc<App>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(app: Arc<App>, log_handle: LogHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = app.snapshot();
         let s = &state.settings;
 
@@ -175,13 +183,17 @@ impl Gaggle {
         let remote_url = text(cx, window, String::new());
         let remote_add = text(cx, window, String::new());
 
-        // Poll the manager and re-render on change.
+        // Poll the manager (and, while the Logs tab is open, the log buffer)
+        // and re-render on change.
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_millis(200)).await;
                 let stop = this
                     .update(cx, |this: &mut Gaggle, cx| {
                         this.state = this.app.snapshot();
+                        if this.tab == Tab::Logs {
+                            this.logs = this.log_handle.snapshot();
+                        }
                         cx.notify();
                     })
                     .is_err();
@@ -197,6 +209,9 @@ impl Gaggle {
             state,
             tab: Tab::Transfers,
             notice: None,
+            log_handle,
+            logs: Vec::new(),
+            log_min_level: LogLevel::Info,
             expanded: HashSet::new(),
             invite_expiry: ExpiryChoice::Never,
             invite_for: None,
@@ -221,6 +236,38 @@ impl Gaggle {
             remote_url,
             remote_add,
         }
+    }
+
+    /// Switch tabs, refreshing the log snapshot immediately when switching
+    /// *to* Logs rather than waiting for the next 200ms poll tick.
+    pub(crate) fn switch_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.tab = tab;
+        if tab == Tab::Logs {
+            self.logs = self.log_handle.snapshot();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_log_min_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
+        self.log_min_level = level;
+        cx.notify();
+    }
+
+    pub(crate) fn clear_logs(&mut self, cx: &mut Context<Self>) {
+        self.log_handle.clear();
+        self.logs.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn copy_logs(&mut self, cx: &mut Context<Self>) {
+        let text = self
+            .logs
+            .iter()
+            .filter(|l| l.level >= self.log_min_level)
+            .map(|l| format!("{} {:<5} {} {}", crate::util::fmt_log_time(l.time_unix), l.level, l.target, l.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.copy_text(text, "Logs copied to clipboard", cx);
     }
 
     pub(crate) fn set_notice(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {

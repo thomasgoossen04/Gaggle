@@ -182,6 +182,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "windows-sys 0.61.2",
 ]
 
@@ -4022,6 +4023,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

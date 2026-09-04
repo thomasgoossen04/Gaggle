@@ -9,12 +9,14 @@
 //!
 //! Nothing here depends on `gpui`; the `gui` crate is a thin renderer on top.
 
+mod logs;
 mod manager;
 mod persist;
 mod settings;
 mod state;
 
 pub use gaggle_core::{Hash, Invite};
+pub use logs::{LogHandle, LogLevel, LogLine, init as init_logging};
 pub use manager::{App, AppEvent, AcceleratorRequest, SubscribeRequest};
 pub use net::ShareLink;
 pub use net::{CacheStats, Multiaddr, PeerId, Scope};

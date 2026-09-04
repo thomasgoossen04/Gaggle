@@ -8,6 +8,13 @@ pub fn spaced(s: &str) -> String {
         .join("\u{2009}")
 }
 
+/// `unix_secs` as `HH:MM:SS` UTC — just the time-of-day for a log tail, no
+/// calendar maths (and no timezone dependency) needed.
+pub fn fmt_log_time(unix_secs: u64) -> String {
+    let s = unix_secs % 86_400;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
 /// A bandwidth / storage cap, or "unlimited" when unset.
 pub fn cap(bytes_per_sec: Option<u64>) -> String {
     match bytes_per_sec {

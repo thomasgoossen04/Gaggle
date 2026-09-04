@@ -16,6 +16,13 @@
 //! surfaces, a single high-viz accent, hazard-stripe rules, targeting brackets
 //! on every card, and uppercase monospace chrome.
 
+// A plain Windows binary launches with a console window attached by default —
+// this is what makes one flash up behind the GUI. `windows_subsystem =
+// "windows"` drops that, but only in release builds: a `cargo run`/`cargo
+// build` (debug) keeps the console, since that's still where panics and
+// stray `println!`s are most useful during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod clipboard;
 mod theme;
@@ -45,6 +52,12 @@ fn main() -> anyhow::Result<()> {
         println!("gaggle-gui {VERSION}");
         return Ok(());
     }
+
+    // As early as possible, so nothing before it (identity load, first
+    // settings read, …) logs unseen. A packaged GUI has no attached console —
+    // this is the only place its background-task warnings become visible;
+    // the Logs tab reads from the returned handle.
+    let logs = app_state::init_logging();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -90,7 +103,7 @@ fn main() -> anyhow::Result<()> {
             // gpui-component's `Input` (and other stateful widgets) look the
             // window's first layer up as a `gpui_component::Root`; without it
             // they panic on focus. Root also draws the `window_border` frame.
-            let view = cx.new(|cx| app::Gaggle::new(app, window, cx));
+            let view = cx.new(|cx| app::Gaggle::new(app, logs.clone(), window, cx));
             cx.new(|cx| gpui_component::Root::new(view, window, cx))
         })
         .expect("failed to open window");

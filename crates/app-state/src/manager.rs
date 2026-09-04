@@ -128,7 +128,15 @@ enum Command {
     Shutdown,
 
     // Internal, from worker tasks.
-    LocalShareReady { id: TransferId, node: Arc<Node>, addrs: Vec<Multiaddr>, info: ShareInfo },
+    LocalShareReady {
+        id: TransferId,
+        node: Arc<Node>,
+        addrs: Vec<Multiaddr>,
+        /// Set when `Settings::public_relay` was configured but the reservation
+        /// failed — the share still works, but the link is local-addresses-only.
+        relay_warning: Option<String>,
+        info: ShareInfo,
+    },
     RescanDone {
         id: TransferId,
         manifest_id: Hash,
@@ -736,7 +744,7 @@ impl Manager {
             }
             Command::Shutdown => {}
 
-            Command::LocalShareReady { id, node, addrs, info } => {
+            Command::LocalShareReady { id, node, addrs, relay_warning, info } => {
                 self.seeds.insert(
                     id,
                     SeedEntry {
@@ -762,6 +770,7 @@ impl Manager {
                     row.status = TransferStatus::Complete;
                     row.share_addr = addrs.first().cloned();
                     row.share_addrs = addrs;
+                    row.error = relay_warning;
                 }
                 self.recount();
                 self.persist_shares();
@@ -1253,19 +1262,27 @@ impl Manager {
                 Ok(_) => return fail(&tx, id, "no listen address".to_string()).await,
                 Err(e) => return fail(&tx, id, format!("no listen address: {e:#}")).await,
             };
+            let mut relay_warning = None;
             if let Some(relay_addr) = &public_relay {
                 match reserve_relay(&node, relay_addr).await {
                     Ok(circuit) => addrs.push(circuit),
-                    Err(e) => tracing::warn!(
-                        id,
-                        error = %format!("{e:#}"),
-                        "could not reserve a slot on the configured relay; \
-                         share link will only carry local addresses"
-                    ),
+                    Err(e) => {
+                        let msg = format!(
+                            "Public relay unreachable ({e:#}) — link only has local addresses"
+                        );
+                        tracing::warn!(id, error = %format!("{e:#}"), "relay reservation failed");
+                        relay_warning = Some(msg);
+                    }
                 }
             }
             let _ = tx
-                .send(Command::LocalShareReady { id, node: Arc::new(node), addrs, info })
+                .send(Command::LocalShareReady {
+                    id,
+                    node: Arc::new(node),
+                    addrs,
+                    relay_warning,
+                    info,
+                })
                 .await;
         });
     }

@@ -2,8 +2,8 @@
 //! builders and the expandable detail panels (swarm inspector, invite form).
 
 use app_state::{
-    AccelShareRow, AcceleratorState, RemoteAccelState, SourceStats, Theme, TransferRow,
-    TransferStatus,
+    AccelShareRow, AcceleratorState, LogLevel, LogLine, RemoteAccelState, SourceStats, Theme,
+    TransferRow, TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -17,7 +17,7 @@ use crate::ui::widgets::{
     Tri, btn, card, checkmark, chip, danger_btn, field, field_suffixed, hint, kv, primary_btn,
     progress_bar, section_title, status_pill, suffix_btn,
 };
-use crate::util::{cap, human_bytes, human_rate};
+use crate::util::{cap, fmt_log_time, human_bytes, human_rate};
 
 /// Local folders this node originates and serves.
 pub fn shares(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
@@ -1159,5 +1159,96 @@ pub fn body(tab: Tab, app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         Tab::Transfers => transfers(app, cx),
         Tab::Accelerator => accelerator(app, cx),
         Tab::Settings => settings(app, cx),
+        Tab::Logs => logs(app, cx),
     }
+}
+
+/// Captured `tracing` output from every crate in the process — a packaged GUI
+/// has no attached console, so this is the only place a background-task
+/// warning (a failed relay reservation, a rejected connection, …) is visible.
+fn logs(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+
+    let level_btn = |level: LogLevel, id: &'static str, label: &'static str| {
+        let active = app.log_min_level == level;
+        div()
+            .id(id)
+            .px_2()
+            .py_1()
+            .border_1()
+            .border_color(if active { t.accent } else { t.line })
+            .bg(if active { t.accent } else { t.panel_hi })
+            .text_color(if active { t.on_accent } else { t.fg })
+            .text_xs()
+            .font_weight(FontWeight::BOLD)
+            .cursor_pointer()
+            .child(label)
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.set_log_min_level(level, cx)
+            }))
+    };
+
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(level_btn(LogLevel::Trace, "log-lvl-all", "ALL"))
+                        .child(level_btn(LogLevel::Info, "log-lvl-info", "INFO+"))
+                        .child(level_btn(LogLevel::Warn, "log-lvl-warn", "WARN+"))
+                        .child(level_btn(LogLevel::Error, "log-lvl-error", "ERROR")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(btn("copy-logs", "Copy").on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| this.copy_logs(cx),
+                        )))
+                        .child(danger_btn("clear-logs", "Clear").on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| this.clear_logs(cx),
+                        ))),
+                ),
+        )
+        .child(hint(
+            "Everything this process has logged, oldest at the bottom. RUST_LOG (if set \
+             before launch) controls verbosity; INFO+ is the default.",
+        ));
+
+    let lines: Vec<&LogLine> =
+        app.logs.iter().filter(|l| l.level >= app.log_min_level).collect();
+    if lines.is_empty() {
+        col = col.child(hint("NO LOG LINES YET AT THIS LEVEL."));
+    } else {
+        // Most-recent first; a render cap keeps a long-running session's tab
+        // switch cheap (the full buffer is still there for Copy).
+        let mut list = div().flex().flex_col().gap_1().font_family("monospace").text_xs();
+        for line in lines.iter().rev().take(1000) {
+            let color = match line.level {
+                LogLevel::Error | LogLevel::Warn => t.bad,
+                LogLevel::Info => t.fg,
+                LogLevel::Debug | LogLevel::Trace => t.muted,
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(div().text_color(t.muted).child(fmt_log_time(line.time_unix)))
+                    .child(div().w(px(44.0)).text_color(color).child(line.level.label()))
+                    .child(div().text_color(t.muted).child(line.target.clone()))
+                    .child(div().flex_1().text_color(color).child(line.message.clone())),
+            );
+        }
+        col = col.child(list);
+    }
+
+    col.into_any_element()
 }
