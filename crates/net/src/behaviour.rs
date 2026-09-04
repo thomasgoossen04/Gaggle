@@ -48,6 +48,15 @@ pub(crate) fn chunk_exchange() -> request_response::Behaviour<GaggleCodec> {
 /// hole-punch signalling but far too tight for pulling chunks through the relay
 /// as a fallback. An accelerator's whole job is to carry that traffic, so lift
 /// the byte cap and stretch the durations.
+///
+/// The defaults also throttle *how often* a peer may open a reservation/circuit
+/// at all: a per-peer token bucket of 30, refilling at just one token every 2
+/// minutes once drained. That's sized for a public, untrusted relay — on our
+/// private accelerator it means any firewalled peer leaning on relay fallback
+/// (exactly the case it exists for) burns the burst in seconds and then gets a
+/// "resource limit exceeded" on nearly every subsequent dial. Drop those rate
+/// limiters entirely; `max_circuits(_per_peer)` / `max_reservations(_per_peer)`
+/// below are the real ceiling.
 fn relay_config() -> relay::Config {
     relay::Config {
         max_circuit_bytes: 0, // unlimited
@@ -55,6 +64,10 @@ fn relay_config() -> relay::Config {
         reservation_duration: Duration::from_secs(60 * 60),
         max_circuits: 512,
         max_circuits_per_peer: 64,
+        max_reservations: 1024,
+        max_reservations_per_peer: 16,
+        reservation_rate_limiters: Vec::new(),
+        circuit_src_rate_limiters: Vec::new(),
         ..relay::Config::default()
     }
 }
