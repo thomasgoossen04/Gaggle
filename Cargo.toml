@@ -33,3 +33,7 @@ dirs = "6"
 # Smaller distributable binaries. No LTO on purpose — it roughly doubles the
 # gpui release-compile time in CI for little runtime gain here.
 strip = true
+# More parallel codegen at a small runtime-perf/size cost, same tradeoff as
+# skipping LTO above — this is a CI-heavy workspace (gpui + libp2p), not a
+# perf-critical binary.
+codegen-units = 256

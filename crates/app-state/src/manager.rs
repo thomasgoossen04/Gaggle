@@ -8,8 +8,9 @@
 //! lives here.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use control_plane::AdminClient;
@@ -110,6 +111,7 @@ enum Command {
     Subscribe(SubscribeRequest),
     Pause(TransferId),
     Resume(TransferId),
+    Retry(TransferId),
     Remove { id: TransferId, delete_files: bool },
     RescanShare(TransferId),
     CheckUpdates(TransferId),
@@ -150,6 +152,9 @@ enum Command {
     /// [`rescan_share`](Manager::rescan_share)) made progress.
     ScanProgress { id: TransferId, files_total: usize, bytes_done: u64, bytes_total: u64 },
     DownloadProgress { id: TransferId, p: SwarmProgress, base_bytes: u64 },
+    /// A download/resync worker reached a new pre-transfer phase (resolving
+    /// sources, authenticating, fetching metadata) — feeds `TransferRow::detail`.
+    DownloadStage { id: TransferId, message: String },
     DownloadDone { id: TransferId, outcome: Box<DownloadOutcome> },
     UpdateSeen { id: TransferId, version: u64 },
     ResyncProgress { id: TransferId, p: SwarmProgress },
@@ -345,6 +350,12 @@ impl App {
 
     pub fn resume(&self, id: TransferId) {
         self.send(Command::Resume(id));
+    }
+
+    /// Re-attempt a failed download from scratch (existing partial chunks are
+    /// kept and topped up, same as [`resume`](Self::resume)).
+    pub fn retry(&self, id: TransferId) {
+        self.send(Command::Retry(id));
     }
 
     /// Stop and forget a transfer (a seed stops serving; a download's partial
@@ -681,6 +692,7 @@ impl Manager {
             Command::Subscribe(req) => self.subscribe(req),
             Command::Pause(id) => self.pause(id),
             Command::Resume(id) => self.resume(id),
+            Command::Retry(id) => self.retry(id),
             Command::Remove { id, delete_files } => self.remove(id, delete_files),
             Command::RescanShare(id) => self.rescan_share(id),
             Command::CheckUpdates(id) => self.check_updates(id),
@@ -797,16 +809,27 @@ impl Manager {
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
             }
             Command::WorkerFailed { id, error } => {
-                self.downloads.remove(&id);
+                // Leave a download job's `request`/`chunk_dir` in place (task is
+                // already finished) so `retry` can respawn it, same as a paused one.
+                if let Some(job) = self.downloads.get_mut(&id) {
+                    job.last_sample = None;
+                }
                 self.resync_samples.remove(&id);
                 if let Some(row) = self.state.transfers.get_mut(&id) {
                     row.status = TransferStatus::Failed;
                     row.error = Some(error.clone());
                     row.speed_bps = 0;
+                    row.detail = None;
                 }
                 self.recount();
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferFailed(id, error));
+            }
+            Command::DownloadStage { id, message } => {
+                if let Some(row) = self.state.transfers.get_mut(&id) {
+                    row.detail = Some(message);
+                    self.publish();
+                }
             }
             Command::ScanProgress { id, files_total, bytes_done, bytes_total } => {
                 if let Some(row) = self.state.transfers.get_mut(&id) {
@@ -821,26 +844,19 @@ impl Manager {
                 let now = Instant::now();
                 let done = base_bytes + p.bytes_done;
                 if let Some(job) = self.downloads.get_mut(&id) {
-                    let speed = match job.last_sample.replace((now, done)) {
-                        Some((t0, b0)) => {
-                            let dt = now.duration_since(t0).as_secs_f64();
-                            if dt > 0.0 {
-                                (done.saturating_sub(b0) as f64 / dt) as u64
-                            } else {
-                                0
-                            }
-                        }
-                        None => 0,
-                    };
+                    let speed = sample_speed(&mut job.last_sample, now, done);
                     if let Some(row) = self.state.transfers.get_mut(&id) {
                         row.status = TransferStatus::Active;
+                        row.detail = None;
                         row.total_bytes = base_bytes + p.bytes_total;
                         row.done_bytes = done;
-                        row.speed_bps = if row.speed_bps == 0 {
-                            speed
-                        } else {
-                            (row.speed_bps * 3 + speed) / 4
-                        };
+                        if let Some(speed) = speed {
+                            row.speed_bps = if row.speed_bps == 0 {
+                                speed
+                            } else {
+                                (row.speed_bps * 3 + speed) / 4
+                            };
+                        }
                         bump_source(&mut row.sources, p.from, p.chunk_len);
                     }
                     self.publish();
@@ -902,26 +918,19 @@ impl Manager {
             Command::ResyncProgress { id, p } => {
                 let now = Instant::now();
                 if let Some(slot) = self.resync_samples.get_mut(&id) {
-                    let speed = match slot.replace((now, p.bytes_done)) {
-                        Some((t0, b0)) => {
-                            let dt = now.duration_since(t0).as_secs_f64();
-                            if dt > 0.0 {
-                                (p.bytes_done.saturating_sub(b0) as f64 / dt) as u64
-                            } else {
-                                0
-                            }
-                        }
-                        None => 0,
-                    };
+                    let speed = sample_speed(slot, now, p.bytes_done);
                     if let Some(row) = self.state.transfers.get_mut(&id) {
                         row.status = TransferStatus::Active;
+                        row.detail = None;
                         row.total_bytes = p.bytes_total.max(1);
                         row.done_bytes = p.bytes_done;
-                        row.speed_bps = if row.speed_bps == 0 {
-                            speed
-                        } else {
-                            (row.speed_bps * 3 + speed) / 4
-                        };
+                        if let Some(speed) = speed {
+                            row.speed_bps = if row.speed_bps == 0 {
+                                speed
+                            } else {
+                                (row.speed_bps * 3 + speed) / 4
+                            };
+                        }
                         bump_source(&mut row.sources, p.from, p.chunk_len);
                     }
                     self.publish();
@@ -1534,6 +1543,26 @@ impl Manager {
         self.publish();
     }
 
+    fn retry(&mut self, id: TransferId) {
+        let Some(job) = self.downloads.remove(&id) else { return };
+        let is_failed = self
+            .state
+            .transfers
+            .get(&id)
+            .map(|r| r.status == TransferStatus::Failed)
+            .unwrap_or(false);
+        if !is_failed {
+            self.downloads.insert(id, job);
+            return;
+        }
+        if let Some(row) = self.state.transfers.get_mut(&id) {
+            row.status = TransferStatus::Connecting;
+            row.error = None;
+        }
+        self.spawn_download(id, job.request, job.chunk_dir);
+        self.publish();
+    }
+
     fn remove(&mut self, id: TransferId, delete_files: bool) {
         self.seeds.remove(&id);
         self.subs.remove(&id);
@@ -1701,6 +1730,7 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
         source_dir: None,
         file_paths: Arc::new(Vec::new()),
         update_available: None,
+        detail: None,
     }
 }
 
@@ -1720,7 +1750,9 @@ async fn reserve_relay(node: &Node, relay_addr: &str) -> anyhow::Result<Multiadd
     // live — the reservation needs one) and joins its DHT, so the origin
     // also becomes discoverable through the relay's bootstrap/rendezvous role.
     let relay = node.bootstrap(addr.clone()).await?;
-    node.reserve_relay_slot(relay, addr).await
+    let circuit = node.reserve_relay_slot(relay, addr).await?;
+    tracing::info!(%relay, %circuit, "relay reservation established");
+    Ok(circuit)
 }
 
 /// A throttled [`index_dir_with_progress`] callback that forwards
@@ -1757,6 +1789,59 @@ fn clear_partial(dir: PathBuf) {
     });
 }
 
+/// How long a download/resync worker may go with no observable progress — no
+/// phase change, no chunk verified — before it is treated as stuck and failed
+/// with a clear error. Without this, a dial that neither connects nor errors
+/// (seen on some networks/firewalls) leaves a transfer sitting on
+/// "Connecting" forever with nothing in the UI to say anything is wrong.
+/// Generous on purpose: fetching metadata for a share with many thousands of
+/// files is legitimately slow, not stuck, and a relay reservation + dcutr
+/// hole-punch through a slow/flaky NAT can genuinely take minutes — 90s was
+/// tripping on connections that would have come through fine given more time.
+const STALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Update a transfer's `detail` text and mark `activity` so the stall
+/// watchdog racing this worker knows it is still making progress, even
+/// before any chunk has actually moved. Also logged, so a stuck run shows up
+/// in the Logs tab.
+fn report_stage(
+    tx: &mpsc::Sender<Command>,
+    activity: &Mutex<Instant>,
+    id: TransferId,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    *activity.lock().unwrap() = Instant::now();
+    tracing::info!(id, "{message}");
+    let _ = tx.try_send(Command::DownloadStage { id, message });
+}
+
+/// Race `work` against a watchdog that fails it once `activity` — touched by
+/// `work` on every phase change and every chunk received — has been stale for
+/// longer than [`STALL_TIMEOUT`].
+async fn with_stall_watchdog<T>(
+    activity: Arc<Mutex<Instant>>,
+    work: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => return result,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                let stale = activity.lock().unwrap().elapsed();
+                if stale > STALL_TIMEOUT {
+                    anyhow::bail!(
+                        "no response from any source for {}s — the source may be \
+                         unreachable (check your network connection and firewall), \
+                         or offline",
+                        STALL_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        }
+    }
+}
+
 async fn run_download(
     node: &Node,
     id: TransferId,
@@ -1766,59 +1851,75 @@ async fn run_download(
     tx: mpsc::Sender<Command>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
+    let activity = Arc::new(Mutex::new(Instant::now()));
+    let work_activity = activity.clone();
 
-    let peers = node.connect_all(&req.sources).await?;
-    if let Some(cred) = &req.credential {
-        node.authenticate_all(&peers, cred).await?;
-    }
-
-    let dir = chunk_dir.clone();
-    let mut disk = tokio::task::spawn_blocking(move || DiskChunkStore::open(&dir)).await??;
-    let base_bytes = disk.size_on_disk().unwrap_or(0);
-
-    let progress_tx = tx.clone();
-    // Pin the id the invite/link promised: a source discovered for one share
-    // must not be able to substitute a different manifest (chunks would still
-    // "verify" — against the attacker's manifest). Resync deliberately does not
-    // pin (a rescan changes the id); the first download always can.
-    let config = SwarmConfig { manifest_id: Some(req.manifest_id), ..swarm_config_for(&req) };
-    let dl = node
-        .download_share_multi_with_progress(
-            &peers,
-            &mut disk,
-            config,
-            move |p: SwarmProgress| {
-                let _ = progress_tx.try_send(Command::DownloadProgress { id, p, base_bytes });
-            },
-        )
-        .await?;
-
-    let manifest = dl.share.manifest.clone();
-    let chunk_lists = dl.share.chunk_lists.clone();
-    let total_bytes = manifest.total_size();
-    let files = manifest.files.len();
-    let version = manifest.version;
-
-    let out = output_dir.clone();
-    let m2 = manifest.clone();
-    let l2 = chunk_lists.clone();
-    tokio::task::spawn_blocking(move || write_share(&out, &m2, &l2, &disk)).await??;
-
-    let _ = tx
-        .send(Command::DownloadDone {
+    let work = async move {
+        report_stage(
+            &tx,
+            &work_activity,
             id,
-            outcome: Box::new(DownloadOutcome {
-                files,
-                total_bytes,
-                output_dir,
-                sources: dl.chunks_per_source,
-                manifest,
-                chunk_lists,
-                version,
-            }),
-        })
-        .await;
-    Ok(())
+            format!("resolving {} source(s)…", req.sources.len()),
+        );
+        let peers = node.connect_all(&req.sources).await?;
+        if let Some(cred) = &req.credential {
+            report_stage(&tx, &work_activity, id, "authenticating…");
+            node.authenticate_all(&peers, cred).await?;
+        }
+
+        let dir = chunk_dir.clone();
+        let mut disk = tokio::task::spawn_blocking(move || DiskChunkStore::open(&dir)).await??;
+        let base_bytes = disk.size_on_disk().unwrap_or(0);
+
+        report_stage(&tx, &work_activity, id, "fetching share metadata…");
+        let progress_tx = tx.clone();
+        let progress_activity = work_activity.clone();
+        // Pin the id the invite/link promised: a source discovered for one share
+        // must not be able to substitute a different manifest (chunks would still
+        // "verify" — against the attacker's manifest). Resync deliberately does not
+        // pin (a rescan changes the id); the first download always can.
+        let config = SwarmConfig { manifest_id: Some(req.manifest_id), ..swarm_config_for(&req) };
+        let dl = node
+            .download_share_multi_with_progress(
+                &peers,
+                &mut disk,
+                config,
+                move |p: SwarmProgress| {
+                    *progress_activity.lock().unwrap() = Instant::now();
+                    let _ = progress_tx.try_send(Command::DownloadProgress { id, p, base_bytes });
+                },
+            )
+            .await?;
+
+        let manifest = dl.share.manifest.clone();
+        let chunk_lists = dl.share.chunk_lists.clone();
+        let total_bytes = manifest.total_size();
+        let files = manifest.files.len();
+        let version = manifest.version;
+
+        let out = output_dir.clone();
+        let m2 = manifest.clone();
+        let l2 = chunk_lists.clone();
+        tokio::task::spawn_blocking(move || write_share(&out, &m2, &l2, &disk)).await??;
+
+        let _ = tx
+            .send(Command::DownloadDone {
+                id,
+                outcome: Box::new(DownloadOutcome {
+                    files,
+                    total_bytes,
+                    output_dir,
+                    sources: dl.chunks_per_source,
+                    manifest,
+                    chunk_lists,
+                    version,
+                }),
+            })
+            .await;
+        Ok(())
+    };
+
+    with_stall_watchdog(activity, work).await
 }
 
 async fn run_resync(
@@ -1831,61 +1932,78 @@ async fn run_resync(
     tx: mpsc::Sender<Command>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
+    let activity = Arc::new(Mutex::new(Instant::now()));
+    let work_activity = activity.clone();
 
-    let peers = node.connect_all(&req.sources).await?;
-    if let Some(cred) = &req.credential {
-        node.authenticate_all(&peers, cred).await?;
-    }
+    let work = async move {
+        report_stage(
+            &tx,
+            &work_activity,
+            id,
+            format!("resolving {} source(s)…", req.sources.len()),
+        );
+        let peers = node.connect_all(&req.sources).await?;
+        if let Some(cred) = &req.credential {
+            report_stage(&tx, &work_activity, id, "authenticating…");
+            node.authenticate_all(&peers, cred).await?;
+        }
 
-    // Recover chunks that still live in the materialized output tree, so only
-    // genuinely new bytes are pulled.
-    let scan_dir = output_dir.clone();
-    let scan_name = name.clone();
-    let old_v = old_manifest.version;
-    let mut mem = tokio::task::spawn_blocking(move || {
-        let mut mem = MemoryChunkStore::new();
-        let _ = snapshot_dir(&scan_dir, scan_name, old_v, &mut mem);
-        mem
-    })
-    .await?;
-
-    let progress_tx = tx.clone();
-    let dl = node
-        .download_share_multi_with_progress(
-            &peers,
-            &mut mem,
-            swarm_config_for(&req),
-            move |p: SwarmProgress| {
-                let _ = progress_tx.try_send(Command::ResyncProgress { id, p });
-            },
-        )
+        report_stage(&tx, &work_activity, id, "scanning existing files…");
+        // Recover chunks that still live in the materialized output tree, so only
+        // genuinely new bytes are pulled.
+        let scan_dir = output_dir.clone();
+        let scan_name = name.clone();
+        let old_v = old_manifest.version;
+        let mut mem = tokio::task::spawn_blocking(move || {
+            let mut mem = MemoryChunkStore::new();
+            let _ = snapshot_dir(&scan_dir, scan_name, old_v, &mut mem);
+            mem
+        })
         .await?;
 
-    let new_manifest = dl.share.manifest.clone();
-    let new_lists = dl.share.chunk_lists.clone();
-    let files = new_manifest.files.len();
-    let total_bytes = new_manifest.total_size();
+        report_stage(&tx, &work_activity, id, "fetching share metadata…");
+        let progress_tx = tx.clone();
+        let progress_activity = work_activity.clone();
+        let dl = node
+            .download_share_multi_with_progress(
+                &peers,
+                &mut mem,
+                swarm_config_for(&req),
+                move |p: SwarmProgress| {
+                    *progress_activity.lock().unwrap() = Instant::now();
+                    let _ = progress_tx.try_send(Command::ResyncProgress { id, p });
+                },
+            )
+            .await?;
 
-    let out2 = output_dir.clone();
-    let om = old_manifest.clone();
-    let nm = new_manifest.clone();
-    let nl = new_lists.clone();
-    let synced =
-        tokio::task::spawn_blocking(move || sync_share(&out2, &om, &nm, &nl, &mem)).await??;
+        let new_manifest = dl.share.manifest.clone();
+        let new_lists = dl.share.chunk_lists.clone();
+        let files = new_manifest.files.len();
+        let total_bytes = new_manifest.total_size();
 
-    let _ = tx
-        .send(Command::ResyncDone {
-            id,
-            outcome: Box::new(ResyncOutcome {
-                manifest: new_manifest,
-                chunk_lists: new_lists,
-                synced,
-                files,
-                total_bytes,
-            }),
-        })
-        .await;
-    Ok(())
+        let out2 = output_dir.clone();
+        let om = old_manifest.clone();
+        let nm = new_manifest.clone();
+        let nl = new_lists.clone();
+        let synced =
+            tokio::task::spawn_blocking(move || sync_share(&out2, &om, &nm, &nl, &mem)).await??;
+
+        let _ = tx
+            .send(Command::ResyncDone {
+                id,
+                outcome: Box::new(ResyncOutcome {
+                    manifest: new_manifest,
+                    chunk_lists: new_lists,
+                    synced,
+                    files,
+                    total_bytes,
+                }),
+            })
+            .await;
+        Ok(())
+    };
+
+    with_stall_watchdog(activity, work).await
 }
 
 /// Fetch the current manifest version from the first source that answers.
@@ -2152,6 +2270,35 @@ fn free_space(path: &std::path::Path) -> std::io::Result<u64> {
 #[cfg(not(any(unix, windows)))]
 fn free_space(_path: &std::path::Path) -> std::io::Result<u64> {
     Ok(0)
+}
+
+/// Minimum wall-clock gap between two speed samples. A `DownloadProgress`
+/// fires once per chunk, and several chunks can land in the same tokio poll
+/// (parallel in-flight requests completing back to back) — computing a rate
+/// from two samples microseconds apart divides real bytes by a near-zero
+/// `dt` and reports absurd multi-GiB/s speeds. Below this interval, bytes are
+/// left to accumulate against the last real sample instead of recomputing.
+const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Update `slot` (`last_sample`) with the latest `(time, bytes_done)` reading
+/// and return a new bytes/sec rate — but only once at least
+/// [`MIN_SAMPLE_INTERVAL`] has passed since the sample `slot` was last
+/// updated. `None` means "too soon, or this is the first sample" — the
+/// caller should leave the existing displayed speed alone rather than
+/// overwrite it with a noisy or unset value.
+fn sample_speed(slot: &mut Option<(Instant, u64)>, now: Instant, done: u64) -> Option<u64> {
+    match *slot {
+        Some((t0, b0)) if now.duration_since(t0) >= MIN_SAMPLE_INTERVAL => {
+            let dt = now.duration_since(t0).as_secs_f64();
+            *slot = Some((now, done));
+            Some((done.saturating_sub(b0) as f64 / dt) as u64)
+        }
+        Some(_) => None,
+        None => {
+            *slot = Some((now, done));
+            None
+        }
+    }
 }
 
 /// Credit one chunk to a source in a row's per-source breakdown.

@@ -8,7 +8,7 @@
 use gpui::WindowAppearance;
 use gpui_component::ThemeMode;
 
-pub use gaggle_ui_kit::theme::active;
+pub use gaggle_ui_kit::theme::{MONO, active};
 
 /// Resolve an [`app_state::Theme`] against the OS appearance, make the matching
 /// palette active, and return the gpui-component mode to keep its own chrome

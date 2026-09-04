@@ -50,10 +50,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config \
+            build-essential pkg-config mold \
             libssl-dev libfontconfig1-dev libfreetype6-dev \
             libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libvulkan-dev
+
+      - name: Use mold linker (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} -p gui -p launcher -p accelerator

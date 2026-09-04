@@ -2,13 +2,13 @@
 //! builders and the expandable detail panels (swarm inspector, invite form).
 
 use app_state::{
-    AccelShareRow, AcceleratorState, LogLevel, LogLine, RemoteAccelState, SourceStats, Theme,
-    TransferRow, TransferStatus,
+    AccelShareRow, AcceleratorState, LogLevel, RemoteAccelState, SourceStats, Theme, TransferRow,
+    TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, MouseButton, SharedString, deferred, div, hsla,
-    px, relative,
+    px, relative, uniform_list,
 };
 
 use crate::app::{ConfirmKind, Gaggle, Tab};
@@ -79,7 +79,7 @@ fn share_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl 
         .child(
             div()
                 .text_xs()
-                .font_family("monospace")
+                .font_family(theme::MONO)
                 .text_color(t.muted)
                 .child(if row.status == TransferStatus::Scanning {
                     format!(
@@ -92,7 +92,7 @@ fn share_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl 
                     format!("{} FILES · {}", row.files, human_bytes(row.total_bytes))
                 }),
         )
-        .child(div().text_xs().font_family("monospace").text_color(t.info).child(addr))
+        .child(div().text_xs().font_family(theme::MONO).text_color(t.info).child(addr))
         .child(
             div()
                 .flex()
@@ -151,7 +151,7 @@ fn seed_detail(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> Any
             .child(
                 div()
                     .text_xs()
-                    .font_family("monospace")
+                    .font_family(theme::MONO)
                     .text_color(t.muted)
                     .child("Tick the files & folders this invite may access."),
             )
@@ -165,7 +165,7 @@ fn seed_detail(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> Any
                     .child(
                         div()
                             .text_xs()
-                            .font_family("monospace")
+                            .font_family(theme::MONO)
                             .text_color(t.muted)
                             .child("EXPIRES"),
                     )
@@ -186,7 +186,7 @@ fn seed_detail(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> Any
                         .border_1()
                         .border_color(t.line)
                         .text_xs()
-                        .font_family("monospace")
+                        .font_family(theme::MONO)
                         .text_color(t.info)
                         .child(elide(&token, 64)),
                 )
@@ -357,7 +357,7 @@ fn tree_rows(
                 .child(
                     div()
                         .text_xs()
-                        .font_family("monospace")
+                        .font_family(theme::MONO)
                         .text_color(if on { t.fg } else { t.muted })
                         .child(name),
                 )
@@ -420,6 +420,7 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
         TransferStatus::Active | TransferStatus::Connecting | TransferStatus::Queued
     );
     let can_resume = row.status == TransferStatus::Paused;
+    let can_retry = row.status == TransferStatus::Failed;
 
     let mut c = card()
         .child(
@@ -441,13 +442,27 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                 )
                 .child(status_pill(row.status)),
         )
+        .when_some(
+            (row.status == TransferStatus::Connecting)
+                .then(|| row.detail.clone())
+                .flatten(),
+            |el, detail| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .font_family(theme::MONO)
+                        .text_color(t.muted)
+                        .child(format!("… {detail}")),
+                )
+            },
+        )
         .child(bar)
-        .child(div().text_xs().font_family("monospace").text_color(t.muted).child(line))
+        .child(div().text_xs().font_family(theme::MONO).text_color(t.muted).child(line))
         .when_some(row.error.clone(), |el, e| {
             el.child(
                 div()
                     .text_xs()
-                    .font_family("monospace")
+                    .font_family(theme::MONO)
                     .text_color(t.bad)
                     .child(format!("!! {e}")),
             )
@@ -469,6 +484,14 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                     el.child(btn(("resume", id as usize), "Resume").on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| {
                             this.app.resume(id);
+                            cx.notify();
+                        },
+                    )))
+                })
+                .when(can_retry, |el| {
+                    el.child(primary_btn(("retry", id as usize), "Retry").on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.app.retry(id);
                             cx.notify();
                         },
                     )))
@@ -536,7 +559,7 @@ fn source_line(s: &SourceStats, max_bytes: u64) -> impl IntoElement {
                 .flex()
                 .justify_between()
                 .text_xs()
-                .font_family("monospace")
+                .font_family(theme::MONO)
                 .child(div().text_color(t.info).child(short_peer(&s.peer.to_string())))
                 .child(
                     div()
@@ -565,7 +588,7 @@ pub fn accelerator(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             .child(
                 div()
                     .text_xs()
-                    .font_family("monospace")
+                    .font_family(theme::MONO)
                     .text_color(t.muted)
                     .child("Authorise it on a daemon:  accelerator authorize <key>"),
             )
@@ -576,7 +599,7 @@ pub fn accelerator(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                     .border_1()
                     .border_color(t.line)
                     .text_xs()
-                    .font_family("monospace")
+                    .font_family(theme::MONO)
                     .text_color(t.info)
                     .child(app.state.operator_key.clone()),
             )
@@ -595,7 +618,7 @@ pub fn accelerator(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             .child(
                 div()
                     .text_xs()
-                    .font_family("monospace")
+                    .font_family(theme::MONO)
                     .text_color(t.muted)
                     .child("Measures write speed + free space on the download volume."),
             )
@@ -629,7 +652,7 @@ fn accelerator_form(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         .child(
             div()
                 .text_xs()
-                .font_family("monospace")
+                .font_family(theme::MONO)
                 .text_color(t.muted)
                 .child(
                     "RELAY: hot-chunk cache + bootstrap.  NAS: durable on-disk replicas.  \
@@ -699,7 +722,7 @@ fn accel_share_row(
                 .child(
                     div()
                         .text_xs()
-                        .font_family("monospace")
+                        .font_family(theme::MONO)
                         .text_color(if s.error.is_some() { t.bad } else { t.muted })
                         .child(meta),
                 ),
@@ -728,7 +751,7 @@ fn accelerator_status(app: &Gaggle, acc: &AcceleratorState, cx: &mut Context<Gag
         c = c.child(
             div()
                 .text_xs()
-                .font_family("monospace")
+                .font_family(theme::MONO)
                 .text_color(t.info)
                 .child(addr.to_string()),
         );
@@ -842,7 +865,7 @@ fn remote_row(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> A
         .child(
             div()
                 .text_xs()
-                .font_family("monospace")
+                .font_family(theme::MONO)
                 .text_color(t.muted)
                 .child(r.admin_url.clone()),
         );
@@ -852,7 +875,7 @@ fn remote_row(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> A
     }
     if let Some(err) = &r.error {
         panel = panel.child(
-            div().text_xs().font_family("monospace").text_color(t.bad).child(format!("!! {err}")),
+            div().text_xs().font_family(theme::MONO).text_color(t.bad).child(format!("!! {err}")),
         );
     }
 
@@ -955,7 +978,7 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                     .child(
                         div()
                             .text_xs()
-                            .font_family("monospace")
+                            .font_family(theme::MONO)
                             .text_color(t.muted)
                             .child("THEME"),
                     )
@@ -976,7 +999,7 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                     .child(
                         div()
                             .text_xs()
-                            .font_family("monospace")
+                            .font_family(theme::MONO)
                             .text_color(t.muted)
                             .child("REMEMBER SHARES & TRANSFERS ON RESTART"),
                     )
@@ -1130,7 +1153,7 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
         .border_1()
         .border_color(t.accent)
         .child(section_title(&format!("Remove “{}”?", c.name)))
-        .child(div().text_xs().font_family("monospace").text_color(t.muted).child(body))
+        .child(div().text_xs().font_family(theme::MONO).text_color(t.muted).child(body))
         .child(actions)
         // Clicks inside the card must not fall through to the backdrop.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
@@ -1163,6 +1186,13 @@ pub fn body(tab: Tab, app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     }
 }
 
+/// Fixed row height for the Logs tab's `uniform_list`. `uniform_list` derives
+/// its scroll geometry from measuring a single item and applying that height
+/// to every row; leaving height to auto-size from text let it drift between
+/// renders (visible as uneven gaps/overlap between lines), so every row
+/// pins to this instead.
+const LOG_ROW_HEIGHT: f32 = 22.0;
+
 /// Captured `tracing` output from every crate in the process — a packaged GUI
 /// has no attached console, so this is the only place a background-task
 /// warning (a failed relay reservation, a rejected connection, …) is visible.
@@ -1188,10 +1218,23 @@ fn logs(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             }))
     };
 
+    // Newest-first display order, as plain indices into `app.logs` —
+    // recomputed by `Gaggle::recompute_log_order` only when `logs` or
+    // `log_min_level` actually change, *not* here: this function reruns on
+    // every scroll tick (the virtualized list below re-renders as it
+    // scrolls), and re-filtering up to 4000 lines that often was the main
+    // source of scroll jank. The actual per-line elements are still built
+    // lazily, only for whatever range `uniform_list` reports as on-screen.
+    let order = app.log_order.clone();
+    let total = app.logs.len();
+    let shown = order.len();
+
     let mut col = div()
         .flex()
         .flex_col()
         .gap_2()
+        .flex_1()
+        .min_h_0()
         .child(
             div()
                 .flex()
@@ -1200,11 +1243,22 @@ fn logs(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 .child(
                     div()
                         .flex()
+                        .items_center()
                         .gap_2()
                         .child(level_btn(LogLevel::Trace, "log-lvl-all", "ALL"))
                         .child(level_btn(LogLevel::Info, "log-lvl-info", "INFO+"))
                         .child(level_btn(LogLevel::Warn, "log-lvl-warn", "WARN+"))
-                        .child(level_btn(LogLevel::Error, "log-lvl-error", "ERROR")),
+                        .child(level_btn(LogLevel::Error, "log-lvl-error", "ERROR"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(t.muted)
+                                .child(if shown == total {
+                                    format!("{shown} lines")
+                                } else {
+                                    format!("{shown} of {total} lines")
+                                }),
+                        ),
                 )
                 .child(
                     div()
@@ -1223,30 +1277,53 @@ fn logs(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
              before launch) controls verbosity; INFO+ is the default.",
         ));
 
-    let lines: Vec<&LogLine> =
-        app.logs.iter().filter(|l| l.level >= app.log_min_level).collect();
-    if lines.is_empty() {
+    if order.is_empty() {
         col = col.child(hint("NO LOG LINES YET AT THIS LEVEL."));
     } else {
-        // Most-recent first; a render cap keeps a long-running session's tab
-        // switch cheap (the full buffer is still there for Copy).
-        let mut list = div().flex().flex_col().gap_1().font_family("monospace").text_xs();
-        for line in lines.iter().rev().take(1000) {
-            let color = match line.level {
-                LogLevel::Error | LogLevel::Warn => t.bad,
-                LogLevel::Info => t.fg,
-                LogLevel::Debug | LogLevel::Trace => t.muted,
-            };
-            list = list.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(div().text_color(t.muted).child(fmt_log_time(line.time_unix)))
-                    .child(div().w(px(44.0)).text_color(color).child(line.level.label()))
-                    .child(div().text_color(t.muted).child(line.target.clone()))
-                    .child(div().flex_1().text_color(color).child(line.message.clone())),
-            );
-        }
+        let logs = app.logs.clone();
+        let list = uniform_list("log-lines", order.len(), move |range, _window, _cx| {
+            range
+                .map(|i| {
+                    let line = &logs[order[i]];
+                    let color = match line.level {
+                        LogLevel::Error | LogLevel::Warn => t.bad,
+                        LogLevel::Info => t.fg,
+                        LogLevel::Debug | LogLevel::Trace => t.muted,
+                    };
+                    let stripe = if i % 2 == 0 { t.panel } else { t.panel_hi };
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_1()
+                        .h(px(LOG_ROW_HEIGHT))
+                        .overflow_hidden()
+                        .bg(stripe)
+                        .child(
+                            div()
+                                .w(px(64.0))
+                                .flex_shrink_0()
+                                .text_color(t.muted)
+                                .child(fmt_log_time(line.time_unix)),
+                        )
+                        .child(div().w(px(40.0)).flex_shrink_0().text_color(color).child(line.level.label()))
+                        .child(
+                            div()
+                                .w(px(160.0))
+                                .flex_shrink_0()
+                                .truncate()
+                                .text_color(t.muted)
+                                .child(line.target.clone()),
+                        )
+                        .child(div().flex_1().truncate().text_color(color).child(line.message.clone()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .font_family(theme::MONO)
+        .text_xs();
         col = col.child(list);
     }
 

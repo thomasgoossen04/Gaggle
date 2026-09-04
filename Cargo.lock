@@ -2684,6 +2684,7 @@ version = "2.0.0"
 dependencies = [
  "gpui",
  "gpui-component",
+ "tracing",
 ]
 
 [[package]]

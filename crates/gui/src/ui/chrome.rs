@@ -10,7 +10,7 @@ use gpui_component::InteractiveElementExt as _;
 
 use crate::app::{Gaggle, Tab};
 use crate::theme;
-use crate::ui::widgets::{hazard_bar, win_btn};
+use crate::ui::widgets::win_btn;
 use crate::util::spaced;
 
 /// The custom title bar + the hazard rule beneath it.
@@ -59,7 +59,7 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                 .justify_between()
                 .pl(if is_macos { px(78.0) } else { px(16.0) })
                 .pr_1()
-                .py_2()
+                .py_3()
                 // Drag-to-move: arm on press, fire the compositor move on the
                 // first drag, so clicks on the tabs / controls still land.
                 .on_mouse_down(
@@ -125,7 +125,6 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                         }),
                 ),
         )
-        .child(hazard_bar())
 }
 
 /// The bottom status line: a notice, or the swarm summary when idle.
@@ -149,7 +148,7 @@ pub fn status_bar(app: &Gaggle) -> impl IntoElement {
         .border_t_1()
         .border_color(t.line)
         .text_xs()
-        .font_family("monospace")
+        .font_family(theme::MONO)
         .child(div().text_color(t.accent).child("▍"))
         .child(
             div()

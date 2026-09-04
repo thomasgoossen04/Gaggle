@@ -69,6 +69,10 @@ fn main() -> anyhow::Result<()> {
 
     Application::new().run(move |cx| {
         gpui_component::init(cx);
+        // Register the embedded monospace font before anything renders — see
+        // `gaggle_ui_kit::fonts` for why bundling it (rather than relying on
+        // the OS to have a font named "monospace") matters on Windows/macOS.
+        gaggle_ui_kit::fonts::install(cx);
         // Seed the palette (and gpui-component's own frame colour) from the
         // persisted setting; `Gaggle::render` keeps it current thereafter.
         let mode = theme::activate(app.snapshot().settings.theme, cx.window_appearance());

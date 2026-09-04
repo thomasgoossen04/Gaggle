@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -98,8 +99,21 @@ pub struct Gaggle {
     /// The process's captured `tracing` output — see the Logs tab.
     pub(crate) log_handle: LogHandle,
     /// The last-polled snapshot of `log_handle`, refreshed only while the
-    /// Logs tab is open.
-    pub(crate) logs: Vec<LogLine>,
+    /// Logs tab is open. `Rc`-shared rather than cloned per render so the
+    /// virtualized log list (`ui::views::logs`) can hand its render closure
+    /// a cheap handle instead of copying every line's strings each frame.
+    pub(crate) logs: Rc<[LogLine]>,
+    /// `log_handle.version()` as of the last `logs` refresh — lets the
+    /// poller skip re-snapshotting (and the re-render it would trigger)
+    /// when nothing new has been logged.
+    pub(crate) logs_version: u64,
+    /// Newest-first indices into `logs` passing `log_min_level`, recomputed
+    /// only in [`Self::recompute_log_order`] (whenever `logs` or
+    /// `log_min_level` actually changes) rather than on every render — the
+    /// Logs tab's `uniform_list` re-renders on every scroll tick, and
+    /// re-filtering up to 4000 lines on each of those was the main source of
+    /// scroll jank.
+    pub(crate) log_order: Rc<[usize]>,
     /// Logs tab: only show lines at or above this severity.
     pub(crate) log_min_level: LogLevel,
     /// Rows whose detail panel (swarm inspector / invite form) is open.
@@ -184,17 +198,37 @@ impl Gaggle {
         let remote_add = text(cx, window, String::new());
 
         // Poll the manager (and, while the Logs tab is open, the log buffer)
-        // and re-render on change.
+        // and re-render on change. Both checks are cheap no-ops when nothing
+        // changed (a `watch` version check, an atomic load) — the actual
+        // state clone / log snapshot / `cx.notify()` (which forces a full
+        // re-render of whichever tab is showing) only happen when there's
+        // something new, instead of unconditionally 5x/sec forever. That
+        // matters most for the heavier tabs (Logs, Accelerator): a redundant
+        // background re-render was competing for frame budget right when a
+        // tab switch also needed to lay out a tab's worth of elements fresh.
+        let mut state_rx = app.state_watch();
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_millis(200)).await;
                 let stop = this
                     .update(cx, |this: &mut Gaggle, cx| {
-                        this.state = this.app.snapshot();
-                        if this.tab == Tab::Logs {
-                            this.logs = this.log_handle.snapshot();
+                        let mut changed = false;
+                        if state_rx.has_changed().unwrap_or(false) {
+                            this.state = state_rx.borrow_and_update().clone();
+                            changed = true;
                         }
-                        cx.notify();
+                        if this.tab == Tab::Logs {
+                            let v = this.log_handle.version();
+                            if v != this.logs_version {
+                                this.logs_version = v;
+                                this.logs = this.log_handle.snapshot().into();
+                                this.recompute_log_order();
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            cx.notify();
+                        }
                     })
                     .is_err();
                 if stop {
@@ -210,7 +244,9 @@ impl Gaggle {
             tab: Tab::Transfers,
             notice: None,
             log_handle,
-            logs: Vec::new(),
+            logs: Rc::from([]),
+            logs_version: 0,
+            log_order: Rc::from([]),
             log_min_level: LogLevel::Info,
             expanded: HashSet::new(),
             invite_expiry: ExpiryChoice::Never,
@@ -243,19 +279,39 @@ impl Gaggle {
     pub(crate) fn switch_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
         if tab == Tab::Logs {
-            self.logs = self.log_handle.snapshot();
+            self.logs_version = self.log_handle.version();
+            self.logs = self.log_handle.snapshot().into();
+            self.recompute_log_order();
         }
         cx.notify();
     }
 
+    /// Rebuild [`Self::log_order`] from the current `logs` + `log_min_level`.
+    /// Call whenever either changes — never from the render path, since the
+    /// Logs tab's `uniform_list` re-renders on every scroll tick and
+    /// filtering up to 4000 lines that often is real, measurable cost.
+    fn recompute_log_order(&mut self) {
+        self.log_order = self
+            .logs
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.level >= self.log_min_level)
+            .map(|(i, _)| i)
+            .rev()
+            .collect();
+    }
+
     pub(crate) fn set_log_min_level(&mut self, level: LogLevel, cx: &mut Context<Self>) {
         self.log_min_level = level;
+        self.recompute_log_order();
         cx.notify();
     }
 
     pub(crate) fn clear_logs(&mut self, cx: &mut Context<Self>) {
         self.log_handle.clear();
-        self.logs.clear();
+        self.logs = Rc::from([]);
+        self.log_order = Rc::from([]);
+        self.logs_version = self.log_handle.version();
         cx.notify();
     }
 
@@ -691,14 +747,23 @@ impl Render for Gaggle {
             .text_color(t.fg)
             .text_sm()
             .child(ui::chrome::header(self, window, cx))
-            .child(
+            .child({
+                // The Logs tab manages its own scroll region (a virtualized
+                // `uniform_list`, which needs a *bounded* height to compute a
+                // viewport from) rather than growing to fit its content, so it
+                // can't sit in this generic auto-height scroller with every
+                // other tab — that would either collapse it to zero height or
+                // give it two nested scrollbars.
+                let logs_tab = self.tab == Tab::Logs;
                 div()
                     .id("body")
                     .flex_1()
-                    .overflow_y_scroll()
+                    .min_h_0()
                     .p_4()
-                    .child(ui::views::body(self.tab, self, cx)),
-            )
+                    .when(logs_tab, |d| d.flex().flex_col().overflow_hidden())
+                    .when(!logs_tab, |d| d.overflow_y_scroll())
+                    .child(ui::views::body(self.tab, self, cx))
+            })
             .child(ui::chrome::status_bar(self))
             .children(ui::views::confirm_modal(self, cx))
     }

@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -69,6 +70,11 @@ pub struct LogLine {
 
 struct Inner {
     lines: Mutex<VecDeque<LogLine>>,
+    /// Bumped on every captured line and on `clear()` — a cheap way for a
+    /// poller to tell "did anything change?" without locking `lines` and
+    /// cloning the buffer. Monotonic even once the ring buffer is full and
+    /// `lines.len()` stops changing (push+evict keeps the length constant).
+    version: AtomicU64,
 }
 
 /// A cheap-to-clone handle onto the process's captured log lines.
@@ -81,8 +87,17 @@ impl LogHandle {
         self.0.lines.lock().unwrap().iter().cloned().collect()
     }
 
+    /// Monotonically increasing counter, bumped on every new line and on
+    /// `clear()`. Compare against a previously-read value to skip a
+    /// `snapshot()` (and the re-render it would trigger) when nothing new
+    /// has been logged since.
+    pub fn version(&self) -> u64 {
+        self.0.version.load(Ordering::Relaxed)
+    }
+
     pub fn clear(&self) {
         self.0.lines.lock().unwrap().clear();
+        self.0.version.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -103,6 +118,8 @@ impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
             lines.pop_front();
         }
         lines.push_back(line);
+        drop(lines);
+        self.0.version.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -153,7 +170,8 @@ static HANDLE: OnceLock<LogHandle> = OnceLock::new();
 pub fn init() -> LogHandle {
     HANDLE
         .get_or_init(|| {
-            let inner = Arc::new(Inner { lines: Mutex::new(VecDeque::new()) });
+            let inner =
+                Arc::new(Inner { lines: Mutex::new(VecDeque::new()), version: AtomicU64::new(0) });
             let handle = LogHandle(inner.clone());
             let filter =
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

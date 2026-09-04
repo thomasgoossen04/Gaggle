@@ -166,7 +166,7 @@ impl Render for Launcher {
                     .child(
                         div()
                             .text_xs()
-                            .font_family("monospace")
+                            .font_family(theme::MONO)
                             .text_color(t.muted)
                             .child(match self.updater.channel() {
                                 Channel::Beta => "// GAGGLE UPDATER · BETA",
@@ -208,7 +208,7 @@ impl Render for Launcher {
                     .child(
                         div()
                             .text_xs()
-                            .font_family("monospace")
+                            .font_family(theme::MONO)
                             .font_weight(FontWeight::BOLD)
                             .text_color(t.muted)
                             .child(spaced("LAUNCHER")),
@@ -218,7 +218,7 @@ impl Render for Launcher {
                 div()
                     .w_full()
                     .text_center()
-                    .font_family("monospace")
+                    .font_family(theme::MONO)
                     .text_xs()
                     .text_color(t.fg)
                     .child(status.line().to_uppercase()),
@@ -265,7 +265,7 @@ impl Render for Launcher {
                 .border_color(if active { t.accent } else { t.line })
                 .bg(if active { t.accent } else { t.panel_hi })
                 .text_color(if active { t.on_accent } else { t.muted })
-                .font_family("monospace")
+                .font_family(theme::MONO)
                 .font_weight(FontWeight::BOLD)
                 .text_size(px(9.0))
                 .cursor_pointer()
@@ -281,7 +281,7 @@ impl Render for Launcher {
             .gap_1()
             .child(
                 div()
-                    .font_family("monospace")
+                    .font_family(theme::MONO)
                     .text_size(px(9.0))
                     .text_color(t.muted)
                     .child("CH"),
@@ -331,7 +331,7 @@ impl Render for Launcher {
                 .child(box_)
                 .child(
                     div()
-                        .font_family("monospace")
+                        .font_family(theme::MONO)
                         .text_size(px(9.0))
                         .text_color(t.muted)
                         .child("DESKTOP SHORTCUT"),
@@ -348,7 +348,7 @@ impl Render for Launcher {
                 .bottom_1()
                 .right_2()
                 .text_color(t.muted)
-                .font_family("monospace")
+                .font_family(theme::MONO)
                 .text_size(px(9.0))
                 .child(VERSION),
         );

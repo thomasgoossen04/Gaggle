@@ -13,8 +13,7 @@ use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputState};
 
 pub use gaggle_ui_kit::widgets::{
-    btn, card, chip, danger_btn, hazard_bar, hint, kv, primary_btn, progress_bar, section_title,
-    win_btn,
+    btn, card, chip, danger_btn, hint, kv, primary_btn, progress_bar, section_title, win_btn,
 };
 
 use crate::theme;
@@ -91,7 +90,7 @@ fn field_row(label: &str, input: impl IntoElement) -> AnyElement {
             div()
                 .min_w(px(150.0))
                 .text_xs()
-                .font_family("monospace")
+                .font_family(theme::MONO)
                 .text_color(t.muted)
                 .child(label.to_uppercase()),
         )
@@ -114,7 +113,7 @@ pub fn status_pill(status: TransferStatus) -> Div {
         .border_1()
         .border_color(color)
         .text_xs()
-        .font_family("monospace")
+        .font_family(theme::MONO)
         .font_weight(FontWeight::BOLD)
         .text_color(color)
         .child(status.label().to_uppercase())

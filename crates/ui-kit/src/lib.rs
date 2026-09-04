@@ -5,5 +5,6 @@
 //! [`gui`](../gui) and the [`launcher`](../launcher) render identically without
 //! either copying the palette.
 
+pub mod fonts;
 pub mod theme;
 pub mod widgets;

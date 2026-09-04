@@ -108,6 +108,13 @@ pub struct TransferRow {
     /// Download only: a newer manifest version seen by the last update check.
     /// Cleared by a successful resync.
     pub update_available: Option<u64>,
+    /// Human-readable phase text while `status` is `Connecting` — e.g.
+    /// "resolving 2 source(s)…", "authenticating…", "fetching share
+    /// metadata…" — so the UI can show *what* it's waiting on instead of a
+    /// static label. Cleared once real transfer progress starts. Paired with
+    /// a stall watchdog: if this goes stale too long the transfer fails with
+    /// a clear error instead of sitting on "Connecting" forever.
+    pub detail: Option<String>,
 }
 
 impl TransferRow {

@@ -165,7 +165,7 @@ pub fn hazard_bar() -> impl IntoElement {
 pub fn section_title(text: &str) -> Div {
     let t = theme::active();
     div()
-        .font_family("monospace")
+        .font_family(theme::MONO)
         .font_weight(FontWeight::BOLD)
         .text_color(t.fg)
         .child(format!("▮ {}", text.to_uppercase()))
@@ -177,7 +177,7 @@ pub fn hint(text: &str) -> Div {
     div()
         .p_3()
         .text_xs()
-        .font_family("monospace")
+        .font_family(theme::MONO)
         .text_color(t.muted)
         .child(format!("// {text}"))
 }
@@ -190,7 +190,7 @@ pub fn kv(key: &str, value: String) -> Div {
         .justify_between()
         .gap_3()
         .text_xs()
-        .font_family("monospace")
+        .font_family(theme::MONO)
         .child(div().text_color(t.muted).child(key.to_uppercase()))
         .child(div().text_color(t.fg).child(value))
 }
@@ -203,7 +203,7 @@ pub fn chip(text: &str, color: gpui::Hsla) -> Div {
         .border_1()
         .border_color(color)
         .text_xs()
-        .font_family("monospace")
+        .font_family(theme::MONO)
         .font_weight(FontWeight::BOLD)
         .text_color(color)
         .child(text.to_uppercase())

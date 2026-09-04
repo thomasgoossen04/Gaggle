@@ -707,7 +707,8 @@ impl EventLoop {
         }
 
         if let Some(addrs) = self.peer_addrs.get(&peer).filter(|a| !a.is_empty()) {
-            let addrs = addrs.iter().cloned().collect();
+            let addrs: Vec<_> = addrs.iter().cloned().collect();
+            tracing::info!(%peer, addrs = ?addrs, "dialing peer");
             if let Err(e) = self.swarm.dial(
                 DialOpts::peer_id(peer)
                     .addresses(addrs)
@@ -715,10 +716,12 @@ impl EventLoop {
                     .condition(PeerCondition::DisconnectedAndNotDialing)
                     .build(),
             ) {
+                tracing::warn!(%peer, error = %e, detail = ?e, "dial failed immediately");
                 self.fail_awaiting(peer, format!("dialing {peer}: {e}"));
             }
         } else {
             // No known route — ask the DHT who is close to this peer id.
+            tracing::info!(%peer, "no known route; querying the DHT for closest peers");
             let qid = self.swarm.behaviour_mut().kademlia.get_closest_peers(peer);
             self.pending_route.insert(qid, peer);
         }
@@ -759,6 +762,7 @@ impl EventLoop {
                 }
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                tracing::info!(peer = %peer_id, "connected");
                 if let Some(reply) = self.pending_connect.remove(&peer_id) {
                     let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
                     let _ = reply.send(Ok(peer_id));
@@ -770,6 +774,12 @@ impl EventLoop {
                 self.grants.remove(&peer_id);
             }
             SwarmEvent::OutgoingConnectionError { peer_id: Some(peer), error, .. } => {
+                // `%error` alone often collapses to a generic one-liner (e.g.
+                // "failed to negotiate transport protocol(s)"); `?error`'s Debug
+                // usually itemizes every address that was tried and how each
+                // one failed, which is what actually tells a LAN-firewall
+                // failure apart from a dead relay circuit.
+                tracing::warn!(%peer, error = %error, detail = ?error, "outgoing connection failed");
                 if let Some(reply) = self.pending_connect.remove(&peer) {
                     let _ = reply.send(Err(anyhow::anyhow!("connecting to {peer}: {error}")));
                 }
@@ -805,10 +815,12 @@ impl EventLoop {
                 }
             },
             PeerBehaviourEvent::ChunkExchange(request_response::Event::OutboundFailure {
+                peer,
                 request_id,
                 error,
                 ..
             }) => {
+                tracing::warn!(%peer, %error, "outbound request failed");
                 if let Some(reply) = self.pending_requests.remove(&request_id) {
                     let _ = reply.send(Err(anyhow::anyhow!("request failed: {error}")));
                 }
@@ -889,6 +901,7 @@ impl EventLoop {
                 let has_addr =
                     self.peer_addrs.get(&target).map(|a| !a.is_empty()).unwrap_or(false);
                 if found && has_addr {
+                    tracing::info!(peer = %target, "found route via DHT; dialing");
                     let addrs = self.peer_addrs[&target].iter().cloned().collect();
                     if let Err(e) = self.swarm.dial(
                         DialOpts::peer_id(target)
@@ -897,9 +910,11 @@ impl EventLoop {
                             .condition(PeerCondition::DisconnectedAndNotDialing)
                             .build(),
                     ) {
+                        tracing::warn!(peer = %target, error = %e, detail = ?e, "dial failed immediately");
                         self.fail_awaiting(target, format!("dialing {target}: {e}"));
                     }
                 } else {
+                    tracing::warn!(peer = %target, "no route found on the DHT");
                     self.fail_awaiting(target, format!("no route found to {target} on the DHT"));
                 }
             }

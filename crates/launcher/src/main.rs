@@ -171,6 +171,9 @@ fn headless_update(up: &Updater) -> anyhow::Result<()> {
 fn run_window(up: Updater) {
     Application::new().run(move |cx| {
         gpui_component::init(cx);
+        // See `gaggle_ui_kit::fonts` — without this, "monospace" fails to
+        // resolve to any font on Windows/macOS.
+        gaggle_ui_kit::fonts::install(cx);
         let dark = matches!(
             cx.window_appearance(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark

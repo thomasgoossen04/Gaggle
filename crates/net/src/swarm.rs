@@ -145,6 +145,7 @@ where
     let max_load = config.per_peer_parallelism.max(1);
     let prefer: HashSet<PeerId> = config.prefer.iter().copied().collect();
 
+    tracing::info!(sources = sources.len(), "fetching manifest");
     // 1. Manifest and chunk lists, from whichever source answers.
     let mut manifest = match from_any(sources, &request, Request::GetManifest(config.manifest_id))
         .await?
@@ -169,6 +170,7 @@ where
             .retain(|d| manifest.files.iter().any(|f| f.path.starts_with(&format!("{d}/"))));
     }
 
+    tracing::info!(files = manifest.files.len(), "fetching chunk lists");
     let mut chunk_lists: BTreeMap<String, ChunkList> = BTreeMap::new();
     for file in &manifest.files {
         let list = match from_any(sources, &request, Request::GetChunkList(file.root)).await? {
@@ -211,6 +213,7 @@ where
     //    inventory we cannot read is assumed to hold everything (optimistic — a
     //    wrong guess only costs one `NotFound` round trip, after which it is
     //    dropped for that chunk).
+    tracing::info!(chunks_needed = needed.len(), "querying source inventories");
     let mut holders: HashMap<Hash, Vec<PeerId>> = HashMap::new();
     for &peer in sources {
         match request(peer, Request::GetInventory).await {
@@ -222,13 +225,19 @@ where
                     }
                 }
             }
-            _ => {
+            other => {
+                tracing::warn!(
+                    %peer,
+                    result = ?other.as_ref().map(Response::kind),
+                    "could not read inventory; assuming it holds everything needed"
+                );
                 for &hash in &needed {
                     holders.entry(hash).or_default().push(peer);
                 }
             }
         }
     }
+    tracing::info!(sources = sources.len(), chunks = needed.len(), "starting chunk transfer");
     for &hash in &needed {
         if holders.get(&hash).is_none_or(|h| h.is_empty()) {
             anyhow::bail!("no source holds chunk {hash}");

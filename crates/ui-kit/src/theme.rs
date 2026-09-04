@@ -10,6 +10,8 @@ use std::cell::Cell;
 use gpui::Hsla;
 use gpui_component::ThemeMode;
 
+pub use crate::fonts::MONO;
+
 /// Opaque `Hsla` from degrees / unit saturation / unit lightness. `const` so
 /// palettes can live in `static`s.
 const fn c(h: f32, s: f32, l: f32) -> Hsla {
