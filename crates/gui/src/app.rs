@@ -17,7 +17,8 @@ use gpui::{ClipboardItem, Entity, PathPromptOptions, SharedString, Timer, Window
 use gpui_component::input::InputState;
 
 use crate::util::{
-    fmt_minutes, fmt_rate_mib, fmt_size_gib, parse_minutes, parse_rate_mib, parse_size_gib,
+    fmt_minutes, fmt_rate_mib, fmt_size_gib, fmt_size_mib, parse_minutes, parse_rate_mib,
+    parse_size_gib, parse_size_mib,
 };
 use crate::{clipboard, theme, ui};
 
@@ -119,6 +120,8 @@ pub struct Gaggle {
     pub(crate) set_ul: Entity<InputState>,
     pub(crate) set_store: Entity<InputState>,
     pub(crate) set_resync: Entity<InputState>,
+    /// Seed hot-chunk cache budget, in MiB.
+    pub(crate) set_seed_cache: Entity<InputState>,
     // Accelerator form.
     pub(crate) accel_cache: Entity<InputState>,
     pub(crate) accel_link: Entity<InputState>,
@@ -160,6 +163,7 @@ impl Gaggle {
         let set_ul = num(cx, window, fmt_rate_mib(s.upload_cap_bps), decimal.clone());
         let set_store = num(cx, window, fmt_size_gib(s.storage_cap_bytes), decimal);
         let set_resync = num(cx, window, fmt_minutes(s.auto_resync_secs), integer.clone());
+        let set_seed_cache = num(cx, window, fmt_size_mib(s.seed_cache_bytes), integer.clone());
         let accel_cache = num(cx, window, "256".into(), integer);
         let accel_link = text(cx, window, String::new());
         let accel_dir = text(cx, window, String::new());
@@ -204,6 +208,7 @@ impl Gaggle {
             set_ul,
             set_store,
             set_resync,
+            set_seed_cache,
             accel_cache,
             accel_link,
             accel_dir,
@@ -451,6 +456,7 @@ impl Gaggle {
         let ul = parse_rate_mib(&self.set_ul.read(cx).value());
         let store = parse_size_gib(&self.set_store.read(cx).value());
         let resync = parse_minutes(&self.set_resync.read(cx).value());
+        let seed_cache = parse_size_mib(&self.set_seed_cache.read(cx).value());
 
         let mut next = self.state.settings.clone();
         if !dir.trim().is_empty() {
@@ -460,6 +466,8 @@ impl Gaggle {
         next.upload_cap_bps = ul;
         next.storage_cap_bytes = store;
         next.auto_resync_secs = resync;
+        // Blank / unparseable keeps the current budget (core enforces a floor).
+        next.seed_cache_bytes = seed_cache.unwrap_or(self.state.settings.seed_cache_bytes);
         self.app.update_settings(next);
         self.set_notice("Settings saved", cx);
     }

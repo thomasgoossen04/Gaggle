@@ -33,8 +33,9 @@ impl Role {
 pub struct Home(PathBuf);
 
 impl Home {
-    /// `--home` if given, else `$GAGGLE_ACCEL_HOME`, else
-    /// `$HOME/.local/share/gaggle/accelerator`, else a temp dir.
+    /// `--home` if given, else `$GAGGLE_ACCEL_HOME`, else the per-OS data dir
+    /// (`~/.local/share` on Linux, `~/Library/Application Support` on macOS,
+    /// `%APPDATA%` on Windows) `+ /gaggle/accelerator`, else a temp dir.
     pub fn resolve(explicit: Option<PathBuf>) -> Self {
         if let Some(dir) = explicit {
             return Self(dir);
@@ -42,8 +43,8 @@ impl Home {
         if let Some(dir) = std::env::var_os("GAGGLE_ACCEL_HOME") {
             return Self(PathBuf::from(dir));
         }
-        if let Some(home) = std::env::var_os("HOME") {
-            return Self(PathBuf::from(home).join(".local/share/gaggle/accelerator"));
+        if let Some(data) = dirs::data_dir() {
+            return Self(data.join("gaggle").join("accelerator"));
         }
         Self(std::env::temp_dir().join("gaggle-accelerator"))
     }

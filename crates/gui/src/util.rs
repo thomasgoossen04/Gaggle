@@ -47,6 +47,16 @@ pub fn parse_size_gib(s: &str) -> Option<u64> {
         .map(|v| (v * (1u64 << 30) as f64) as u64)
 }
 
+/// A MiB figure as bytes.
+pub fn parse_size_mib(s: &str) -> Option<u64> {
+    let t = s.trim();
+    (!t.is_empty())
+        .then(|| t.parse::<f64>().ok())
+        .flatten()
+        .filter(|v| *v > 0.0)
+        .map(|v| (v * (1u64 << 20) as f64) as u64)
+}
+
 /// A minutes figure as seconds.
 pub fn parse_minutes(s: &str) -> Option<u64> {
     let t = s.trim();
@@ -65,6 +75,15 @@ pub fn fmt_size_gib(bytes: Option<u64>) -> String {
     match bytes {
         Some(v) => format!("{:.0}", v as f64 / (1u64 << 30) as f64),
         None => String::new(),
+    }
+}
+
+/// A byte count as whole MiB, for pre-filling a field. `0 → ""`.
+pub fn fmt_size_mib(bytes: u64) -> String {
+    if bytes == 0 {
+        String::new()
+    } else {
+        format!("{:.0}", bytes as f64 / (1u64 << 20) as f64)
     }
 }
 

@@ -5,7 +5,8 @@ use std::fs;
 use std::path::Path;
 
 use gaggle_core::{
-    DiskChunkStore, Manifest, MemoryChunkStore, snapshot_dir, sync_share, write_share,
+    DiskChunkStore, Manifest, MemoryChunkStore, SourceChunkStore, index_dir, snapshot_dir,
+    sync_share, write_share,
 };
 
 /// Deterministic pseudo-random bytes (splitmix64).
@@ -80,6 +81,49 @@ fn snapshot_builds_a_verifiable_manifest_and_dedups() {
 
     let json = snap.manifest.to_json().unwrap();
     assert_eq!(Manifest::from_json(&json).unwrap(), snap.manifest);
+}
+
+#[test]
+fn index_dir_locates_every_chunk_and_serves_the_folder_from_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let a = pattern(3 * 1024 * 1024, 5);
+    let mut a_plus = a.clone();
+    a_plus.extend_from_slice(&pattern(1024 * 1024, 55));
+    write(root, "a/x.bin", &a);
+    write(root, "a/y.bin", &a); // dedups against x.bin
+    write(root, "b/z.bin", &a_plus);
+    write(root, "b/small.txt", b"hi");
+    write(root, "b/empty.bin", b"");
+    fs::create_dir_all(root.join("c/empty-dir")).unwrap();
+
+    let idx = index_dir(root, "share", 1).unwrap();
+
+    // Same manifest a MemoryChunkStore scan would produce.
+    let mut mem = MemoryChunkStore::new();
+    let plain = snapshot_dir(root, "share", 1, &mut mem).unwrap();
+    assert_eq!(idx.manifest, plain.manifest);
+
+    // Every chunk referenced by any file has a source location.
+    for list in idx.chunk_lists.values() {
+        for chunk in &list.chunks {
+            assert!(idx.locations.contains_key(&chunk.hash), "missing location for {}", chunk.hash);
+        }
+    }
+
+    // A SourceChunkStore over that index rebuilds the tree byte-for-byte,
+    // holding well under the folder size in RAM.
+    let store = SourceChunkStore::new(root, idx.locations, SourceChunkStore::MIN_BUDGET_BYTES);
+    let out = tempfile::tempdir().unwrap();
+    write_share(out.path(), &idx.manifest, &idx.chunk_lists, &store).unwrap();
+
+    assert_eq!(fs::read(out.path().join("a/x.bin")).unwrap(), a);
+    assert_eq!(fs::read(out.path().join("a/y.bin")).unwrap(), a);
+    assert_eq!(fs::read(out.path().join("b/z.bin")).unwrap(), a_plus);
+    assert_eq!(fs::read(out.path().join("b/small.txt")).unwrap(), b"hi");
+    assert!(out.path().join("c/empty-dir").is_dir());
+    assert!(store.disk_reads() > 0 && store.failed_reads() == 0);
 }
 
 #[test]

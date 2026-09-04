@@ -8,17 +8,17 @@
 //! bytes into a [`ChunkStore`], and returns the [`Manifest`] plus the per-file
 //! [`ChunkList`]s.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, Metadata};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 
-use crate::chunk::{ChunkerConfig, chunk_reader};
+use crate::chunk::{ChunkWithData, ChunkerConfig, chunk_reader};
 use crate::chunklist::ChunkList;
 use crate::error::{Error, Result};
 use crate::hash::Hash;
 use crate::manifest::{FileEntry, Manifest};
-use crate::store::ChunkStore;
+use crate::store::{ChunkLocation, ChunkStore};
 
 /// Everything derived from a folder.
 pub struct Snapshot {
@@ -32,6 +32,18 @@ pub struct Snapshot {
     pub skipped: Vec<PathBuf>,
 }
 
+/// A folder scan that also records where each chunk lives in the source tree,
+/// so a share can be **served by reading chunks back from the original files on
+/// demand** — no chunk bytes are retained. See [`index_dir`].
+pub struct IndexedSnapshot {
+    pub manifest: Manifest,
+    pub chunk_lists: BTreeMap<String, ChunkList>,
+    pub skipped: Vec<PathBuf>,
+    /// First-seen source location of every distinct chunk hash. A chunk shared
+    /// between files (dedup) is recorded once — any occurrence serves it.
+    pub locations: HashMap<Hash, ChunkLocation>,
+}
+
 /// Chunk every regular file under `root`, populate `store`, and build the
 /// manifest + chunk lists. Chunk size adapts to each file (see
 /// [`ChunkerConfig::for_file_size`]).
@@ -40,6 +52,42 @@ pub fn snapshot_dir(
     name: impl Into<String>,
     version: u64,
     store: &mut dyn ChunkStore,
+) -> Result<Snapshot> {
+    scan_tree(root, name, version, |_rel, cwd| {
+        store.put(cwd.chunk.hash, cwd.data);
+    })
+}
+
+/// Like [`snapshot_dir`] but instead of storing chunk bytes it records a
+/// `hash -> `[`ChunkLocation`] map (path + byte range within the source tree).
+/// Feed the result to [`SourceChunkStore`](crate::SourceChunkStore) to seed a
+/// large folder with only a bounded in-RAM hot-chunk cache — no second copy on
+/// disk, no whole-folder buffer.
+pub fn index_dir(root: &Path, name: impl Into<String>, version: u64) -> Result<IndexedSnapshot> {
+    let mut locations: HashMap<Hash, ChunkLocation> = HashMap::new();
+    let snap = scan_tree(root, name, version, |rel, cwd| {
+        locations.entry(cwd.chunk.hash).or_insert(ChunkLocation {
+            path: rel.to_owned(),
+            offset: cwd.chunk.offset,
+            len: cwd.chunk.len,
+        });
+    })?;
+    Ok(IndexedSnapshot {
+        manifest: snap.manifest,
+        chunk_lists: snap.chunk_lists,
+        skipped: snap.skipped,
+        locations,
+    })
+}
+
+/// The shared walk-and-chunk pass behind [`snapshot_dir`] and [`index_dir`].
+/// `on_chunk` is handed each chunk (with its bytes) as it is produced, together
+/// with the owning file's manifest-relative path.
+fn scan_tree(
+    root: &Path,
+    name: impl Into<String>,
+    version: u64,
+    mut on_chunk: impl FnMut(&str, ChunkWithData),
 ) -> Result<Snapshot> {
     if !root.is_dir() {
         return Err(Error::Io(std::io::Error::new(
@@ -69,8 +117,9 @@ pub fn snapshot_dir(
         let mut chunks = Vec::new();
         for item in chunk_reader(reader, cfg)? {
             let cwd = item?;
-            store.put(cwd.chunk.hash, cwd.data);
-            chunks.push(cwd.chunk);
+            let chunk = cwd.chunk;
+            on_chunk(&rel, cwd);
+            chunks.push(chunk);
         }
 
         let list = ChunkList::from_chunks(&chunks);

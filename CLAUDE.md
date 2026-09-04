@@ -11,9 +11,15 @@ throughput. The full design and the milestone roadmap live in `notes/plan.md` (t
 directory is git-ignored — read it, don't rely on it being present for others).
 
 Milestone 1 (the `gaggle-core` data model — chunking, Merkle trees, manifest, dedup)
-is implemented and tested. `gaggle-core` ships three `ChunkStore`s: `MemoryChunkStore`
+is implemented and tested. `gaggle-core` ships four `ChunkStore`s: `MemoryChunkStore`
 (a plain map), `LruChunkCache` (byte-budgeted, LRU eviction — the relay's hot cache),
-and `DiskChunkStore` (durable, one sharded file per chunk — the NAS replica).
+`DiskChunkStore` (durable, one sharded file per chunk — the NAS replica), and
+`SourceChunkStore` (streaming seed — no bytes retained: it reads each requested chunk
+from the original files on disk, verifies it, and holds it in a bounded `LruChunkCache`).
+`snapshot::index_dir` is `snapshot_dir` without the `store.put`: it returns the same
+manifest + chunk lists plus a `Hash -> ChunkLocation {path, offset, len}` map to feed a
+`SourceChunkStore`, so seeding a 100 GB folder costs a bounded RAM cache and no second
+on-disk copy.
 `snapshot::write_share` is `snapshot_dir`'s inverse: materialize a share's files from
 any store back onto disk. `snapshot::sync_share` is its delta form (milestone 10):
 given the old + new manifests it rebuilds only added/changed files, deletes removed
@@ -78,8 +84,9 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   multi-share accelerators" below): `accelerator run [--role relay|nas]
   [--cache-mib N] [--dir <path>] [--admin-listen host:port] [--listen <maddr>]`,
   plus `accelerator identity` / `authorize <hex>` / `share {add|rm|ls}`. State
-  lives under `--home` / `$GAGGLE_ACCEL_HOME` / `~/.local/share/gaggle/accelerator`
-  (`identity.key` + `config.toml`).
+  lives under `--home` / `$GAGGLE_ACCEL_HOME` / the per-OS data dir (`dirs::data_dir()`
+  — `~/.local/share` Linux, `~/Library/Application Support` macOS, `%APPDATA%` Windows)
+  `+ /gaggle/accelerator` (`identity.key` + `config.toml`).
 
 Tests: `crates/net/tests/loopback.rs` (direct transfer), `discovery.rs` (DHT +
 relay/dcutr), `swarm.rs` (multi-seed load spread, partial-seed stitching, dead-source
@@ -99,15 +106,17 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   sync, thread-safe handle (callable from a GUI thread with no tokio runtime); all the
   async lives on a background task `App::new` spawns. It owns the `net` nodes: one
   shared downloading `Node`, one serving `Node` per local share (`Arc<Node>`, so a
-  rescan can re-`serve` in place). `App::add_local_share` snapshots a folder (off-thread)
-  and seeds it; `App::add_private_share` also mints a per-share `ShareKeypair` and calls
+  rescan can re-`serve` in place). `App::add_local_share` indexes a folder (off-thread,
+  `index_dir`) and seeds it through a `SourceChunkStore` — chunks stream from the source
+  files on demand, capped by `Settings::seed_cache_bytes` (default 256 MiB, floor 32 MiB)
+  of hot-chunk cache; `App::add_private_share` also mints a per-share `ShareKeypair` and calls
   `restrict_to_invite_holders`, and `App::mint_invite(id, Scope, expiry)` hands back a
   `gaggleshare1…` token in `AppState::minted_invite`. `App::subscribe(SubscribeRequest)`
   pulls a remote share into a `DiskChunkStore` under the download dir (so pause = abort,
   resume = top up), then `write_share`s the tree out. Progress rides
   `Node::download_share_multi_with_progress` (`SwarmProgress` per chunk).
-- **Delta sync (milestone 10)** — `App::rescan_share(id)` re-snapshots a seeded folder,
-  bumps `Manifest::version`, and re-serves. `App::check_updates(id)` fetches just the
+- **Delta sync (milestone 10)** — `App::rescan_share(id)` re-indexes a seeded folder
+  (`index_dir`, same streaming `SourceChunkStore`), bumps `Manifest::version`, and re-serves. `App::check_updates(id)` fetches just the
   remote manifest (`Node::fetch_manifest`) and flags `TransferRow::update_available` when
   it is newer; `App::resync(id)` re-chunks the existing output tree into a store, tops it
   up with only the delta chunks, then applies `gaggle_core::sync_share` (writes
@@ -180,7 +189,9 @@ pause keeps partial + resume finishes, settings survive a restart, removing a se
 later subscribers fail, **rescan→check_updates→resync applies only the delta** (added
 file arrives, removed file is deleted, `version` bumps), **a private share refuses a
 strangers then admits a minted invite**, **benchmark reports throughput + free space**,
-**a NAS accelerator replicates a share**. `app-state` unit tests cover `Settings`
+**a NAS accelerator replicates a share**, **a seed streams a folder several times its
+`seed_cache_bytes` budget from disk and still serves every chunk**. `app-state` unit
+tests cover `Settings`
 persistence, `ShareLink` round trips, and name sanitizing. **`relay_accelerator_carries_multiple_shares`**
 starts a local relay with two `ShareLink`s and drops one live; **remote-accelerator
 tests** cover `Settings` round-tripping `remote_accelerators` and a registered
@@ -189,7 +200,10 @@ one-relay-two-shares, mixed public/private on one relay, `remove_share`, and
 persistent-identity tests. `crates/control-plane/tests/admin.rs` round-trips a
 signed request through the admin router (authorised ok; bad key / stale ts → 401;
 add-share reaches the supervisor channel). `crates/core/tests/snapshot.rs` adds a
-`sync_share` delta-apply test.
+`sync_share` delta-apply test and an `index_dir` test (locations cover every chunk; a
+`SourceChunkStore` over them rebuilds the tree byte-for-byte). `store.rs` unit-tests
+`SourceChunkStore` read-through + caching, its no-op `put`, and its refusal to serve a
+source file that changed after the scan.
 
 ## Commands
 
@@ -290,17 +304,24 @@ reads. Module layout and how the pieces chain:
 - **`manifest`** — `Manifest` = `format` + `version` + `name` + sorted `files`
   (`FileEntry { path, size, root, mode }`) + sorted `dirs`. Deliberately small: **one
   root per file, no embedded chunk lists**. `canonicalize` (sort + dedup) before
-  serializing; `validate` rejects unsafe paths and unsorted entries. `Manifest::diff`
+  serializing; `validate` rejects unsorted entries and unsafe paths — `..`, absolute,
+  `\`, NUL, **and Windows traps** (`:` drive/ADS, trailing dot/space, `CON`/`NUL`/`COM1`…
+  device names) so `write_share` can't escape its target dir on any OS. `Manifest::diff`
   classifies files added/removed/changed/unchanged by comparing roots.
-- **`store`** — `ChunkStore` trait + three impls: `MemoryChunkStore` (plain map,
+- **`store`** — `ChunkStore` trait + four impls: `MemoryChunkStore` (plain map,
   `DedupStats`), `LruChunkCache` (byte-budgeted, LRU eviction, `CacheStats` — relay
   hot cache), `DiskChunkStore` (durable, sharded one-file-per-chunk, `try_get` /
-  `try_put` for explicit `io::Result` — NAS replica). Dedup is just content
+  `try_put` for explicit `io::Result` — NAS replica), and `SourceChunkStore` (a
+  `root` + a `Hash -> ChunkLocation` index + a bounded `LruChunkCache`; `get` reads
+  the range from the source file, re-hashes it — a since-changed file yields `None` —
+  and caches it; `put` is a no-op — the streaming seed). Dedup is just content
   addressing: `put` is a no-op if the hash is already present.
 - **`snapshot`** — ties it together: `snapshot_dir` walks a dir → chunks each file into
-  a `ChunkStore` → `Snapshot { manifest, chunk_lists, skipped }`. `write_share` is the
-  inverse: rebuild the files under a root dir from a store (used by the NAS accelerator
-  and the loopback demo).
+  a `ChunkStore` → `Snapshot { manifest, chunk_lists, skipped }`. `index_dir` is the
+  same walk but records a `Hash -> ChunkLocation` map instead of storing bytes →
+  `IndexedSnapshot` (for a `SourceChunkStore`). `write_share` is the inverse: rebuild
+  the files under a root dir from a store (used by the NAS accelerator and the loopback
+  demo).
 - **`identity`** — per-share Ed25519 keypair. `ShareKeypair` (origin-only secret) /
   `SharePublicKey` (the share's authority, distinct from `Manifest::id`) / `Signature`,
   all with hex/base64url serde. `verify` uses `verify_strict` (no malleable sigs).

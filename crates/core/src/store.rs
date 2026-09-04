@@ -19,8 +19,10 @@
 //!   full replica: survives restarts, resumes partial fills.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hash::Hash;
@@ -413,6 +415,127 @@ impl ChunkStore for DiskChunkStore {
     }
 }
 
+/// Where a chunk's bytes live inside a source tree: a file path relative to the
+/// share root plus the byte range. Built by [`index_dir`](crate::index_dir) and
+/// consumed by [`SourceChunkStore`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkLocation {
+    /// `/`-separated path relative to the share root.
+    pub path: String,
+    pub offset: u64,
+    pub len: u32,
+}
+
+/// A [`ChunkStore`] that keeps **no** durable copy of a share: it reads each
+/// requested chunk straight from the original files under `root`, verifies it
+/// against its content address, and holds it in a small byte-budgeted
+/// [`LruChunkCache`] so a burst of requests for the same chunk costs one disk
+/// read. Nothing is written to disk and RAM use is capped at the budget (plus
+/// the location index).
+///
+/// This is what a peer uses to *seed a folder it already has*: a 100 GB install
+/// is served with a few hundred MB of cache, not 100 GB of RAM and not a second
+/// on-disk copy. [`put`](ChunkStore::put) is a no-op — the store only ever
+/// serves what [`index_dir`](crate::index_dir) found. A `get` whose source
+/// bytes no longer hash as expected (the file changed since the scan) returns
+/// `None`; a fresh `index_dir` fixes it.
+#[derive(Debug)]
+pub struct SourceChunkStore {
+    root: PathBuf,
+    locations: HashMap<Hash, ChunkLocation>,
+    cache: Mutex<LruChunkCache>,
+    disk_reads: AtomicU64,
+    failed_reads: AtomicU64,
+}
+
+impl SourceChunkStore {
+    /// Smallest RAM budget honoured. The chunker tops out at a 16 MiB chunk
+    /// ([`ChunkerConfig::HUGE`](crate::ChunkerConfig)), and [`LruChunkCache`]
+    /// refuses a chunk larger than its whole budget, so the floor leaves
+    /// headroom for the largest possible chunk to always be cacheable.
+    pub const MIN_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+    /// `root` is the share's source folder; `locations` comes from
+    /// [`index_dir`](crate::index_dir); `ram_budget_bytes` is clamped up to
+    /// [`MIN_BUDGET_BYTES`](Self::MIN_BUDGET_BYTES).
+    pub fn new(
+        root: impl Into<PathBuf>,
+        locations: HashMap<Hash, ChunkLocation>,
+        ram_budget_bytes: u64,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            locations,
+            cache: Mutex::new(LruChunkCache::new(ram_budget_bytes.max(Self::MIN_BUDGET_BYTES))),
+            disk_reads: AtomicU64::new(0),
+            failed_reads: AtomicU64::new(0),
+        }
+    }
+
+    /// Occupancy + hit rate of the hot-chunk cache.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).stats()
+    }
+
+    /// Chunks served by actually reading the source files (i.e. cache misses).
+    pub fn disk_reads(&self) -> u64 {
+        self.disk_reads.load(Ordering::Relaxed)
+    }
+
+    /// `get`s that could not be served because the source file was unreadable
+    /// or no longer held the expected bytes (it changed since the scan).
+    pub fn failed_reads(&self) -> u64 {
+        self.failed_reads.load(Ordering::Relaxed)
+    }
+
+    fn read_range(&self, loc: &ChunkLocation) -> io::Result<Vec<u8>> {
+        let mut file = File::open(self.root.join(&loc.path))?;
+        file.seek(SeekFrom::Start(loc.offset))?;
+        let mut buf = vec![0u8; loc.len as usize];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+impl ChunkStore for SourceChunkStore {
+    fn contains(&self, hash: &Hash) -> bool {
+        self.locations.contains_key(hash)
+    }
+
+    fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
+        if let Some(hit) =
+            self.cache.lock().unwrap_or_else(|e| e.into_inner()).get_refreshing(hash)
+        {
+            return Some(hit);
+        }
+        let loc = self.locations.get(hash)?;
+        let bytes = match self.read_range(loc) {
+            Ok(b) if Hash::of(&b) == *hash => b,
+            _ => {
+                // Unreadable, or the source file changed since the scan — never
+                // serve bytes that don't match the requested content address.
+                self.failed_reads.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        self.disk_reads.fetch_add(1, Ordering::Relaxed);
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(*hash, bytes.clone());
+        Some(bytes)
+    }
+
+    /// A streaming seed never absorbs chunks — it only serves what it indexed.
+    fn put(&mut self, _hash: Hash, _data: Vec<u8>) -> bool {
+        false
+    }
+
+    fn len(&self) -> usize {
+        self.locations.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,5 +697,69 @@ mod tests {
         let (h, d) = chunk(b"x");
         assert!(store.try_put(h, &d).unwrap());
         assert!(!store.try_put(h, &d).unwrap());
+    }
+
+    // --- SourceChunkStore ----------------------------------------------------
+
+    fn locmap(entries: &[(Hash, &str, u64, u32)]) -> HashMap<Hash, ChunkLocation> {
+        entries
+            .iter()
+            .map(|(h, p, off, len)| {
+                (*h, ChunkLocation { path: (*p).to_string(), offset: *off, len: *len })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn source_store_reads_ranges_from_the_tree_and_caches_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"hello world, this is a file").unwrap();
+        let (h_hello, _) = chunk(b"hello ");
+        let (h_rest, _) = chunk(b"world, this is a file");
+
+        let store = SourceChunkStore::new(
+            dir.path(),
+            locmap(&[(h_hello, "a.bin", 0, 6), (h_rest, "a.bin", 6, 21)]),
+            0, // clamped up to MIN_BUDGET_BYTES
+        );
+
+        assert!(store.contains(&h_hello));
+        assert_eq!(store.get(&h_hello).as_deref(), Some(&b"hello "[..]));
+        assert_eq!(store.get(&h_rest).as_deref(), Some(&b"world, this is a file"[..]));
+        assert_eq!(store.disk_reads(), 2);
+
+        // Second read is a cache hit — no extra disk read.
+        assert_eq!(store.get(&h_hello).as_deref(), Some(&b"hello "[..]));
+        assert_eq!(store.disk_reads(), 2);
+        assert!(store.cache_stats().hits >= 1);
+    }
+
+    #[test]
+    fn source_store_put_is_a_noop_and_unknown_hashes_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SourceChunkStore::new(dir.path(), HashMap::new(), 1 << 20);
+        let (h, d) = chunk(b"nope");
+        assert!(!store.put(h, d));
+        assert!(!store.contains(&h));
+        assert!(store.get(&h).is_none());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn source_store_refuses_bytes_that_no_longer_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"original").unwrap();
+        let (h, _) = chunk(b"original");
+        let store =
+            SourceChunkStore::new(dir.path(), locmap(&[(h, "a.bin", 0, 8)]), 1 << 20);
+        assert_eq!(store.get(&h).as_deref(), Some(&b"original"[..]));
+
+        std::fs::write(dir.path().join("a.bin"), b"tampered").unwrap();
+        // Not cached yet after a rewrite? It is cached from the first get; but a
+        // fresh store (post-rescan the manager builds one) must not serve stale.
+        let fresh =
+            SourceChunkStore::new(dir.path(), locmap(&[(h, "a.bin", 0, 8)]), 1 << 20);
+        assert!(fresh.get(&h).is_none());
+        assert_eq!(fresh.failed_reads(), 1);
     }
 }

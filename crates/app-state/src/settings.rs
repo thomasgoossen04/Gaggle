@@ -38,6 +38,14 @@ pub struct Settings {
     pub upload_cap_bps: Option<u64>,
     /// Storage ceiling for cache-accelerator mode, in bytes (`None` = no cap).
     pub storage_cap_bytes: Option<u64>,
+    /// RAM ceiling, in bytes, for the hot-chunk cache each *seeded* local share
+    /// keeps. A seed streams chunks from its source folder on demand and holds
+    /// only what a peer recently asked for, up to this budget — so sharing a
+    /// 100 GB folder costs a few hundred MB of RAM, not 100 GB, and no second
+    /// copy on disk. Clamped up to
+    /// [`SourceChunkStore::MIN_BUDGET_BYTES`](gaggle_core::SourceChunkStore::MIN_BUDGET_BYTES).
+    #[serde(default = "default_seed_cache_bytes")]
+    pub seed_cache_bytes: u64,
     pub theme: Theme,
     /// If set, subscribed shares are polled this often (seconds) for a newer
     /// manifest version. A newer version is only *flagged* — never applied
@@ -70,11 +78,17 @@ impl Default for Settings {
             download_cap_bps: None,
             upload_cap_bps: None,
             storage_cap_bytes: None,
+            seed_cache_bytes: default_seed_cache_bytes(),
             theme: Theme::System,
             auto_resync_secs: None,
             remote_accelerators: Vec::new(),
         }
     }
+}
+
+/// Default seed hot-chunk cache budget: 256 MiB.
+fn default_seed_cache_bytes() -> u64 {
+    256 << 20
 }
 
 impl Settings {
@@ -99,11 +113,12 @@ impl Settings {
 }
 
 fn default_download_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join("Downloads").join("Gaggle")
-    } else {
-        std::env::temp_dir().join("gaggle-downloads")
-    }
+    // `~/Downloads` on every desktop OS (Linux honours XDG user-dirs, Windows
+    // resolves `%USERPROFILE%\Downloads`); fall back to `~/Downloads`, then temp.
+    dirs::download_dir()
+        .map(|d| d.join("Gaggle"))
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads").join("Gaggle")))
+        .unwrap_or_else(|| std::env::temp_dir().join("gaggle-downloads"))
 }
 
 #[cfg(test)]
@@ -114,11 +129,16 @@ mod tests {
     fn round_trips_through_json() {
         let s = Settings {
             download_cap_bps: Some(2_000_000),
+            seed_cache_bytes: 512 << 20,
             theme: Theme::Dark,
             ..Settings::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), s);
+
+        // A config written before this field existed still loads.
+        let legacy = r#"{"download_dir":"/tmp/x","theme":"light"}"#;
+        assert_eq!(serde_json::from_str::<Settings>(legacy).unwrap().seed_cache_bytes, 256 << 20);
     }
 
     #[test]

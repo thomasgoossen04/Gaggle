@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use control_plane::AdminClient;
 use gaggle_core::{
     AgentId, AgentKeypair, ChunkList, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
-    SignedCapability, SyncOutcome, snapshot_dir, sync_share, write_share,
+    SignedCapability, SourceChunkStore, SyncOutcome, index_dir, snapshot_dir, sync_share,
+    write_share,
 };
 use net::accel::{nas_add_share, relay_add_share};
 use net::{
@@ -1130,13 +1131,18 @@ impl Manager {
         self.insert_row(new_row(id, name.clone(), TransferKind::Seeding));
 
         let tx = self.self_tx.clone();
+        let cache_bytes = self.state.settings.seed_cache_bytes;
         tokio::spawn(async move {
             let scan_dir = dir.clone();
             let scan_name = name.clone();
             let built = tokio::task::spawn_blocking(move || {
-                let mut store = MemoryChunkStore::new();
-                let snap = snapshot_dir(&scan_dir, scan_name, 1, &mut store)?;
-                anyhow::Ok((snap, store))
+                // Stream chunks from the source folder on demand, holding only a
+                // bounded hot-chunk cache in RAM — no whole-folder buffer, no
+                // second copy on disk.
+                let idx = index_dir(&scan_dir, scan_name, 1)?;
+                let store =
+                    SourceChunkStore::new(&scan_dir, idx.locations.clone(), cache_bytes);
+                anyhow::Ok((idx, store))
             })
             .await;
 
@@ -1188,6 +1194,7 @@ impl Manager {
         let name = seed.name.clone();
         let next_version = seed.version + 1;
         let share_seed = seed.share_seed;
+        let cache_bytes = self.state.settings.seed_cache_bytes;
 
         if let Some(row) = self.state.transfers.get_mut(&id) {
             row.status = TransferStatus::Connecting;
@@ -1198,9 +1205,9 @@ impl Manager {
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
             let built = tokio::task::spawn_blocking(move || {
-                let mut store = MemoryChunkStore::new();
-                let snap = snapshot_dir(&dir, name, next_version, &mut store)?;
-                anyhow::Ok((snap, store))
+                let idx = index_dir(&dir, name, next_version)?;
+                let store = SourceChunkStore::new(&dir, idx.locations.clone(), cache_bytes);
+                anyhow::Ok((idx, store))
             })
             .await;
             let (snap, store) = match built {
@@ -1909,7 +1916,30 @@ fn free_space(path: &std::path::Path) -> std::io::Result<u64> {
     Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn free_space(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    // NUL-terminated UTF-16 of the directory; the API accepts a path on the
+    // volume, not just a drive root.
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free_to_caller: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(free_to_caller)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn free_space(_path: &std::path::Path) -> std::io::Result<u64> {
     Ok(0)
 }

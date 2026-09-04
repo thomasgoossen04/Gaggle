@@ -30,10 +30,9 @@ use gpui::{
 };
 
 fn config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("gaggle").join("settings.json"))
+    // `~/.config` (or `$XDG_CONFIG_HOME`) on Linux, `~/Library/Application
+    // Support` on macOS, `%APPDATA%` on Windows.
+    dirs::config_dir().map(|base| base.join("gaggle").join("settings.json"))
 }
 
 fn main() -> anyhow::Result<()> {

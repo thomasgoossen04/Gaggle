@@ -963,6 +963,7 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 .child(field("Download MiB/s", &app.set_dl))
                 .child(field("Upload MiB/s", &app.set_ul))
                 .child(field("Cache store GiB", &app.set_store))
+                .child(field("Seed RAM MiB", &app.set_seed_cache))
                 .child(field("Auto-check min", &app.set_resync))
                 .child(
                     div().mt_1().flex().child(
@@ -979,6 +980,7 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 .child(kv("Download cap", cap(s.download_cap_bps)))
                 .child(kv("Upload cap", cap(s.upload_cap_bps)))
                 .child(kv("Cache storage cap", cap(s.storage_cap_bytes)))
+                .child(kv("Seed RAM buffer", human_bytes(s.seed_cache_bytes)))
                 .child(kv(
                     "Auto update-check",
                     match s.auto_resync_secs {
@@ -987,7 +989,11 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                     },
                 )),
         )
-        .child(hint("Blank a limit field to clear it (unlimited / off)."))
+        .child(hint(
+            "Blank a limit field to clear it (unlimited / off). Seed RAM is the \
+             hot-chunk cache each shared folder keeps — it streams from disk, so a \
+             big share needs only a small buffer.",
+        ))
         .into_any_element()
 }
 

@@ -28,7 +28,7 @@ use crate::run::Overrides;
 #[command(name = "accelerator", about = "P2P folder-share accelerator daemon")]
 struct Cli {
     /// State directory (identity + config.toml). Defaults to
-    /// $GAGGLE_ACCEL_HOME or ~/.local/share/gaggle/accelerator.
+    /// $GAGGLE_ACCEL_HOME or the per-OS data dir + /gaggle/accelerator.
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 

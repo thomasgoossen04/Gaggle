@@ -131,6 +131,56 @@ async fn share_a_folder_then_subscribe_and_complete() {
 }
 
 #[tokio::test]
+async fn a_seed_streams_from_disk_under_a_small_ram_budget() {
+    // A source folder several times the seed's RAM buffer: the streaming store
+    // must evict and re-read from the source files and still serve every chunk.
+    let folder = TempDir::new().unwrap();
+    let mut blob = Vec::with_capacity(96 * 1024 * 1024);
+    let mut state = 0xdead_beef_0123_4567u64;
+    while blob.len() < 96 * 1024 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        blob.extend_from_slice(&state.to_le_bytes());
+    }
+    fs::write(folder.path().join("big.bin"), &blob).unwrap();
+    fs::write(folder.path().join("note.txt"), b"streamed\n").unwrap();
+
+    let seeder = App::new(None).await.unwrap();
+    // Clamped up to SourceChunkStore::MIN_BUDGET_BYTES (32 MiB) — well under the
+    // 96 MiB share, so the cache is forced to evict during the download.
+    seeder.update_settings(Settings { seed_cache_bytes: 1, ..Settings::default() });
+    wait_for(&seeder, 5, |s| s.settings.seed_cache_bytes == 1).await;
+    seeder.add_local_share(folder.path());
+
+    let seeded = wait_for(&seeder, 30, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let (addr, manifest_id, seed_bytes) =
+        (seed.share_addr.clone().unwrap(), seed.manifest_id, seed.total_bytes);
+    assert!(seed_bytes > 96 * 1024 * 1024);
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "streamed".into(),
+        manifest_id,
+        sources: vec![addr],
+        credential: None,
+    });
+
+    let done = wait_for(&leech, 90, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    assert_eq!(row.done_bytes, seed_bytes);
+    dir_matches(folder.path(), &row.output_dir.clone().unwrap());
+}
+
+#[tokio::test]
 async fn completing_a_download_removes_its_partial_dir() {
     let folder = sample_folder();
     let seeder = App::new(None).await.unwrap();

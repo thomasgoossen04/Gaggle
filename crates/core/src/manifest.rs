@@ -189,8 +189,39 @@ fn check_rel_path(p: &str) -> Result<()> {
         if comp.is_empty() || comp == "." || comp == ".." {
             return Err(Error::Manifest(format!("unsafe path component in {p:?}")));
         }
+        // Keep materialization safe on Windows regardless of which OS produced
+        // the manifest. `:` is a drive letter (`C:evil` → `root.join` escapes
+        // the target dir) or an NTFS alternate-data-stream; a trailing dot or
+        // space and the reserved DOS device names (CON, NUL, COM1…) are traps
+        // that would silently break `write_share` on a Windows peer.
+        if comp.contains(':') {
+            return Err(Error::Manifest(format!("unsafe path component {comp:?} in {p:?}")));
+        }
+        if comp.ends_with(['.', ' ']) {
+            return Err(Error::Manifest(format!("trailing dot or space in {comp:?} ({p:?})")));
+        }
+        if is_dos_device_name(comp) {
+            return Err(Error::Manifest(format!("reserved device name {comp:?} in {p:?}")));
+        }
     }
     Ok(())
+}
+
+/// Windows reserves these names (optionally with any extension, any case):
+/// `CON PRN AUX NUL COM1-9 LPT1-9`. A file so named cannot be created there.
+fn is_dos_device_name(comp: &str) -> bool {
+    let stem = comp.split('.').next().unwrap_or(comp);
+    let s = stem.to_ascii_uppercase();
+    match s.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => {
+            let b = s.as_bytes();
+            b.len() == 4
+                && (s.starts_with("COM") || s.starts_with("LPT"))
+                && b[3].is_ascii_digit()
+                && b[3] != b'0'
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,10 +291,35 @@ mod tests {
         m.format = "something-else".into();
         assert!(m.validate().is_err());
 
-        for bad in ["../evil", "/etc/passwd", "a//b", "a/./b", "", "a\\b"] {
+        for bad in [
+            "../evil",
+            "/etc/passwd",
+            "a//b",
+            "a/./b",
+            "",
+            "a\\b",
+            // Windows-hostile: drive-relative, ADS, reserved names, trailing dot.
+            "C:evil.exe",
+            "sub/C:/evil",
+            "mods/stream.txt:zone",
+            "NUL",
+            "dir/con",
+            "COM1",
+            "lpt9.txt",
+            "weird.",
+            "trailing space ",
+        ] {
             let mut m = Manifest::new("s", 1);
             m.files.push(file(bad, b"x"));
             assert!(m.validate().is_err(), "should reject {bad:?}");
+        }
+
+        // …but names that merely resemble device names are fine.
+        for ok in ["coma", "coms.txt", "com10", "com0", "coma/lptx", "coneheads"] {
+            let mut m = Manifest::new("s", 1);
+            m.files.push(file(ok, b"x"));
+            m.canonicalize();
+            assert!(m.validate().is_ok(), "should accept {ok:?}");
         }
 
         let mut m = Manifest::new("s", 1);

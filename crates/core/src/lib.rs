@@ -41,7 +41,10 @@ pub use identity::{ShareKeypair, SharePublicKey, Signature};
 pub use invite::{Capability, Invite, Scope, SignedCapability};
 pub use manifest::{FileEntry, Manifest, ManifestDiff};
 pub use merkle::{MerkleProof, MerkleTree, Side, merkle_root};
-pub use snapshot::{Snapshot, SyncOutcome, snapshot_dir, sync_share, write_share};
+pub use snapshot::{
+    IndexedSnapshot, Snapshot, SyncOutcome, index_dir, snapshot_dir, sync_share, write_share,
+};
 pub use store::{
-    CacheStats, ChunkStore, DedupStats, DiskChunkStore, LruChunkCache, MemoryChunkStore,
+    CacheStats, ChunkLocation, ChunkStore, DedupStats, DiskChunkStore, LruChunkCache,
+    MemoryChunkStore, SourceChunkStore,
 };
