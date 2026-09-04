@@ -488,20 +488,56 @@ struct Manager {
 
 /// Load a persistent operator [`AgentKeypair`] from `operator.key` next to the
 /// settings file, creating it on first run. Ephemeral if there is no config dir.
+///
+/// The seed derives every accelerator/NAS share identity, so the file is written
+/// `0600` and a present-but-unparseable file is **not** overwritten (that would
+/// silently rotate every derived identity) — the process runs ephemerally
+/// instead so a transient read error can't destroy the identity.
 fn load_or_create_operator(config_path: Option<&std::path::Path>) -> AgentKeypair {
     let Some(dir) = config_path.and_then(|p| p.parent()) else {
         return AgentKeypair::generate();
     };
     let path = dir.join("operator.key");
-    if let Ok(hex) = std::fs::read_to_string(&path)
-        && let Ok(bytes) = <[u8; 32]>::try_from(hex_decode(hex.trim()).unwrap_or_default())
-    {
-        return AgentKeypair::from_seed(bytes);
+    match std::fs::read_to_string(&path) {
+        Ok(hex) => {
+            if let Ok(bytes) = <[u8; 32]>::try_from(hex_decode(hex.trim()).unwrap_or_default()) {
+                return AgentKeypair::from_seed(bytes);
+            }
+            tracing::warn!(path = %path.display(), "operator.key is unreadable; using an ephemeral identity (not overwriting it)");
+            return AgentKeypair::generate();
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot read operator.key; using an ephemeral identity");
+            return AgentKeypair::generate();
+        }
+        Err(_) => {} // absent — create it below
     }
     let kp = AgentKeypair::generate();
     let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(&path, hex_encode(&kp.to_seed()));
+    if let Err(e) = write_secret_file(&path, hex_encode(&kp.to_seed()).as_bytes()) {
+        tracing::warn!(path = %path.display(), error = %e, "could not persist operator.key");
+    }
     kp
+}
+
+/// Write secret bytes to a freshly created file, `0600` on unix.
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1569,11 +1605,16 @@ async fn run_download(
     let base_bytes = disk.size_on_disk().unwrap_or(0);
 
     let progress_tx = tx.clone();
+    // Pin the id the invite/link promised: a source discovered for one share
+    // must not be able to substitute a different manifest (chunks would still
+    // "verify" — against the attacker's manifest). Resync deliberately does not
+    // pin (a rescan changes the id); the first download always can.
+    let config = SwarmConfig { manifest_id: Some(req.manifest_id), ..swarm_config_for(&req) };
     let dl = node
         .download_share_multi_with_progress(
             &peers,
             &mut disk,
-            swarm_config_for(&req),
+            config,
             move |p: SwarmProgress| {
                 let _ = progress_tx.try_send(Command::DownloadProgress { id, p, base_bytes });
             },

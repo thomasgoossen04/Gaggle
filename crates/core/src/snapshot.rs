@@ -154,7 +154,7 @@ pub fn write_share(
 ) -> Result<()> {
     fs::create_dir_all(root)?;
     for dir in &manifest.dirs {
-        fs::create_dir_all(root.join(dir))?;
+        fs::create_dir_all(safe_dest(root, dir)?)?;
     }
 
     for file in &manifest.files {
@@ -204,7 +204,7 @@ pub fn sync_share(
 ) -> Result<SyncOutcome> {
     fs::create_dir_all(root)?;
     for dir in &new.dirs {
-        fs::create_dir_all(root.join(dir))?;
+        fs::create_dir_all(safe_dest(root, dir)?)?;
     }
 
     let diff = Manifest::diff(old, new);
@@ -220,11 +220,16 @@ pub fn sync_share(
         outcome.written.push(file.path.clone());
     }
 
-    // Removed files.
+    // Removed files. Only unlink a real file at that path — never follow a
+    // symlink that may have been planted there.
     for file in &diff.removed {
         let dest = root.join(&file.path);
-        match fs::remove_file(&dest) {
-            Ok(()) => outcome.removed.push(file.path.clone()),
+        match fs::symlink_metadata(&dest) {
+            Ok(md) if md.file_type().is_file() => {
+                fs::remove_file(&dest)?;
+                outcome.removed.push(file.path.clone());
+            }
+            Ok(_) => {} // a dir or a symlink — leave it
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Error::Io(e)),
         }
@@ -253,9 +258,16 @@ fn materialize_file(
     list: &ChunkList,
     store: &dyn ChunkStore,
 ) -> Result<()> {
-    let dest = root.join(&file.path);
+    let dest = safe_dest(root, &file.path)?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
+    }
+    // A pre-existing symlink where the file goes would be followed by
+    // `File::create`; remove the link itself (not its target) and write fresh.
+    if let Ok(md) = fs::symlink_metadata(&dest)
+        && md.file_type().is_symlink()
+    {
+        fs::remove_file(&dest)?;
     }
 
     let mut written = 0u64;
@@ -290,7 +302,10 @@ fn materialize_file(
 fn apply_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        // Permission bits only. Never honour setuid/setgid/sticky from a
+        // manifest we did not produce — a downloaded share must not be able to
+        // drop a setuid file into the download tree.
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))?;
     }
     Ok(())
 }
@@ -326,6 +341,34 @@ fn collect(
         }
     }
     Ok(())
+}
+
+/// Resolve `root`-relative `rel` to an absolute path, rejecting it if any
+/// existing path component (a parent dir, or the leaf) is a symlink.
+///
+/// `rel` has already passed [`Manifest::validate`](crate::Manifest) so it cannot
+/// contain `..` or an absolute prefix; this closes the *physical* escape a
+/// planted symlink in the output tree would otherwise open (`create_dir_all` and
+/// `File::create` both follow links). Costs a handful of `lstat`s per file —
+/// nothing beside writing the file's bytes.
+fn safe_dest(root: &Path, rel: &str) -> Result<PathBuf> {
+    let mut cur = root.to_path_buf();
+    for comp in rel.split('/') {
+        cur.push(comp);
+        match fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(Error::Verify(format!(
+                    "refusing to follow a symlink at {} while materializing {rel}",
+                    cur.display()
+                )));
+            }
+            Ok(_) => {}
+            // Nothing exists here yet, so nothing deeper can be a link either.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Ok(root.join(rel))
 }
 
 /// `path` relative to `root`, as a `/`-separated string. Errors on non-UTF-8 or

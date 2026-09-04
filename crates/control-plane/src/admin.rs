@@ -10,7 +10,8 @@
 //! daemon over an [`mpsc`] channel and reads status from a [`watch`] channel, so
 //! `control-plane` never has to depend on `net`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -36,6 +37,9 @@ pub const H_DAEMON_SIGNATURE: &str = "x-gaggle-daemon-signature";
 /// Requests older than this (clock skew) are rejected.
 const MAX_SKEW_SECS: i64 = 60;
 const MAX_BODY: usize = 64 * 1024;
+/// Cap on the in-flight `(agent, nonce)` replay cache. Entries expire after the
+/// skew window, so this is only reached under a flood; hitting it fails closed.
+const MAX_SEEN_NONCES: usize = 100_000;
 
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -120,6 +124,9 @@ pub struct AdminState {
     daemon: Arc<AgentKeypair>,
     commands: mpsc::Sender<AdminCommand>,
     status: watch::Receiver<DaemonStatus>,
+    /// `(agent, nonce) -> expiry` — a signed request is honoured once inside the
+    /// skew window so a captured request cannot be replayed.
+    seen_nonces: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl AdminState {
@@ -134,6 +141,7 @@ impl AdminState {
             daemon: Arc::new(daemon),
             commands,
             status,
+            seen_nonces: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -270,7 +278,21 @@ fn verify_request(
     let sig = Signature::from_bytes(sig_arr);
 
     let msg = canonical(method, path, ts, nonce, body);
-    agent.verify(&msg, &sig).map_err(|_| unauth("signature does not verify"))
+    agent.verify(&msg, &sig).map_err(|_| unauth("signature does not verify"))?;
+
+    // Replay protection: accept each (agent, nonce) at most once inside the skew
+    // window. The signature is already valid here, so this only rejects a
+    // byte-for-byte replay of a genuine request.
+    let now = unix_now() as i64;
+    let mut seen = state.seen_nonces.lock().unwrap_or_else(|e| e.into_inner());
+    seen.retain(|_, exp| *exp > now);
+    if seen.len() >= MAX_SEEN_NONCES {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "replay cache saturated, retry shortly".into()));
+    }
+    if seen.insert(format!("{agent_hex}:{nonce}"), now + MAX_SKEW_SECS + 1).is_some() {
+        return Err(unauth("nonce already used"));
+    }
+    Ok(())
 }
 
 /// Buffer `resp`, attach the daemon's identity + a signature over the body hash.

@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{Error, Result};
@@ -97,12 +97,14 @@ impl SharePublicKey {
     }
 
     /// Verify `sig` over `msg` against this key. Uses `verify_strict` — a
-    /// malleable or non-canonical signature is rejected.
+    /// malleable or non-canonical signature (non-canonical `S`, small-order `A`)
+    /// is rejected, so a capability token has exactly one valid encoding.
     pub(crate) fn verify(&self, msg: &[u8], sig: &Signature) -> Result<()> {
         let vk = VerifyingKey::from_bytes(&self.0)
             .map_err(|e| Error::Invite(format!("not a valid Ed25519 public key: {e}")))?;
         let sig = ed25519_dalek::Signature::from_bytes(&sig.0);
-        vk.verify(msg, &sig).map_err(|_| Error::Invite("signature does not verify".into()))
+        vk.verify_strict(msg, &sig)
+            .map_err(|_| Error::Invite("signature does not verify".into()))
     }
 }
 

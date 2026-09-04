@@ -10,7 +10,7 @@
 //! an [`Invite`] carries just the public key and a signed, already-scoped
 //! capability.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -20,10 +20,23 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use gaggle_core::Invite;
 
+/// Upper bound on stored invites. `POST /invites` is unauthenticated, so the
+/// registry must not grow without limit; past this the oldest entry is evicted
+/// (FIFO), which under a flood keeps the most recent — most likely legitimate —
+/// codes resolvable. Far above any real number of pending invites.
+const MAX_INVITES: usize = 10_000;
+
+#[derive(Default)]
+struct Store {
+    by_code: HashMap<String, Invite>,
+    /// Insertion order, for FIFO eviction when `by_code` is at capacity.
+    order: VecDeque<String>,
+}
+
 /// In-memory store of published invites, keyed by a short random code.
 #[derive(Clone, Default)]
 pub struct InviteRegistry {
-    inner: Arc<Mutex<HashMap<String, Invite>>>,
+    inner: Arc<Mutex<Store>>,
 }
 
 impl InviteRegistry {
@@ -31,19 +44,30 @@ impl InviteRegistry {
         Self::default()
     }
 
-    /// Store `invite` under a fresh random code and return the code.
+    /// Store `invite` under a fresh random code and return the code, evicting the
+    /// oldest entry if the registry is full.
     pub fn publish(&self, invite: Invite) -> String {
         let code = random_code();
-        self.inner.lock().unwrap().insert(code.clone(), invite);
+        let mut store = self.inner.lock().unwrap();
+        while store.order.len() >= MAX_INVITES {
+            match store.order.pop_front() {
+                Some(old) => {
+                    store.by_code.remove(&old);
+                }
+                None => break,
+            }
+        }
+        store.by_code.insert(code.clone(), invite);
+        store.order.push_back(code.clone());
         code
     }
 
     pub fn get(&self, code: &str) -> Option<Invite> {
-        self.inner.lock().unwrap().get(code).cloned()
+        self.inner.lock().unwrap().by_code.get(code).cloned()
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.lock().unwrap().by_code.len()
     }
 
     pub fn is_empty(&self) -> bool {

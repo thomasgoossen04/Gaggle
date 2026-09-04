@@ -86,6 +86,40 @@ async fn a_tampered_request_body_fails_the_signature() {
 }
 
 #[tokio::test]
+async fn a_captured_request_cannot_be_replayed() {
+    use base64::Engine as _;
+    use gaggle_core::Hash;
+
+    let operator = AgentKeypair::from_seed([1u8; 32]);
+    let h = spawn(vec![operator.public()]).await;
+
+    // Build one genuine signed GET and fire the exact same bytes twice.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+    let nonce = "replay-me";
+    let canonical =
+        format!("gaggle-admin\nGET\n/admin/status\n{ts}\n{nonce}\n{}", Hash::of(b"").to_hex());
+    let sig = operator.sign(canonical.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+    let http = reqwest::Client::new();
+    let fire = || {
+        http.get(format!("{}/admin/status", h.base))
+            .header("x-gaggle-agent", operator.public().to_hex())
+            .header("x-gaggle-timestamp", &ts)
+            .header("x-gaggle-nonce", nonce)
+            .header("x-gaggle-signature", &sig_b64)
+            .send()
+    };
+
+    assert_eq!(fire().await.unwrap().status(), 200, "first use is accepted");
+    assert_eq!(fire().await.unwrap().status(), 401, "the replay is refused");
+}
+
+#[tokio::test]
 async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
     let operator = AgentKeypair::from_seed([1u8; 32]);
     let mut h = spawn(vec![operator.public()]).await;

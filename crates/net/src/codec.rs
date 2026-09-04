@@ -96,8 +96,19 @@ async fn read_frame<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Vec<u
             format!("framed message of {len} bytes exceeds the {MAX_FRAME}-byte limit"),
         ));
     }
-    let mut buf = vec![0u8; len];
-    io.read_exact(&mut buf).await?;
+    // Grow the buffer as bytes actually arrive instead of trusting `len` for one
+    // up-front allocation: otherwise a peer costs us up to `MAX_FRAME` of memory
+    // per connection with a 4-byte header and no body. `read_to_end` doubles
+    // geometrically, so a real 16 MiB chunk still lands in ~4 reallocs — nothing
+    // next to hashing it.
+    let mut buf = Vec::with_capacity(len.min(1 << 20));
+    let read = AsyncReadExt::take(io, len as u64).read_to_end(&mut buf).await?;
+    if read != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("framed message ended after {read} of {len} bytes"),
+        ));
+    }
     Ok(buf)
 }
 
