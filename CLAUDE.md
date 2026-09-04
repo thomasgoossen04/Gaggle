@@ -242,7 +242,9 @@ no git history).
 
 **Two release channels**, both driven by `.github/workflows/release.yml` (push to
 `main` *or* `beta`). Each push builds + zips `gaggle-gui` + `gaggle-launcher` for
-linux-x86_64 / windows-x86_64 / macos-aarch64 / macos-x86_64, runs
+linux-x86_64 / windows-x86_64 / macos-aarch64 / macos-x86_64 (the Intel macOS
+build is cross-compiled on the Apple Silicon runner — no x86_64 macOS runners
+exist), runs
 `.github/scripts/make_latest.py <version> <tag> <channel> dist` to compose `latest.json`,
 and publishes a GitHub Release:
 
