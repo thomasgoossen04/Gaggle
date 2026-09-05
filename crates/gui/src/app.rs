@@ -3,7 +3,7 @@
 //! form inputs and the title-bar drag latch. All rendering is delegated to
 //! [`crate::ui`]; all behaviour is a thin wrapper over [`app_state::App`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -162,8 +162,12 @@ pub struct Gaggle {
     // Remote accelerator form.
     pub(crate) remote_label: Entity<InputState>,
     pub(crate) remote_url: Entity<InputState>,
-    /// Paste field: add a share to a remote accelerator (row buttons read it).
-    pub(crate) remote_add: Entity<InputState>,
+    /// Paste field: add a share to a remote accelerator, keyed by that
+    /// remote's label — one `InputState` per row. Sharing a single entity
+    /// across rows made every row echo whatever was typed in any one of
+    /// them, since they'd all be bound to the same underlying state.
+    /// Kept in sync with `state.remote_accelerators` by [`Self::sync_remote_inputs`].
+    pub(crate) remote_add_inputs: HashMap<String, Entity<InputState>>,
 }
 
 impl Gaggle {
@@ -176,7 +180,7 @@ impl Gaggle {
         // (an earlier `Theme::change` in `main` runs before a window exists and
         // can guess the appearance wrong).
         let initial_mode = theme::activate(state.settings.theme, window.appearance());
-        gpui_component::Theme::change(initial_mode, Some(&mut *window), cx);
+        theme::apply_mode(initial_mode, Some(&mut *window), cx);
 
         // A field that only accepts a decimal / integer number (or empty).
         let decimal = regex::Regex::new(r"^\d*\.?\d*$").unwrap();
@@ -203,7 +207,11 @@ impl Gaggle {
         let accel_add = text(cx, window, String::new());
         let remote_label = text(cx, window, String::new());
         let remote_url = text(cx, window, String::new());
-        let remote_add = text(cx, window, String::new());
+        let remote_add_inputs = state
+            .remote_accelerators
+            .iter()
+            .map(|r| (r.label.clone(), text(cx, window, String::new())))
+            .collect();
 
         // Poll the manager (and, while the Logs tab is open, the log buffer)
         // and re-render on change. Both checks are cheap no-ops when nothing
@@ -280,7 +288,23 @@ impl Gaggle {
             accel_add,
             remote_label,
             remote_url,
-            remote_add,
+            remote_add_inputs,
+        }
+    }
+
+    /// Ensure `remote_add_inputs` has exactly one entity per currently-known
+    /// remote label, creating entities for newly-added remotes and dropping
+    /// ones for remotes that were forgotten. Must run somewhere that has a
+    /// `&mut Window` (creating an `InputState` requires one), so it's called
+    /// from [`Render::render`] rather than from the (window-less) view layer.
+    fn sync_remote_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remote_add_inputs
+            .retain(|label, _| self.state.remote_accelerators.iter().any(|r| &r.label == label));
+        for r in &self.state.remote_accelerators {
+            if !self.remote_add_inputs.contains_key(&r.label) {
+                let input = cx.new(|cx| InputState::new(window, cx).default_value(String::new()));
+                self.remote_add_inputs.insert(r.label.clone(), input);
+            }
         }
     }
 
@@ -699,7 +723,10 @@ impl Gaggle {
     }
 
     pub(crate) fn remote_add_share(&mut self, label: String, cx: &mut Context<Self>) {
-        let token = self.remote_add.read(cx).value().trim().to_string();
+        let token = match self.remote_add_inputs.get(&label) {
+            Some(input) => input.read(cx).value().trim().to_string(),
+            None => return,
+        };
         if token.is_empty() {
             self.set_notice("Paste a share link first", cx);
             return;
@@ -734,7 +761,7 @@ impl Gaggle {
         });
         let mode = theme::activate(theme, window.appearance());
         self.theme_mode = Some(mode);
-        gpui_component::Theme::change(mode, Some(window), cx);
+        theme::apply_mode(mode, Some(window), cx);
         self.set_notice(format!("Theme → {}", theme.label()), cx);
     }
 }
@@ -747,9 +774,10 @@ impl Render for Gaggle {
         // finally lands, or on a live system theme switch.
         if self.theme_mode != Some(mode) {
             self.theme_mode = Some(mode);
-            gpui_component::Theme::change(mode, Some(&mut *window), cx);
+            theme::apply_mode(mode, Some(&mut *window), cx);
         }
         let t = theme::active();
+        self.sync_remote_inputs(window, cx);
 
         // The `window_border` frame is drawn by the wrapping `gpui_component::Root`.
         div()

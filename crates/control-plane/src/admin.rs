@@ -4,7 +4,10 @@
 //! operator add / remove which shares it accelerates. Every request is signed by
 //! the operator's Ed25519 key ([`gaggle_core::AgentKeypair`]) and checked
 //! against the daemon's `authorized` set; every response is signed by the
-//! daemon's own key so a client can pin it on first contact (TOFU).
+//! daemon's own key so a client can pin it on first contact (TOFU). The whole
+//! exchange runs over TLS (see [`crate::tls`]), terminated with a self-signed
+//! certificate derived from that same daemon key, so [`AdminClient`] pins one
+//! identity that governs both layers instead of trusting a CA.
 //!
 //! The router is deliberately transport-only: it forwards mutations to the
 //! daemon over an [`mpsc`] channel and reads status from a [`watch`] channel, so
@@ -54,13 +57,17 @@ fn unb64(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Accept a bare `host:port` (or `//host:port`) and turn it into an absolute
-/// `http://…` origin with no trailing slash, so a pasted `127.0.0.1:8749` works.
+/// `https://…` origin with no trailing slash, so a pasted `127.0.0.1:8749`
+/// works. The admin API is TLS-only (see [`crate::tls`]); an explicit
+/// `http://` is left as-is rather than silently upgraded, since a caller who
+/// typed that scheme deliberately gets a connection error, not a
+/// downgrade-without-noticing.
 pub fn normalize_base(input: &str) -> String {
     let s = input.trim().trim_end_matches('/');
     if s.starts_with("http://") || s.starts_with("https://") {
         s.to_string()
     } else {
-        format!("http://{}", s.trim_start_matches("//"))
+        format!("https://{}", s.trim_start_matches("//"))
     }
 }
 
@@ -159,6 +166,12 @@ impl AdminState {
             seen_nonces: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    /// The daemon's own signing key — also the identity [`crate::tls::server_config`]
+    /// derives the admin API's TLS certificate from.
+    pub fn daemon_key(&self) -> &AgentKeypair {
+        &self.daemon
+    }
 }
 
 /// `GET /admin/status`, `GET /admin/shares`, `POST /admin/shares`,
@@ -173,10 +186,17 @@ pub fn router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-/// Serve the admin [`router`] on `listener` until the process ends. A thin
-/// wrapper so daemons need not depend on `axum` directly.
+/// Serve the admin [`router`] on `listener` until the process ends, TLS
+/// -terminated with a self-signed certificate derived from `state`'s own
+/// daemon identity (see [`crate::tls`]) — the same posture as
+/// [`crate::serve_daemon`], minus the rendezvous routes. A thin wrapper so
+/// daemons need not depend on `axum`/`axum_server` directly.
 pub async fn serve(listener: tokio::net::TcpListener, state: AdminState) -> anyhow::Result<()> {
-    axum::serve(listener, router(state)).await?;
+    let tls_config = crate::tls::server_config(state.daemon_key())?;
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls_config));
+    axum_server::tls_rustls::from_tcp_rustls(listener.into_std()?, rustls_config)?
+        .serve(router(state).into_make_service())
+        .await?;
     Ok(())
 }
 
@@ -337,30 +357,32 @@ fn insert(headers: &mut HeaderMap, name: &str, value: &str) {
 
 // --- client ------------------------------------------------------------
 
-/// `reqwest` client for a daemon's [`router`]. Signs every request with the
-/// operator key and verifies (and can pin) the daemon's response signature.
+/// HTTP(S) client for a daemon's [`router`]. Signs every request with the
+/// operator key; verifies (and can pin) the daemon's response signature; and,
+/// via [`crate::tls::client_config`], pins that exact same identity at the
+/// TLS layer instead of trusting any CA.
 pub struct AdminClient {
     base: String,
-    http: reqwest::Client,
+    http: crate::http_client::HttpClient,
     operator: AgentKeypair,
-    /// The daemon identity we expect. `None` until the first successful call,
-    /// after which callers should persist [`AdminClient::pinned`].
-    pinned: Option<AgentId>,
+    /// The daemon identity we expect. `None` until the first successful
+    /// connection, after which callers should persist [`AdminClient::pinned`].
+    /// Shared with the TLS certificate verifier ([`crate::tls`]) so exactly
+    /// one pin governs both layers.
+    pinned: Arc<Mutex<Option<AgentId>>>,
 }
 
 impl AdminClient {
-    pub fn new(base: impl Into<String>, operator: AgentKeypair, pinned: Option<AgentId>) -> Self {
-        Self {
-            base: normalize_base(&base.into()),
-            http: reqwest::Client::new(),
-            operator,
-            pinned,
-        }
+    pub fn new(base: impl Into<String>, operator: AgentKeypair, pinned: Option<AgentId>) -> anyhow::Result<Self> {
+        let pinned = Arc::new(Mutex::new(pinned));
+        let tls = crate::tls::client_config(pinned.clone())?;
+        let http = crate::http_client::HttpClient::new(tls);
+        Ok(Self { base: normalize_base(&base.into()), http, operator, pinned })
     }
 
     /// The daemon identity this client has locked onto, if any.
     pub fn pinned(&self) -> Option<AgentId> {
-        self.pinned
+        *self.pinned.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The normalized base URL this client talks to.
@@ -407,31 +429,23 @@ impl AdminClient {
         getrandom::getrandom(&mut nonce).expect("system RNG unavailable");
         let nonce = b64(&nonce);
         let sig = self.operator.sign(&canonical(method, path, &ts, &nonce, &body));
+        let agent_hex = self.operator.public().to_hex();
+        let sig_b64 = b64(&sig.to_bytes());
 
         let url = format!("{}{path}", self.base);
-        let req = self
-            .http
-            .request(method.parse()?, &url)
-            .header(H_AGENT, self.operator.public().to_hex())
-            .header(H_TIMESTAMP, &ts)
-            .header(H_NONCE, &nonce)
-            .header(H_SIGNATURE, b64(&sig.to_bytes()))
-            .header("content-type", "application/json")
-            .body(body);
-
-        let resp = req.send().await?;
-        let status = resp.status();
-        let daemon_hdr = resp
-            .headers()
-            .get(H_DAEMON)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let daemon_sig = resp
-            .headers()
+        let headers = [
+            (H_AGENT, agent_hex.as_str()),
+            (H_TIMESTAMP, ts.as_str()),
+            (H_NONCE, nonce.as_str()),
+            (H_SIGNATURE, sig_b64.as_str()),
+            ("content-type", "application/json"),
+        ];
+        let (status, headers, bytes) = self.http.send(method, &url, &headers, body).await?;
+        let daemon_hdr = headers.get(H_DAEMON).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let daemon_sig = headers
             .get(H_DAEMON_SIGNATURE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let bytes = resp.bytes().await?;
 
         self.verify_daemon(daemon_hdr.as_deref(), daemon_sig.as_deref(), &bytes)?;
 
@@ -466,12 +480,19 @@ impl AdminClient {
             .verify(digest.as_bytes(), &Signature::from_bytes(sig_arr))
             .map_err(|_| anyhow::anyhow!("daemon response signature does not verify"))?;
 
-        match self.pinned {
+        // By the time an HTTP response reaches here, the TLS handshake for
+        // this connection has already run (see `tls::PinningVerifier`) and,
+        // on a fresh connection, already pinned whatever identity presented
+        // the certificate. So this is also the cross-layer check: a valid
+        // TLS connection whose *signed response* claims a different identity
+        // than the one its certificate presented is rejected here.
+        let mut pinned = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
+        match *pinned {
             Some(expected) if expected != agent => {
                 anyhow::bail!("daemon identity changed — expected {expected}, got {agent}")
             }
             Some(_) => {}
-            None => self.pinned = Some(agent),
+            None => *pinned = Some(agent),
         }
         Ok(())
     }

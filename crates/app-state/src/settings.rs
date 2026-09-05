@@ -72,7 +72,7 @@ pub struct Settings {
     /// reachability, same as before).
     #[serde(default)]
     pub public_relay: Option<String>,
-    /// An accelerator's control-plane HTTP base URL (e.g. `http://host:8749` —
+    /// An accelerator's control-plane base URL (e.g. `https://host:8749` —
     /// typically the same accelerator as `public_relay`, on the same host)
     /// used as a NAT-traversal *rendezvous* point: not a data relay, just a
     /// place for two peers who have never talked before to swap their current
@@ -123,7 +123,8 @@ pub enum PersistedAccelRole {
 pub struct RemoteAccelerator {
     /// A short human label, unique within the list.
     pub label: String,
-    /// Base URL of the daemon's admin API, e.g. `http://host:8749`.
+    /// Base URL of the daemon's admin API, e.g. `https://host:8749` (TLS,
+    /// self-signed — see `control_plane::tls`; a bare `host:port` is fine too).
     pub admin_url: String,
     /// Hex `AgentId` of the daemon, learned + pinned on the first successful
     /// call. `None` until then.

@@ -78,6 +78,11 @@ struct RunArgs {
     /// host:port for the admin API.
     #[arg(long)]
     admin_listen: Option<String>,
+    /// host:port for NAT-rendezvous, if different from --admin-listen (e.g.
+    /// admin behind a VPN, rendezvous on a public port). Pass an empty string
+    /// to go back to serving both on --admin-listen.
+    #[arg(long)]
+    rendezvous_listen: Option<String>,
     /// Multiaddr to listen on, e.g. /ip4/0.0.0.0/udp/4001/quic-v1.
     #[arg(long)]
     listen: Option<String>,
@@ -106,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
                     cache_mib: args.cache_mib,
                     replica_dir: args.replica_dir,
                     admin_listen: args.admin_listen,
+                    rendezvous_listen: args.rendezvous_listen,
                     listen: args.listen,
                 },
             )

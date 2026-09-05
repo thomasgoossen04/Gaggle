@@ -45,7 +45,16 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   against the manifest root. `transfer::fetch_manifest_and_lists` fetches just the
   metadata. The serving side is `Catalog` (store type-erased, so a peer serves from
   RAM and a NAS from disk through the same type); it may hold a *partial* store and
-  reports what it has via `Request::GetInventory`.
+  reports what it has via `Request::GetInventory`. Every `Response::Chunk`'s bytes
+  pass through `wire_crypto::{seal, open}` right where `codec.rs` frames them —
+  compressed with `lz4_flex` when that shrinks the chunk, always sealed with
+  `XChaCha20Poly1305` under a fixed, binary-embedded key — one chunk at a time, so
+  this never needs a whole-share pass before streaming starts. It sits on top of,
+  not instead of, QUIC's own TLS 1.3; the key is not a secret from anyone who has
+  the binary and does not gate private shares (that's still `invite`/`Capability`) —
+  it only keeps raw file bytes off the wire in the clear and shrinks compressible
+  chunks. Every other layer (verification, the relay cache, `DiskChunkStore`) only
+  ever sees plaintext, since `codec.rs` reverses it on read.
 - **`Node`** — a standard peer: the chunk protocol wired together with a **Kademlia**
   DHT (`ShareKey` = `Manifest::id`; `provide` / `find_providers`), **identify**, **mDNS**,
   **UPnP**, a **relay client** and **dcutr**. mDNS (`libp2p::mdns::tokio`, deliberately
@@ -109,7 +118,10 @@ relay/dcutr), `swarm.rs` (multi-seed load spread, partial-seed stitching, dead-s
 re-routing, re-seeding), `accelerator.rs` (relay cache shields the origin / evicts under
 budget; NAS durability across restart, resumed replication, LAN priority),
 `private.rs` (no-invite refusal, whole-share download, per-file scope, expiry, wrong
-key, invite-URL round trip, private relay). `control-plane/tests/invite_exchange.rs`
+key, invite-URL round trip, private relay). `wire_crypto`'s own unit tests cover the
+compress-or-not fallback, a fresh nonce per seal, and tamper/truncation rejection —
+every other `net` test above already exercises it implicitly, since every chunk
+that crosses the wire goes through it. `control-plane/tests/invite_exchange.rs`
 round-trips an invite through a live server. Plus the
 `cargo run -p net --example loopback_transfer` demo
 (`serve [seed]` / `mint-invite` / `fetch [invite]` / `fetch-swarm`).

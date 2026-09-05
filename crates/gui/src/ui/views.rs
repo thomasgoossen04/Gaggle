@@ -903,14 +903,15 @@ fn remote_row(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> A
     }
 
     panel
-        .child(field("Add share link", &app.remote_add))
-        .child(
-            btn((SharedString::from(format!("rmt-add-{label}")), 0), "Add share to this remote")
-                .on_click(cx.listener({
-                    let label = label.clone();
-                    move |this, _: &ClickEvent, _, cx| this.remote_add_share(label.clone(), cx)
-                })),
-        )
+        .when_some(app.remote_add_inputs.get(&label), |el, input| {
+            el.child(field("Add share link", input)).child(
+                btn((SharedString::from(format!("rmt-add-{label}")), 0), "Add share to this remote")
+                    .on_click(cx.listener({
+                        let label = label.clone();
+                        move |this, _: &ClickEvent, _, cx| this.remote_add_share(label.clone(), cx)
+                    })),
+            )
+        })
         .into_any_element()
 }
 
@@ -1061,11 +1062,14 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                      machine directly. Leave blank for LAN/VPN-only sharing.",
                 ))
                 .child(hint(
-                    "Rendezvous URL: that same accelerator's HTTP address (e.g. \
-                     http://host:8749 — usually the admin_listen host:port). Two peers \
-                     that have never talked before use it to swap current addresses and \
-                     punch a direct hole through NAT — no data flows through it, just a \
-                     few KB of signaling. Works even without a relay reservation above.",
+                    "Rendezvous URL: that accelerator's rendezvous address (host:port; \
+                     TLS is automatic) — usually the same as its admin API, but its \
+                     operator may run it on a separate address (e.g. admin kept private \
+                     behind a VPN, rendezvous exposed publicly). Ask the operator if \
+                     unsure. Two peers that have never talked before use it to swap \
+                     current addresses and punch a direct hole through NAT — no data \
+                     flows through it, just a few KB of signaling. Works even without a \
+                     relay reservation above.",
                 )),
         )
         .child(

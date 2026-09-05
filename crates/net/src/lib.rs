@@ -23,6 +23,7 @@ mod proto;
 mod relay;
 mod swarm;
 mod transfer;
+mod wire_crypto;
 
 use std::path::Path;
 use std::time::Duration;

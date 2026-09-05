@@ -666,24 +666,35 @@ impl Manager {
         let operator = AgentKeypair::from_seed(self.operator.to_seed());
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
-            let mut client = AdminClient::new(base.clone(), operator, pinned);
-            let state = match client.status().await {
-                Ok(s) => {
-                    let role = match s.role.as_str() {
-                        "nas" => Some(AcceleratorRole::Nas),
-                        _ => Some(AcceleratorRole::Relay),
-                    };
-                    RemoteAccelState {
+            let state = match AdminClient::new(base.clone(), operator, pinned) {
+                Ok(mut client) => match client.status().await {
+                    Ok(s) => {
+                        let role = match s.role.as_str() {
+                            "nas" => Some(AcceleratorRole::Nas),
+                            _ => Some(AcceleratorRole::Relay),
+                        };
+                        RemoteAccelState {
+                            label: label.clone(),
+                            admin_url: base,
+                            reachable: true,
+                            peer_id: Some(s.peer_id),
+                            daemon_key: client.pinned().map(|k| k.to_hex()),
+                            role,
+                            shares: s.shares.iter().map(share_status_row).collect(),
+                            error: None,
+                        }
+                    }
+                    Err(e) => RemoteAccelState {
                         label: label.clone(),
                         admin_url: base,
-                        reachable: true,
-                        peer_id: Some(s.peer_id),
-                        daemon_key: client.pinned().map(|k| k.to_hex()),
-                        role,
-                        shares: s.shares.iter().map(share_status_row).collect(),
-                        error: None,
-                    }
-                }
+                        reachable: false,
+                        peer_id: None,
+                        daemon_key: pinned.map(|k| k.to_hex()),
+                        role: None,
+                        shares: Vec::new(),
+                        error: Some(format!("{e:#}")),
+                    },
+                },
                 Err(e) => RemoteAccelState {
                     label: label.clone(),
                     admin_url: base,
@@ -1281,13 +1292,17 @@ impl Manager {
         let operator = AgentKeypair::from_seed(self.operator.to_seed());
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
-            let mut client = AdminClient::new(base, operator, pinned);
-            let result = if let Some(token) = add {
-                client.add_share(token.trim()).await
-            } else if let Some(mid) = remove {
-                client.remove_share(mid.trim()).await
-            } else {
-                Ok(())
+            let result = match AdminClient::new(base, operator, pinned) {
+                Ok(mut client) => {
+                    if let Some(token) = add {
+                        client.add_share(token.trim()).await
+                    } else if let Some(mid) = remove {
+                        client.remove_share(mid.trim()).await
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(e) => Err(e),
             };
             if let Err(e) = result {
                 tracing::warn!(%label, error = %format!("{e:#}"), "remote share op failed");

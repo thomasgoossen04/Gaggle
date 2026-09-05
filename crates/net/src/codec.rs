@@ -3,9 +3,11 @@
 //!
 //! Each message is a 4-byte big-endian length followed by a 1-byte tag and a
 //! tag-specific body. Control fields (`Manifest`, `ChunkList`) travel as JSON —
-//! they are tiny and already `serde`-derived in `gaggle-core`. Chunk bytes are
-//! written raw, so a 16 MiB chunk costs 16 MiB on the wire rather than ~1.4x
-//! that as a JSON byte array.
+//! they are tiny and already `serde`-derived in `gaggle-core`. A `Chunk`
+//! response's bytes are passed through [`crate::wire_crypto`] — compressed
+//! (if that helps) and encrypted — before being written, and reversed on read,
+//! so the rest of the codec (and everything above it) only ever sees the
+//! chunk's plaintext.
 
 use std::io;
 
@@ -151,9 +153,10 @@ fn encode_response(res: &Response) -> io::Result<Vec<u8>> {
         Response::Manifest(m) => json_frame(tag::RES_MANIFEST, m)?,
         Response::ChunkList(l) => json_frame(tag::RES_CHUNK_LIST, l)?,
         Response::Chunk(data) => {
-            let mut v = Vec::with_capacity(1 + data.len());
+            let sealed = crate::wire_crypto::seal(data);
+            let mut v = Vec::with_capacity(1 + sealed.len());
             v.push(tag::RES_CHUNK);
-            v.extend_from_slice(data);
+            v.extend_from_slice(&sealed);
             v
         }
         Response::Inventory(hashes) => json_frame(tag::RES_INVENTORY, hashes)?,
@@ -172,7 +175,7 @@ fn decode_response(bytes: &[u8]) -> io::Result<Response> {
         tag::RES_NOT_FOUND => Ok(Response::NotFound),
         tag::RES_MANIFEST => Ok(Response::Manifest(serde_json::from_slice(rest)?)),
         tag::RES_CHUNK_LIST => Ok(Response::ChunkList(serde_json::from_slice(rest)?)),
-        tag::RES_CHUNK => Ok(Response::Chunk(rest.to_vec())),
+        tag::RES_CHUNK => Ok(Response::Chunk(crate::wire_crypto::open(rest).map_err(bad)?)),
         tag::RES_INVENTORY => Ok(Response::Inventory(serde_json::from_slice(rest)?)),
         tag::RES_WELCOME => Ok(Response::Welcome),
         tag::RES_UNAUTHORIZED => Ok(Response::Unauthorized(

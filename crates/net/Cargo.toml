@@ -13,6 +13,12 @@ serde_json.workspace = true
 postcard.workspace = true
 async-trait = "0.1"
 base64 = "0.22"
+# Per-chunk wire compression + encryption (see src/wire_crypto.rs). Both are
+# pure Rust (no C toolchain needed), matching this crate's `forbid(unsafe_code)`
+# and keeping the release cross-compiles (esp. Windows/macOS-from-Linux) simple.
+chacha20poly1305 = "0.10"
+lz4_flex = "0.11"
+rand = "0.8"
 libp2p = { version = "0.56", features = [
     "quic",
     "dns",

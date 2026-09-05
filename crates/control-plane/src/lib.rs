@@ -7,8 +7,10 @@
 //! code. Bootstrap / registration / admin routes are still to come.
 
 pub mod admin;
+mod http_client;
 pub mod invite;
 pub mod rendezvous;
+mod tls;
 
 pub use admin::{
     AdminClient, AdminCommand, AdminState, DaemonStatus, ShareStatus, router as admin_router,
@@ -21,19 +23,50 @@ pub use rendezvous::{
 
 /// One-line status string for the accelerator daemon's start-up log.
 pub fn describe() -> &'static str {
-    "control-plane: axum invite exchange + NAT rendezvous; bootstrap/admin still stubbed"
+    "control-plane: axum invite exchange + NAT rendezvous, TLS-terminated admin API; bootstrap still stubbed"
 }
 
-/// Serve the signed admin API and the unauthenticated NAT-rendezvous
-/// endpoints on the same listener — an accelerator has one HTTP port, and any
-/// peer trying to reach one of its shares may need rendezvous, not just its
-/// operator.
+/// Serve the signed admin API on `listener` and the unauthenticated
+/// NAT-rendezvous endpoints on `rendezvous_listener` (or, if `None`, merged
+/// onto `listener` too) — both TLS-terminated with a self-signed certificate
+/// derived from `admin`'s own daemon identity (see [`tls`]); `AdminClient`
+/// pins that same identity, so nothing else needs to trust a CA.
+///
+/// Splitting the two listeners is what lets an operator put the admin API
+/// behind a private network (a Tailscale/VPN address, or just `127.0.0.1`)
+/// while the rendezvous endpoint — unauthenticated by design, since any peer
+/// trying to reach one of this daemon's shares may need it, not just the
+/// operator — sits on a publicly reachable address instead. The common case
+/// (one address, `rendezvous_listener: None`) is unchanged from before this
+/// split existed.
 pub async fn serve_daemon(
     listener: tokio::net::TcpListener,
     admin: AdminState,
     rendezvous: RendezvousRegistry,
+    rendezvous_listener: Option<tokio::net::TcpListener>,
 ) -> anyhow::Result<()> {
-    let app = admin::router(admin).merge(rendezvous::router(rendezvous));
-    axum::serve(listener, app).await?;
+    let tls_config = std::sync::Arc::new(tls::server_config(admin.daemon_key())?);
+
+    let Some(rendezvous_listener) = rendezvous_listener else {
+        let app = admin::router(admin).merge(rendezvous::router(rendezvous));
+        return serve_tls(listener, tls_config, app).await;
+    };
+
+    tokio::try_join!(
+        serve_tls(listener, tls_config.clone(), admin::router(admin)),
+        serve_tls(rendezvous_listener, tls_config, rendezvous::router(rendezvous)),
+    )?;
+    Ok(())
+}
+
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    tls_config: std::sync::Arc<rustls::ServerConfig>,
+    app: axum::Router,
+) -> anyhow::Result<()> {
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+    axum_server::tls_rustls::from_tcp_rustls(listener.into_std()?, rustls_config)?
+        .serve(app.into_make_service())
+        .await?;
     Ok(())
 }

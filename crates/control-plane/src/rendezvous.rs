@@ -270,17 +270,26 @@ pub async fn serve(listener: tokio::net::TcpListener, registry: RendezvousRegist
     Ok(())
 }
 
-/// `reqwest` client for the [`router`] endpoints.
+/// HTTP(S) client for the [`router`] endpoints.
 pub struct RendezvousClient {
     base: String,
-    http: reqwest::Client,
+    http: crate::http_client::HttpClient,
 }
+
+const JSON: &[(&str, &str)] = &[("content-type", "application/json")];
 
 impl RendezvousClient {
     /// `base` is the accelerator's control-plane origin, e.g.
-    /// `http://accelerator.example:8749`.
+    /// `https://accelerator.example:8749` (a bare `host:port` is accepted too
+    /// and normalized to `https://` — see [`crate::admin::normalize_base`]).
+    /// This talks TLS like the admin API on the same port, but — unlike
+    /// [`AdminClient`](crate::admin::AdminClient) — pins nothing: rendezvous
+    /// is unauthenticated by design, so there's no operator identity to trust
+    /// on first use here (see [`crate::tls::rendezvous_client_config`]).
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into().trim_end_matches('/').to_string(), http: reqwest::Client::new() }
+        let tls = crate::tls::rendezvous_client_config()
+            .expect("fixed rustls client config is always constructible");
+        Self { base: crate::admin::normalize_base(&base.into()), http: crate::http_client::HttpClient::new(tls) }
     }
 
     /// Subscriber side: register with `origin`, returning a request id to
@@ -290,16 +299,10 @@ impl RendezvousClient {
         struct Registered {
             request_id: String,
         }
-        let r: Registered = self
-            .http
-            .post(format!("{}/rendezvous/{origin}", self.base))
-            .json(me)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(r.request_id)
+        let url = format!("{}/rendezvous/{origin}", self.base);
+        let (status, _, bytes) = self.http.send("POST", &url, JSON, serde_json::to_vec(me)?).await?;
+        anyhow::ensure!(status.is_success(), "rendezvous register failed: {status}");
+        Ok(serde_json::from_slice::<Registered>(&bytes)?.request_id)
     }
 
     /// Subscriber side: poll for the origin's answer. `Ok(None)` while still
@@ -309,35 +312,25 @@ impl RendezvousClient {
         origin: &str,
         request_id: &str,
     ) -> anyhow::Result<Option<PeerInfo>> {
-        let resp = self
-            .http
-            .get(format!("{}/rendezvous/{origin}/{request_id}", self.base))
-            .send()
-            .await?
-            .error_for_status()?;
-        let state: RequestState = resp.json().await?;
-        Ok(state.answer)
+        let url = format!("{}/rendezvous/{origin}/{request_id}", self.base);
+        let (status, _, bytes) = self.http.send("GET", &url, &[], Vec::new()).await?;
+        anyhow::ensure!(status.is_success(), "rendezvous poll failed: {status}");
+        Ok(serde_json::from_slice::<RequestState>(&bytes)?.answer)
     }
 
     /// Origin side: requests waiting for this origin's address.
     pub async fn pending(&self, origin: &str) -> anyhow::Result<Vec<PendingRequest>> {
-        let resp = self
-            .http
-            .get(format!("{}/rendezvous/{origin}/pending", self.base))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json().await?)
+        let url = format!("{}/rendezvous/{origin}/pending", self.base);
+        let (status, _, bytes) = self.http.send("GET", &url, &[], Vec::new()).await?;
+        anyhow::ensure!(status.is_success(), "rendezvous pending failed: {status}");
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     /// Origin side: publish this origin's address for one pending request.
     pub async fn answer(&self, origin: &str, request_id: &str, me: &PeerInfo) -> anyhow::Result<()> {
-        self.http
-            .post(format!("{}/rendezvous/{origin}/{request_id}/answer", self.base))
-            .json(me)
-            .send()
-            .await?
-            .error_for_status()?;
+        let url = format!("{}/rendezvous/{origin}/{request_id}/answer", self.base);
+        let (status, _, _) = self.http.send("POST", &url, JSON, serde_json::to_vec(me)?).await?;
+        anyhow::ensure!(status.is_success(), "rendezvous answer failed: {status}");
         Ok(())
     }
 }

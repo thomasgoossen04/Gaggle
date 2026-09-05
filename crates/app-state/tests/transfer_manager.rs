@@ -218,7 +218,11 @@ async fn a_seed_streams_from_disk_under_a_small_ram_budget() {
         credential: None,
     });
 
-    let done = wait_for(&leech, 90, |s| {
+    // Generous margin: every chunk now also runs through wire_crypto (compress
+    // + AEAD) on both ends, and that's meaningfully slower in an unoptimized
+    // debug build than in release, compounded here by the re-reads a tight
+    // cache budget forces.
+    let done = wait_for(&leech, 180, |s| {
         s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
     })
     .await;

@@ -17,6 +17,10 @@ pub struct Overrides {
     pub cache_mib: Option<u64>,
     pub replica_dir: Option<String>,
     pub admin_listen: Option<String>,
+    /// `Some("")` clears `AcceleratorConfig::rendezvous_listen` back to
+    /// `None` (merged onto `admin_listen`); `Some(addr)` sets it; `None`
+    /// leaves whatever `config.toml` already has.
+    pub rendezvous_listen: Option<String>,
     pub listen: Option<String>,
 }
 
@@ -36,6 +40,9 @@ pub async fn run(home: Home, overrides: Overrides) -> anyhow::Result<()> {
     }
     if let Some(v) = overrides.admin_listen {
         config.admin_listen = v;
+    }
+    if let Some(v) = overrides.rendezvous_listen {
+        config.rendezvous_listen = if v.trim().is_empty() { None } else { Some(v) };
     }
     if let Some(v) = overrides.listen {
         config.listen = v;
@@ -68,13 +75,29 @@ pub async fn run(home: Home, overrides: Overrides) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.admin_listen)
         .await
         .with_context(|| format!("binding admin API to {}", config.admin_listen))?;
-    tracing::info!(
-        addr = %config.admin_listen,
-        "admin API + NAT rendezvous listening"
-    );
+
+    let rendezvous_listener = match &config.rendezvous_listen {
+        Some(addr) => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding NAT rendezvous to {addr}"))?,
+        ),
+        None => None,
+    };
+    match &config.rendezvous_listen {
+        Some(addr) => tracing::info!(
+            admin_addr = %config.admin_listen,
+            rendezvous_addr = %addr,
+            "admin API (https, self-signed — pin the public key above) and NAT rendezvous listening separately"
+        ),
+        None => tracing::info!(
+            addr = %config.admin_listen,
+            "admin API (https, self-signed — pin the public key above) + NAT rendezvous listening"
+        ),
+    }
 
     tokio::select! {
-        r = serve_daemon(listener, state, rendezvous) => r.context("admin/rendezvous server failed")?,
+        r = serve_daemon(listener, state, rendezvous, rendezvous_listener) => r.context("admin/rendezvous server failed")?,
         _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C — shutting down"),
     }
     sup_task.abort();

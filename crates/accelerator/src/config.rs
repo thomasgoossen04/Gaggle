@@ -76,8 +76,17 @@ pub struct AcceleratorConfig {
     /// interface. Set e.g. `/ip4/0.0.0.0/udp/4001/quic-v1` for a stable port
     /// to open in a firewall/router.
     pub listen: String,
-    /// `host:port` for the admin HTTP API.
+    /// `host:port` for the admin API — TLS-terminated (self-signed, keyed off
+    /// this daemon's own identity; see `control_plane::tls`), not plain HTTP.
     pub admin_listen: String,
+    /// `host:port` for the NAT-rendezvous endpoints, if different from
+    /// `admin_listen`. Rendezvous is unauthenticated by design (any peer
+    /// reaching one of this daemon's shares may need it, not just the
+    /// operator) — this lets an operator keep the signed admin API on a
+    /// private address (e.g. a Tailscale/VPN IP, or `127.0.0.1` behind an SSH
+    /// tunnel) while rendezvous sits on a publicly reachable one. `None`
+    /// (the default) serves both on `admin_listen`, as before this existed.
+    pub rendezvous_listen: Option<String>,
     /// Relay role: hot-chunk cache budget in MiB.
     pub cache_mib: u64,
     /// NAS role: replica root. Relative paths resolve under the home dir.
@@ -94,6 +103,7 @@ impl Default for AcceleratorConfig {
             role: Role::Relay,
             listen: String::new(),
             admin_listen: "127.0.0.1:8749".to_string(),
+            rendezvous_listen: None,
             cache_mib: 256,
             replica_dir: None,
             authorized_keys: Vec::new(),

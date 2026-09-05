@@ -96,6 +96,9 @@ can browse.
   when none of that works.
 - **Delta sync.** Re-scanning a changed folder and re-syncing a subscribed copy only moves
   the chunks that actually changed — not the whole share again.
+- **Compressed, encrypted chunk transfer.** Every chunk is compressed (when that shrinks
+  it) and sealed before it goes out over the wire, on top of QUIC's own TLS — one chunk at
+  a time, so this adds no delay before a transfer can start streaming.
 - **Accelerators.** Optional always-on nodes that either cache hot chunks for many
   downloaders (relay role) or hold a full durable replica (NAS role), so a share stays
   available when the original owner is offline. One accelerator can carry many shares, and

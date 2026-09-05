@@ -45,7 +45,7 @@ async fn an_authorised_operator_reads_status_and_pins_the_daemon() {
     let operator = AgentKeypair::from_seed([1u8; 32]);
     let h = spawn(vec![operator.public()]).await;
 
-    let mut client = AdminClient::new(&h.base, operator, None);
+    let mut client = AdminClient::new(&h.base, operator, None).unwrap();
     let status = client.status().await.unwrap();
 
     assert_eq!(status.agent_id, h.daemon_id.to_hex());
@@ -59,7 +59,7 @@ async fn an_unauthorised_key_is_refused() {
     let stranger = AgentKeypair::from_seed([2u8; 32]);
     let h = spawn(vec![authorised.public()]).await;
 
-    let mut client = AdminClient::new(&h.base, stranger, None);
+    let mut client = AdminClient::new(&h.base, stranger, None).unwrap();
     let err = client.status().await.unwrap_err();
     assert!(format!("{err:#}").contains("401"), "unexpected error: {err:#}");
 }
@@ -154,7 +154,7 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
         }
     });
 
-    let mut client = AdminClient::new(&h.base, operator, Some(h.daemon_id));
+    let mut client = AdminClient::new(&h.base, operator, Some(h.daemon_id)).unwrap();
     client.add_share("gaggleshare1demo").await.unwrap();
 
     let shares = client.list_shares().await.unwrap();

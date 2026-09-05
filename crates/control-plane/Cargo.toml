@@ -14,6 +14,30 @@ axum = "0.8"
 getrandom = "0.2"
 base64 = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["json", "http2", "charset", "rustls"] }
+# TLS for the admin API: a self-signed cert derived from the daemon's own
+# `AgentKeypair` (rcgen), served over rustls (axum-server), pinned client-side
+# by the same identity `AdminClient` already TOFU-pins at the app layer. Both
+# rustls configs are built with an explicit `ring` provider (never the process
+# default) so they coexist with `reqwest`'s own `aws-lc-rs`-backed default in
+# the same process without fighting over which one wins.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+x509-parser = "0.17"
+# `reqwest`'s documented way to hand it a fully custom `rustls::ClientConfig`
+# (`ClientBuilder::tls_backend_preconfigured`) is unreliable in practice — it
+# downcasts through `dyn Any` and that fails ("Unknown TLS backend") even with
+# a single, version-matched `rustls` in the graph, a widely-reported issue and
+# not specific to this workspace. `hyper-rustls`'s `with_tls_config` is the
+# actually-supported mechanism, so `AdminClient`/`RendezvousClient` (the two
+# clients that need a custom verifier) are built on `hyper`/`hyper-util`
+# instead; `invite.rs`'s client has no custom-TLS need and stays on `reqwest`.
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "tls12"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

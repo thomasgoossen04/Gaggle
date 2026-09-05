@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
         // Seed the palette (and gpui-component's own frame colour) from the
         // persisted setting; `Gaggle::render` keeps it current thereafter.
         let mode = theme::activate(app.snapshot().settings.theme, cx.window_appearance());
-        gpui_component::Theme::change(mode, None, cx);
+        theme::apply_mode(mode, None, cx);
 
         let app = app.clone();
         let opts = WindowOptions {
