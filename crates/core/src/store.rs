@@ -182,6 +182,7 @@ impl LruChunkCache {
             hits: self.hits,
             misses: self.misses,
             evictions: self.evictions,
+            bytes_served: 0,
         }
     }
 
@@ -267,7 +268,7 @@ impl LruChunkCache {
 }
 
 /// Snapshot of an [`LruChunkCache`]'s occupancy and hit rate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CacheStats {
     pub chunks: u64,
     pub used_bytes: u64,
@@ -277,6 +278,11 @@ pub struct CacheStats {
     /// [`get_refreshing`](LruChunkCache::get_refreshing) calls that missed.
     pub misses: u64,
     pub evictions: u64,
+    /// Cumulative bytes actually handed to downloaders — distinct from
+    /// `used_bytes` (the cache's own footprint). The cache does not count this
+    /// itself; a serving layer in front of it (the relay) fills it in on the
+    /// [`stats`](LruChunkCache::stats) it returns.
+    pub bytes_served: u64,
 }
 
 /// A durable content-addressed chunk store on the filesystem.

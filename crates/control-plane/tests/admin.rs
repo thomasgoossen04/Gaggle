@@ -14,6 +14,7 @@ fn sample_status(agent: &AgentId) -> DaemonStatus {
         role: "relay".into(),
         listen_addrs: vec!["/ip4/127.0.0.1/udp/4001/quic-v1".into()],
         shares: Vec::new(),
+        bytes_served_total: Some(0),
     }
 }
 
@@ -51,6 +52,15 @@ async fn an_authorised_operator_reads_status_and_pins_the_daemon() {
     assert_eq!(status.agent_id, h.daemon_id.to_hex());
     assert_eq!(status.role, "relay");
     assert_eq!(client.pinned(), Some(h.daemon_id), "the daemon key is pinned after first call");
+
+    // The served-bytes total rides along on the same signed status response and
+    // survives the JSON round-trip.
+    assert_eq!(status.bytes_served_total, Some(0));
+
+    // A daemon that then serves 4 KiB shows the higher figure on the next poll.
+    h.status_tx.send_modify(|s| s.bytes_served_total = Some(4096));
+    let later = client.status().await.unwrap();
+    assert_eq!(later.bytes_served_total, Some(4096));
 }
 
 #[tokio::test]

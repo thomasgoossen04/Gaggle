@@ -326,6 +326,11 @@ struct EventLoop {
     grants: HashMap<PeerId, Vec<RelayGrant>>,
 
     pending_fills: HashMap<OutboundRequestId, PendingFill>,
+
+    /// Cumulative chunk bytes forwarded to downloaders (cache hit *or*
+    /// miss-then-fill), across every cached share. Surfaced on
+    /// [`CacheStats::bytes_served`] — the relay's "upload throughput" signal.
+    bytes_served: u64,
 }
 
 impl EventLoop {
@@ -348,6 +353,7 @@ impl EventLoop {
             manifests_by_chunk: HashMap::new(),
             grants: HashMap::new(),
             pending_fills: HashMap::new(),
+            bytes_served: 0,
         }
     }
 
@@ -535,7 +541,9 @@ impl EventLoop {
                 let _ = reply.send(self.shares.keys().copied().collect());
             }
             Command::CacheStats(reply) => {
-                let _ = reply.send(self.cache.stats());
+                let mut stats = self.cache.stats();
+                stats.bytes_served = self.bytes_served;
+                let _ = reply.send(stats);
             }
             Command::Restrict { share, manifest_id } => {
                 match self.shares.get_mut(&manifest_id) {
@@ -630,6 +638,9 @@ impl EventLoop {
                         Response::NotFound
                     }
                 };
+                if let Response::Chunk(data) = &forwarded {
+                    self.bytes_served += data.len() as u64;
+                }
                 let _ = self
                     .swarm
                     .behaviour_mut()
@@ -699,6 +710,7 @@ impl EventLoop {
                 if !self.chunk_allowed(&hash, &peer) {
                     Response::Unauthorized("this chunk is outside your invite".into())
                 } else if let Some(bytes) = self.cache.get_refreshing(&hash) {
+                    self.bytes_served += bytes.len() as u64;
                     Response::Chunk(bytes)
                 } else if let Some(upstream) = self.pick_upstream(&hash) {
                     let id = self

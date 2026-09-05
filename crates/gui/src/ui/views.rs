@@ -1,17 +1,20 @@
 //! The tab bodies — Shares, Transfers, Accelerator, Settings — plus their row
 //! builders and the expandable detail panels (swarm inspector, invite form).
 
+use std::time::{Duration, SystemTime};
+
 use app_state::{
-    AccelShareRow, AcceleratorState, LogLevel, RemoteAccelState, SourceStats, Theme, TransferRow,
-    TransferStatus,
+    AccelShareRow, AcceleratorState, LogLevel, RemoteAccelState, SourceStats, SpeedSample, Theme,
+    TransferRow, TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, ClickEvent, Context, FontWeight, KeyDownEvent, MouseButton, SharedString,
+    AnyElement, ClickEvent, Context, FontWeight, Hsla, KeyDownEvent, MouseButton, SharedString,
     deferred, div, hsla, px, relative, uniform_list,
 };
+use gpui_component::chart::LineChart;
 
-use crate::app::{ConfirmKind, Gaggle, Tab};
+use crate::app::{ConfirmKind, Gaggle, StatsSource, Tab};
 use crate::theme;
 use crate::ui::widgets::{
     Tri, btn, card, checkmark, chip, danger_btn, field, field_suffixed, hint, kv, primary_btn,
@@ -1217,8 +1220,248 @@ pub fn body(tab: Tab, app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         Tab::Shares => shares(app, cx),
         Tab::Transfers => transfers(app, cx),
         Tab::Accelerator => accelerator(app, cx),
+        Tab::Stats => stats(app, cx),
         Tab::Settings => settings(app, cx),
         Tab::Logs => logs(app, cx),
+    }
+}
+
+/// Selectable graph windows: label + span in seconds.
+const STATS_WINDOWS: [(&str, u64); 4] = [("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)];
+
+/// Throughput graphs over a configurable window, for this machine or a
+/// connected remote accelerator. All the history lives in
+/// [`app_state::AppState::stats`]; this tab only slices and draws it.
+pub fn stats(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    let win = app.stats_window;
+    let remotes: Vec<String> =
+        app.state.remote_accelerators.iter().map(|r| r.label.clone()).collect();
+    // A remote that was forgotten since it was picked falls back to Local.
+    let source = match &app.stats_source {
+        StatsSource::Remote(l) if remotes.iter().any(|r| r == l) => StatsSource::Remote(l.clone()),
+        _ => StatsSource::Local,
+    };
+
+    let controls = card().child(section_title("Throughput")).child(
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(stats_window_chips(app, cx))
+            .child(stats_source_dropdown(app, &remotes, cx)),
+    );
+
+    let body = match &source {
+        StatsSource::Local => {
+            let samples = slice_window(&app.state.stats.local, win);
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(speed_chart_card("Download", &samples, |s| s.down_bps, t.accent))
+                .child(speed_chart_card("Upload", &samples, |s| s.up_bps, t.info))
+        }
+        StatsSource::Remote(label) => {
+            let samples = app
+                .state
+                .stats
+                .accelerators
+                .iter()
+                .find(|a| &a.label == label)
+                .map(|a| slice_window(&a.history, win))
+                .unwrap_or_default();
+            div().flex().flex_col().gap_3().child(speed_chart_card(
+                &format!("Served — {label}"),
+                &samples,
+                |s| s.up_bps,
+                t.accent,
+            ))
+        }
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(controls)
+        .child(body)
+        .child(hint(
+            "Sampled every ~2 s and kept for up to an hour. \"Local\" is this \
+             machine's own transfer + serving rate; a remote accelerator only \
+             reports what it serves outward.",
+        ))
+        .into_any_element()
+}
+
+/// The samples within `window` of the most recent one.
+fn slice_window(samples: &[SpeedSample], window: Duration) -> Vec<SpeedSample> {
+    let Some(newest) = samples.last().map(|s| s.at) else {
+        return Vec::new();
+    };
+    let cutoff = newest.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH);
+    samples.iter().filter(|s| s.at >= cutoff).copied().collect()
+}
+
+fn stats_window_chips(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    let cur = app.stats_window.as_secs();
+    let mut row = div().flex().items_center().gap_2();
+    for (label, secs) in STATS_WINDOWS {
+        let active = cur == secs;
+        row = row.child(
+            div()
+                .id(("stats-win", secs as usize))
+                .px_2()
+                .py_1()
+                .border_1()
+                .border_color(if active { t.accent } else { t.line })
+                .bg(if active { t.accent } else { t.panel_hi })
+                .text_color(if active { t.on_accent } else { t.fg })
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.set_stats_window(Duration::from_secs(secs), cx)
+                })),
+        );
+    }
+    row.into_any_element()
+}
+
+/// "Local" + one entry per registered remote accelerator, styled like the
+/// Settings theme selector.
+fn stats_source_dropdown(app: &Gaggle, remotes: &[String], cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    let open = app.stats_source_menu_open;
+    let cur = match &app.stats_source {
+        StatsSource::Remote(l) if remotes.iter().any(|r| r == l) => l.clone(),
+        _ => "Local".to_string(),
+    };
+
+    let trigger = div()
+        .id("stats-source-trigger")
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .bg(t.panel_hi)
+        .border_1()
+        .border_color(t.accent_dim)
+        .text_xs()
+        .font_weight(FontWeight::BOLD)
+        .text_color(t.accent)
+        .cursor_pointer()
+        .hover(|s| s.border_color(t.accent))
+        .child(cur.to_uppercase())
+        .child(div().text_color(t.muted).child(if open { "▲" } else { "▼" }))
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_stats_source_menu(cx)));
+
+    let mut wrap = div().relative().child(trigger);
+    if open {
+        let mut opts: Vec<(String, StatsSource)> = vec![("Local".into(), StatsSource::Local)];
+        for r in remotes {
+            opts.push((r.clone(), StatsSource::Remote(r.clone())));
+        }
+        let menu = div()
+            .absolute()
+            .top_full()
+            .right_0()
+            .mt_1()
+            .min_w(px(160.0))
+            .flex()
+            .flex_col()
+            .bg(t.panel)
+            .border_1()
+            .border_color(t.accent_dim)
+            .children(opts.into_iter().enumerate().map(|(i, (label, src))| {
+                let selected = label.eq_ignore_ascii_case(&cur);
+                div()
+                    .id(("stats-src-opt", i))
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .bg(if selected { t.panel_hi } else { t.panel })
+                    .text_color(if selected { t.accent } else { t.fg })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.panel_hi).text_color(t.accent))
+                    .child(label.to_uppercase())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_stats_source(src.clone(), cx)
+                    }))
+            }));
+        wrap = wrap.child(deferred(menu));
+    }
+    wrap.into_any_element()
+}
+
+/// One titled line chart of `value(sample)` over time, plus now/peak readouts.
+fn speed_chart_card(
+    title: &str,
+    samples: &[SpeedSample],
+    value: impl Fn(&SpeedSample) -> u64,
+    color: Hsla,
+) -> AnyElement {
+    let t = theme::active();
+    let latest = samples.last().map(&value).unwrap_or(0);
+    let peak = samples.iter().map(&value).max().unwrap_or(0);
+
+    let head = div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(section_title(title))
+        .child(
+            div()
+                .text_xs()
+                .font_family(theme::MONO)
+                .text_color(t.muted)
+                .child(format!("NOW {} · PEAK {}", human_rate(latest), human_rate(peak))),
+        );
+
+    if samples.len() < 2 {
+        return card()
+            .child(head)
+            .child(hint("collecting data — check back in a few seconds"))
+            .into_any_element();
+    }
+
+    let now = SystemTime::now();
+    let points: Vec<(SharedString, f64)> = samples
+        .iter()
+        .map(|s| {
+            let ago = now.duration_since(s.at).unwrap_or_default().as_secs();
+            (SharedString::from(fmt_ago(ago)), value(s) as f64)
+        })
+        .collect();
+    let tick_margin = (points.len() / 6).max(1);
+    let chart = LineChart::new(points)
+        .x(|p: &(SharedString, f64)| p.0.clone())
+        .y(|p: &(SharedString, f64)| p.1)
+        .stroke(color)
+        .tick_margin(tick_margin);
+
+    card()
+        .child(head)
+        .child(div().w_full().h(px(180.0)).child(chart))
+        .into_any_element()
+}
+
+/// A compact "how long ago" label for a graph's x-axis.
+fn fmt_ago(secs: u64) -> String {
+    if secs == 0 {
+        "now".into()
+    } else if secs < 60 {
+        format!("-{secs}s")
+    } else if secs < 3600 {
+        format!("-{}m", secs / 60)
+    } else {
+        format!("-{}h{:02}", secs / 3600, (secs % 3600) / 60)
     }
 }
 

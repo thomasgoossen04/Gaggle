@@ -134,6 +134,13 @@ async fn relay_cache_serves_a_share_and_shields_the_origin() {
     assert_eq!(after_a.misses as usize, n_chunks, "each chunk should be one upstream fill");
     assert_eq!(after_a.hits, 0);
     assert!(after_a.used_bytes > 0 && after_a.chunks as usize == n_chunks);
+    // The miss-then-forward path is still a chunk handed to a downloader.
+    assert!(
+        after_a.bytes_served >= after_a.used_bytes,
+        "every forwarded chunk counts toward bytes_served ({} vs {} cached)",
+        after_a.bytes_served,
+        after_a.used_bytes,
+    );
 
     // Second downloader, also relay-only: now everything is a cache hit and the
     // origin is not touched again.
@@ -149,6 +156,12 @@ async fn relay_cache_serves_a_share_and_shields_the_origin() {
     let after_b = relay.cache_stats().await.unwrap();
     assert_eq!(after_b.misses, after_a.misses, "origin was not asked again for hot chunks");
     assert_eq!(after_b.hits as usize, n_chunks, "second pull came entirely from cache");
+    // A second full pull, this time all cache hits: bytes_served doubles.
+    assert_eq!(
+        after_b.bytes_served,
+        after_a.bytes_served * 2,
+        "cache-hit chunks are counted the same as forwarded ones",
+    );
 
     sub_a.shutdown().await;
     sub_b.shutdown().await;

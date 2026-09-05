@@ -20,6 +20,7 @@ fn sample_status(agent: &AgentId) -> DaemonStatus {
         role: "relay".into(),
         listen_addrs: vec![],
         shares: Vec::new(),
+        bytes_served_total: None,
     }
 }
 

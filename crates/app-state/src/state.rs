@@ -9,6 +9,7 @@ use gaggle_core::Hash;
 use net::{CacheStats, Multiaddr, PeerId};
 
 use crate::settings::Settings;
+use crate::stats::SpeedSample;
 
 /// Stable per-session id for a share / transfer row.
 pub type TransferId = u64;
@@ -228,6 +229,25 @@ pub struct RemoteAccelState {
     pub error: Option<String>,
 }
 
+/// Throughput history for the Stats tab. Cheap plain data, refreshed on the
+/// manager's 2 s tick.
+#[derive(Debug, Clone, Default)]
+pub struct StatsSnapshot {
+    /// This machine's own history: real aggregate download + upload rates.
+    pub local: Vec<SpeedSample>,
+    /// One row per registered remote accelerator, in the same order as
+    /// [`AppState::remote_accelerators`]. `down_bps` is always `0` in these —
+    /// a remote accelerator only ever serves outward.
+    pub accelerators: Vec<AccelStatsRow>,
+}
+
+/// Served-throughput history for one remote accelerator, keyed by its label.
+#[derive(Debug, Clone, Default)]
+pub struct AccelStatsRow {
+    pub label: String,
+    pub history: Vec<SpeedSample>,
+}
+
 /// A `gaggleshare1…` token just produced by
 /// [`App::mint_invite`](crate::App::mint_invite), so the GUI can pick it up on
 /// its next poll.
@@ -257,6 +277,8 @@ pub struct AppState {
     /// This node's operator public key (hex) — authorise it on a daemon with
     /// `accelerator authorize <key>`.
     pub operator_key: String,
+    /// Rolling download / upload throughput history — see the Stats tab.
+    pub stats: StatsSnapshot,
 }
 
 impl AppState {

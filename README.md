@@ -106,6 +106,9 @@ can browse.
   downloaders (relay role) or hold a full durable replica (NAS role), so a share stays
   available when the original owner is offline. One accelerator can carry many shares, and
   can be driven remotely over a signed admin API.
+- **Throughput graphs.** The **Stats** tab plots download and upload speed over a
+  selectable window (1m / 5m / 15m / 1h) for this machine, or the outbound rate of any
+  connected remote accelerator.
 - **Cross-platform desktop GUI**, a headless accelerator daemon, and a self-updating
   launcher — see "Getting started" below.
 
@@ -242,6 +245,14 @@ a download fan out across a NAS replica and the origin at the same time even tho
 share link only ever carried the origin's address. No chunk data or share secret touches
 the tracker — it only exchanges peer ids and addresses, and every chunk is still verified
 against the manifest.
+
+### Watch throughput
+
+The **Stats** tab graphs download and upload speed over time. Pick a window with the
+1m / 5m / 15m / 1h chips, and the source with the dropdown: **Local** shows this
+machine's own two rates; picking a registered remote accelerator shows the rate it is
+serving to downloaders, polled over its admin API. History is sampled every couple of
+seconds and kept for about an hour.
 
 ## Development
 

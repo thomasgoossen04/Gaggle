@@ -14,6 +14,7 @@ mod manager;
 mod persist;
 mod settings;
 mod state;
+mod stats;
 
 pub use gaggle_core::{Hash, Invite};
 pub use logs::{LogHandle, LogLevel, LogLine, init as init_logging};
@@ -22,7 +23,8 @@ pub use net::ShareLink;
 pub use net::{CacheStats, Multiaddr, PeerId, Scope};
 pub use settings::{RemoteAccelerator, Settings, Theme};
 pub use state::{
-    AcceleratorRole, AcceleratorState, AccelShareRow, AppState, BenchmarkResult, MintedInvite,
-    RemoteAccelState, SourceStats, SwarmStatus, TransferId, TransferKind, TransferRow,
-    TransferStatus,
+    AccelStatsRow, AcceleratorRole, AcceleratorState, AccelShareRow, AppState, BenchmarkResult,
+    MintedInvite, RemoteAccelState, SourceStats, StatsSnapshot, SwarmStatus, TransferId,
+    TransferKind, TransferRow, TransferStatus,
 };
+pub use stats::{SpeedHistory, SpeedSample};

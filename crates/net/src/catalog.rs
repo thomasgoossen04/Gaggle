@@ -1,10 +1,20 @@
 //! [`Catalog`] — everything the serving side of a share can answer with.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gaggle_core::{ChunkList, ChunkStore, Hash, Manifest, Scope};
 
 use crate::proto::{Request, Response};
+
+/// Cumulative count of chunk bytes a [`Catalog`] has actually handed out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServeStats {
+    /// Bytes of `Response::Chunk` payloads served.
+    pub bytes_served: u64,
+    /// Number of `Request::GetChunk` requests answered with data.
+    pub chunks_served: u64,
+}
 
 /// The manifest, a root-indexed set of chunk lists, and the chunk bytes
 /// themselves. Cheap to answer [`Request`]s from.
@@ -30,6 +40,11 @@ pub struct Catalog {
     /// chunk is shared between files by dedup).
     paths_by_chunk: HashMap<Hash, Vec<String>>,
     store: Box<dyn ChunkStore + Send>,
+    /// Cumulative bytes / chunks served through [`answer`](Self::answer). Read
+    /// back with [`serve_stats`](Self::serve_stats) — the "upload throughput"
+    /// signal the Stats view samples.
+    bytes_served: AtomicU64,
+    chunks_served: AtomicU64,
 }
 
 impl Catalog {
@@ -58,7 +73,23 @@ impl Catalog {
             lists_by_root.insert(root, list);
         }
 
-        Self { manifest, lists_by_root, path_by_root, paths_by_chunk, store: Box::new(store) }
+        Self {
+            manifest,
+            lists_by_root,
+            path_by_root,
+            paths_by_chunk,
+            store: Box::new(store),
+            bytes_served: AtomicU64::new(0),
+            chunks_served: AtomicU64::new(0),
+        }
+    }
+
+    /// Cumulative bytes / chunks this catalog has served to downloaders.
+    pub fn serve_stats(&self) -> ServeStats {
+        ServeStats {
+            bytes_served: self.bytes_served.load(Ordering::Relaxed),
+            chunks_served: self.chunks_served.load(Ordering::Relaxed),
+        }
     }
 
     /// The share's identity — its DHT discovery key lives at
@@ -117,10 +148,55 @@ impl Catalog {
                 .get(root)
                 .cloned()
                 .map_or(Response::NotFound, Response::ChunkList),
-            Request::GetChunk(hash) => {
-                self.store.get(hash).map_or(Response::NotFound, Response::Chunk)
-            }
+            Request::GetChunk(hash) => match self.store.get(hash) {
+                Some(bytes) => {
+                    self.bytes_served.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    self.chunks_served.fetch_add(1, Ordering::Relaxed);
+                    Response::Chunk(bytes)
+                }
+                None => Response::NotFound,
+            },
             Request::GetInventory => Response::Inventory(self.inventory()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gaggle_core::{MemoryChunkStore, snapshot_dir};
+
+    use super::*;
+    use crate::proto::{Request, Response};
+
+    #[test]
+    fn serve_stats_count_only_chunks_actually_handed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), vec![7u8; 40_000]).unwrap();
+
+        let mut store = MemoryChunkStore::new();
+        let snap = snapshot_dir(dir.path(), "s", 1, &mut store).unwrap();
+        let list = snap.chunk_lists.values().next().unwrap().clone();
+        let catalog = Catalog::new(snap.manifest, snap.chunk_lists, store);
+
+        assert_eq!(catalog.serve_stats(), ServeStats::default());
+
+        // A metadata request moves no chunk bytes.
+        catalog.answer(&Request::GetManifest(None));
+        assert_eq!(catalog.serve_stats(), ServeStats::default());
+
+        // A miss counts nothing.
+        catalog.answer(&Request::GetChunk(Hash::of(b"nope")));
+        assert_eq!(catalog.serve_stats(), ServeStats::default());
+
+        let mut expected = 0u64;
+        for chunk in &list.chunks {
+            let Response::Chunk(bytes) = catalog.answer(&Request::GetChunk(chunk.hash)) else {
+                panic!("expected the chunk to be served");
+            };
+            expected += bytes.len() as u64;
+        }
+        let stats = catalog.serve_stats();
+        assert_eq!(stats.bytes_served, expected);
+        assert_eq!(stats.chunks_served, list.chunks.len() as u64);
     }
 }

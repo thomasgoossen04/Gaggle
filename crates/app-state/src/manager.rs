@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use control_plane::{AdminClient, PeerInfo, RendezvousClient, TrackerClient};
 use gaggle_core::{
@@ -31,10 +31,11 @@ use tokio::time::MissedTickBehavior;
 use crate::persist::{PersistedSeed, PersistedState};
 use crate::settings::{PersistedAccelRole, PersistedAccelerator, Settings};
 use crate::state::{
-    AccelShareRow, AcceleratorRole, AcceleratorState, AppState, BenchmarkResult, MintedInvite,
-    RemoteAccelState, ReplicaProgress, SourceStats, SwarmStatus, TransferId, TransferKind,
-    TransferRow, TransferStatus,
+    AccelShareRow, AccelStatsRow, AcceleratorRole, AcceleratorState, AppState, BenchmarkResult,
+    MintedInvite, RemoteAccelState, ReplicaProgress, SourceStats, StatsSnapshot, SwarmStatus,
+    TransferId, TransferKind, TransferRow, TransferStatus,
 };
+use crate::stats::{SpeedHistory, SpeedSample, rate_from_cumulative};
 
 /// A discrete thing that happened, for callers that would rather react than poll.
 #[derive(Debug, Clone)]
@@ -171,8 +172,16 @@ enum Command {
     AccelShareAdded { node: Option<Box<Node>>, row: Box<AccelShareRow>, token: String },
     /// A NAS share added to an already-running local accelerator made progress.
     AccelShareProgress { manifest_id: String, progress: ReplicaProgress },
-    RemoteStatusRefresh { label: String, state: Box<RemoteAccelState> },
+    RemoteStatusRefresh {
+        label: String,
+        state: Box<RemoteAccelState>,
+        /// The daemon's cumulative served-bytes counter, for the Stats tab.
+        served_total: Option<u64>,
+    },
     RepollRemote(String),
+    /// Result of a [`Manager::sample_local_stats`] gather: the current sum of
+    /// every locally-served node's cumulative served-bytes counter.
+    ServedTotalSample(u64),
 }
 
 struct ShareInfo {
@@ -262,6 +271,7 @@ impl App {
             benchmark: None,
             minted_invite: None,
             operator_key: operator.public().to_hex(),
+            stats: StatsSnapshot::default(),
         };
 
         let (commands_tx, commands_rx) = mpsc::channel(128);
@@ -293,6 +303,10 @@ impl App {
             last_tracker_announce: Instant::now()
                 .checked_sub(TRACKER_ANNOUNCE_INTERVAL)
                 .unwrap_or_else(Instant::now),
+            local_history: SpeedHistory::default(),
+            up_total_prev: None,
+            remote_histories: HashMap::new(),
+            remote_up_prev: HashMap::new(),
         };
         tokio::spawn(manager.run());
 
@@ -525,6 +539,17 @@ struct Manager {
     last_resync_poll: Instant,
     last_remote_poll: Instant,
     last_tracker_announce: Instant,
+
+    /// This machine's own download/upload throughput history (the Stats tab's
+    /// "Local" source).
+    local_history: SpeedHistory,
+    /// Previous `(when, cumulative-served-bytes)` reading, for diffing into an
+    /// upload rate on the next [`ServedTotalSample`](Command::ServedTotalSample).
+    up_total_prev: Option<(Instant, u64)>,
+    /// Per-remote served-throughput history, keyed by accelerator label.
+    remote_histories: HashMap<String, SpeedHistory>,
+    /// Per-remote previous `(when, bytes_served_total)` reading.
+    remote_up_prev: HashMap<String, (Instant, u64)>,
 }
 
 /// Load a persistent operator [`AgentKeypair`] from `operator.key` next to the
@@ -621,6 +646,9 @@ impl Manager {
     }
 
     fn tick(&mut self) {
+        // Sample this machine's own throughput (download rate now, upload rate
+        // once the async served-bytes gather answers).
+        self.sample_local_stats();
         // Relay hot-cache stats refresh.
         if let Some(relay) = self.accel.as_ref().and_then(|a| a.relay.clone()) {
             let tx = self.self_tx.clone();
@@ -683,6 +711,66 @@ impl Manager {
         }
     }
 
+    /// Aggregate download rate right now: the sum of every actively-transferring
+    /// download's rolling `speed_bps` estimate. Reuses the per-row EMA the
+    /// progress path already maintains — no extra byte counting.
+    fn aggregate_download_bps(&self) -> u64 {
+        self.state
+            .transfers
+            .values()
+            .filter(|r| {
+                r.kind == TransferKind::Downloading && r.status == TransferStatus::Active
+            })
+            .map(|r| r.speed_bps)
+            .sum()
+    }
+
+    /// Kick off an off-thread read of every locally-served node's cumulative
+    /// served-bytes counter (origin seeds + any in-process NAS replica + a
+    /// running relay cache), summed and fed back as
+    /// [`Command::ServedTotalSample`]. Cheap — one actor round-trip per node.
+    fn sample_local_stats(&mut self) {
+        let mut nodes: Vec<Arc<Node>> =
+            self.seeds.values().map(|s| Arc::clone(&s.node)).collect();
+        let relay = self.accel.as_ref().and_then(|a| a.relay.clone());
+        if let Some(accel) = &self.accel {
+            nodes.extend(accel.nas_nodes.iter().map(|(_, n)| Arc::clone(n)));
+        }
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let mut total = 0u64;
+            for node in nodes {
+                if let Ok(s) = node.serve_stats().await {
+                    total += s.bytes_served;
+                }
+            }
+            if let Some(relay) = relay
+                && let Ok(s) = relay.cache_stats().await
+            {
+                total += s.bytes_served;
+            }
+            let _ = tx.send(Command::ServedTotalSample(total)).await;
+        });
+    }
+
+    /// Rebuild [`AppState::stats::accelerators`] from `remote_histories`,
+    /// following the display order of the registered remotes.
+    fn refresh_remote_stats_snapshot(&mut self) {
+        self.state.stats.accelerators = self
+            .state
+            .remote_accelerators
+            .iter()
+            .map(|r| AccelStatsRow {
+                label: r.label.clone(),
+                history: self
+                    .remote_histories
+                    .get(&r.label)
+                    .map(SpeedHistory::snapshot)
+                    .unwrap_or_default(),
+            })
+            .collect();
+    }
+
     /// Fetch one remote daemon's status off-thread and feed it back as a
     /// [`Command::RemoteStatusRefresh`].
     fn spawn_remote_status(&mut self, label: String) {
@@ -698,25 +786,44 @@ impl Manager {
         let operator = AgentKeypair::from_seed(self.operator.to_seed());
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
-            let state = match AdminClient::new(base.clone(), operator, pinned) {
+            let (state, served_total) = match AdminClient::new(base.clone(), operator, pinned) {
                 Ok(mut client) => match client.status().await {
                     Ok(s) => {
                         let role = match s.role.as_str() {
                             "nas" => Some(AcceleratorRole::Nas),
                             _ => Some(AcceleratorRole::Relay),
                         };
+                        let served = s.bytes_served_total;
+                        (
+                            RemoteAccelState {
+                                label: label.clone(),
+                                admin_url: base,
+                                reachable: true,
+                                peer_id: Some(s.peer_id),
+                                daemon_key: client.pinned().map(|k| k.to_hex()),
+                                role,
+                                shares: s.shares.iter().map(share_status_row).collect(),
+                                error: None,
+                            },
+                            served,
+                        )
+                    }
+                    Err(e) => (
                         RemoteAccelState {
                             label: label.clone(),
                             admin_url: base,
-                            reachable: true,
-                            peer_id: Some(s.peer_id),
-                            daemon_key: client.pinned().map(|k| k.to_hex()),
-                            role,
-                            shares: s.shares.iter().map(share_status_row).collect(),
-                            error: None,
-                        }
-                    }
-                    Err(e) => RemoteAccelState {
+                            reachable: false,
+                            peer_id: None,
+                            daemon_key: pinned.map(|k| k.to_hex()),
+                            role: None,
+                            shares: Vec::new(),
+                            error: Some(format!("{e:#}")),
+                        },
+                        None,
+                    ),
+                },
+                Err(e) => (
+                    RemoteAccelState {
                         label: label.clone(),
                         admin_url: base,
                         reachable: false,
@@ -726,20 +833,15 @@ impl Manager {
                         shares: Vec::new(),
                         error: Some(format!("{e:#}")),
                     },
-                },
-                Err(e) => RemoteAccelState {
-                    label: label.clone(),
-                    admin_url: base,
-                    reachable: false,
-                    peer_id: None,
-                    daemon_key: pinned.map(|k| k.to_hex()),
-                    role: None,
-                    shares: Vec::new(),
-                    error: Some(format!("{e:#}")),
-                },
+                    None,
+                ),
             };
             let _ = tx
-                .send(Command::RemoteStatusRefresh { label, state: Box::new(state) })
+                .send(Command::RemoteStatusRefresh {
+                    label,
+                    state: Box::new(state),
+                    served_total,
+                })
                 .await;
         });
     }
@@ -775,7 +877,7 @@ impl Manager {
             Command::RemoteRemoveShare { label, manifest_id } => {
                 self.remote_share_op(label, None, Some(manifest_id))
             }
-            Command::RemoteStatusRefresh { label, state } => {
+            Command::RemoteStatusRefresh { label, state, served_total } => {
                 if let Some(k) = &state.daemon_key
                     && let Ok(id) = AgentId::from_hex(k)
                 {
@@ -798,8 +900,26 @@ impl Manager {
                     self.state.remote_accelerators.iter_mut().find(|r| r.label == label)
                 {
                     *slot = *state;
-                    self.publish();
                 }
+                // Diff the daemon's cumulative served counter into an upload
+                // rate and push a Stats sample for this remote.
+                if let Some(total) = served_total {
+                    let now = Instant::now();
+                    let up_bps = self
+                        .remote_up_prev
+                        .get(&label)
+                        .copied()
+                        .and_then(|prev| rate_from_cumulative(prev, now, total))
+                        .unwrap_or(0);
+                    self.remote_up_prev.insert(label.clone(), (now, total));
+                    self.remote_histories.entry(label.clone()).or_default().push(SpeedSample {
+                        at: SystemTime::now(),
+                        down_bps: 0,
+                        up_bps,
+                    });
+                }
+                self.refresh_remote_stats_snapshot();
+                self.publish();
             }
             Command::UpdateSettings(s) => {
                 self.state.settings = *s;
@@ -1091,6 +1211,21 @@ impl Manager {
                 }
             }
             Command::RepollRemote(label) => self.spawn_remote_status(label),
+            Command::ServedTotalSample(total) => {
+                let now = Instant::now();
+                let up_bps = self
+                    .up_total_prev
+                    .and_then(|prev| rate_from_cumulative(prev, now, total))
+                    .unwrap_or(0);
+                self.up_total_prev = Some((now, total));
+                self.local_history.push(SpeedSample {
+                    at: SystemTime::now(),
+                    down_bps: self.aggregate_download_bps(),
+                    up_bps,
+                });
+                self.state.stats.local = self.local_history.snapshot();
+                self.publish();
+            }
         }
     }
 
@@ -1302,17 +1437,21 @@ impl Manager {
                 error: None,
             });
         }
+        self.refresh_remote_stats_snapshot();
         self.publish();
         self.spawn_remote_status(label);
     }
 
     fn remove_remote_accelerator(&mut self, label: String) {
         self.remotes.remove(&label);
+        self.remote_histories.remove(&label);
+        self.remote_up_prev.remove(&label);
         self.state.settings.remote_accelerators.retain(|r| r.label != label);
         self.state.remote_accelerators.retain(|r| r.label != label);
         if let Some(path) = &self.config_path {
             let _ = self.state.settings.save(path);
         }
+        self.refresh_remote_stats_snapshot();
         self.publish();
     }
 

@@ -86,7 +86,11 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   `LruChunkCache`; on a miss it fetches from an upstream seed, verifies, caches
   (evicting the coldest chunk if over `RelayConfig::cache_capacity_bytes`), and
   forwards — so N downloaders cost the origin one fetch per hot chunk. `cache_stats()`
-  exposes hits/misses/evictions/bytes.
+  exposes hits/misses/evictions/bytes, plus `bytes_served` — cumulative chunk bytes
+  forwarded to downloaders (cache hit *or* miss-then-fill), the relay's upload-throughput
+  signal. A plain `Node` counts the same thing through its `Catalog` (`ServeStats {
+  bytes_served, chunks_served }`, read back with `Node::serve_stats()`); `Catalog::answer`
+  bumps the counters at the single `GetChunk` choke point every served chunk passes.
 - **NAS replica** (milestone 6) — no new node type: `Node::download_share_multi` into a
   `DiskChunkStore`, then `Node::serve(Catalog::new(manifest, lists, disk))`. The disk
   store dedups and skips chunks already present, so replication resumes after a
@@ -179,12 +183,17 @@ share, and can be driven remotely:
   `AdminState.authorized`); every response is signed by the daemon key
   (`x-gaggle-daemon[-signature]`) so `AdminClient` TOFU-pins it. Mutations go out
   an `mpsc<AdminCommand>`; status comes in a `watch<DaemonStatus>` — no `net` dep.
+  `DaemonStatus.bytes_served_total: Option<u64>` (additive, `skip_serializing_if`)
+  carries the daemon's cumulative served bytes so a client can diff successive polls
+  into an outbound-throughput graph.
 - **`accelerator` daemon** — `config.rs` (`AcceleratorConfig` toml: role, listen,
   admin_listen, cache_mib, replica_dir, `authorized_keys`, `shares`),
   `supervisor.rs` (`Supervisor` owns a multi-share `RelayNode` **or** a
   `HashMap<Hash, Node>` of per-share replicas; applies `AdminCommand`s and
-  rewrites `config.toml`), `run.rs` (identity + config + supervisor + admin
-  server). Prints its peer id + public key on every start.
+  rewrites `config.toml`; `refresh_served()` reads the relay's `cache_stats().bytes_served`
+  or the sum of each NAS node's `serve_stats()` into `last_served` before every
+  `publish()`, incl. on the 30 s tracker-announce tick), `run.rs` (identity + config +
+  supervisor + admin server). Prints its peer id + public key on every start.
 - **`app-state`** — `App` keeps a persistent operator `AgentKeypair` at
   `operator.key` (`App::operator_public_key()`). `AcceleratorRequest::{Relay,Nas}`
   take `shares: Vec<ShareLink>`; `AcceleratorState.shares: Vec<AccelShareRow>`;
@@ -193,6 +202,16 @@ share, and can be driven remotely:
   admin URL + pinned `daemon_key`); `App::{add,remove}_remote_accelerator` /
   `remote_{add,remove}_share`; the manager polls each every ~10 s via `AdminClient`
   into `AppState.remote_accelerators: Vec<RemoteAccelState>`.
+- **Throughput history (`app-state/src/stats.rs`)** — `SpeedSample { at, down_bps,
+  up_bps }` + a capped `SpeedHistory` ring (~1 h at the 2 s tick). `Manager::tick`
+  samples the local rates: download = sum of active `TransferRow::speed_bps`; upload =
+  a diff of the summed cumulative served-bytes counters across every seed `Node` + any
+  in-process NAS node + a running `RelayNode` (gathered off-thread, fed back as
+  `Command::ServedTotalSample`). Each remote's `Command::RemoteStatusRefresh` carries
+  `DaemonStatus.bytes_served_total`, diffed per label into an `up_bps`-only history.
+  All of it is exposed always-on (not gated on the GUI) via
+  `AppState.stats: StatsSnapshot { local: Vec<SpeedSample>, accelerators: Vec<AccelStatsRow
+  { label, history }> }`. `stats::rate_from_cumulative` is the pure diff helper (unit-tested).
 - **`ShareLink`** moved from `app-state` to **`net`** (`net::ShareLink`, re-exported
   by `app-state`); `into_request()` is now `From<ShareLink> for SubscribeRequest`
   in `app-state`.
@@ -253,7 +272,10 @@ share, and can be driven remotely:
   rescan, per-row ▸ panel with the invite form), Transfers (progress bars,
   pause/resume/remove, check-updates/resync, `update vN` badge, per-row ▸ swarm
   inspector = per-source chunk/byte breakdown), Accelerator (benchmark → suggested role
-  → start relay / NAS → live status), and an editable Settings form. It polls
+  → start relay / NAS → live status), Stats (download/upload `gpui_component::chart::LineChart`s
+  over a 1m/5m/15m/1h window — ephemeral `Gaggle::stats_window`; a "Local" / per-remote
+  source dropdown — `Gaggle::stats_source: StatsSource`; reads `AppState.stats`, no polling
+  of its own), and an editable Settings form. It polls
   `App::snapshot()` on a 200 ms `Timer` and re-renders; it never touches `net`. Raw gpui
   for layout/interaction, plus `gpui_component::{init, v_flex, window_border}` and
   `gpui_component::input::{Input, InputState}` for the form fields.
@@ -265,9 +287,17 @@ later subscribers fail, **rescan→check_updates→resync applies only the delta
 file arrives, removed file is deleted, `version` bumps), **a private share refuses a
 strangers then admits a minted invite**, **benchmark reports throughput + free space**,
 **a NAS accelerator replicates a share**, **a seed streams a folder several times its
-`seed_cache_bytes` budget from disk and still serves every chunk**. `app-state` unit
+`seed_cache_bytes` budget from disk and still serves every chunk**, **a real loopback
+transfer leaves the seeder with a non-zero-`up_bps` `stats.local` history and both ends
+with a growing sample count**. `app-state` unit
 tests cover `Settings`
-persistence, `ShareLink` round trips, and name sanitizing. **`relay_accelerator_carries_multiple_shares`**
+persistence, `ShareLink` round trips, name sanitizing, and `stats::{SpeedHistory,
+rate_from_cumulative}` (capping, windowing, counter/clock resets).
+`crates/net/src/catalog.rs` unit-tests that `ServeStats` counts only `GetChunk` hits;
+`crates/net/tests/accelerator.rs`'s relay-cache test asserts `CacheStats::bytes_served`
+tracks both forwarded and cache-hit chunks (doubling on a second full pull);
+`crates/control-plane/tests/admin.rs` asserts `DaemonStatus.bytes_served_total`
+round-trips the signed status response and reflects a later value. **`relay_accelerator_carries_multiple_shares`**
 starts a local relay with two `ShareLink`s and drops one live; **remote-accelerator
 tests** cover `Settings` round-tripping `remote_accelerators` and a registered
 remote reporting unreachable + persisting. `crates/net/tests/accelerator.rs` adds
@@ -536,7 +566,7 @@ then ask the user to run it and confirm the result looks right. Don't drive `spe
 view — state snapshot, tab, per-row expansion set, the Settings/Accelerator/invite
 `InputState` entities, actions) · `ui/` (`widgets.rs` themed primitives incl. `field()`
 over `gpui_component::input::Input`, `chrome.rs` title bar + status bar, `views.rs` the
-four tabs + expandable detail panels) · `theme.rs` (swappable
+five tabs + expandable detail panels) · `theme.rs` (swappable
 `Palette`s — `DARK`, `LIGHT`; every widget paints from `theme::active()`, a
 thread-local) · `clipboard.rs` · `util.rs`. Add a theme = one more `static Palette` +
 a branch in `theme::activate`. The window is decorationless (`WindowDecorations::Client`

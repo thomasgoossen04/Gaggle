@@ -28,8 +28,17 @@ pub enum Tab {
     Transfers,
     Shares,
     Accelerator,
+    Stats,
     Settings,
     Logs,
+}
+
+/// Which series the Stats tab is showing: this machine, or a named remote
+/// accelerator.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StatsSource {
+    Local,
+    Remote(String),
 }
 
 /// How long a minted invite stays valid.
@@ -134,6 +143,13 @@ pub struct Gaggle {
     pub(crate) confirm_focus: FocusHandle,
     /// The Settings theme dropdown is open.
     pub(crate) theme_menu_open: bool,
+    /// Stats tab: how far back the graphs reach. Ephemeral view state — never
+    /// persisted to `Settings`.
+    pub(crate) stats_window: Duration,
+    /// Stats tab: which series is shown.
+    pub(crate) stats_source: StatsSource,
+    /// Stats tab: the source dropdown is open.
+    pub(crate) stats_source_menu_open: bool,
     /// Last `ThemeMode` pushed into gpui-component, so `render` can re-sync it
     /// when the resolved mode drifts (the OS appearance can land after frame 1).
     pub(crate) theme_mode: Option<gpui_component::ThemeMode>,
@@ -272,6 +288,9 @@ impl Gaggle {
             confirm: None,
             confirm_focus: cx.focus_handle(),
             theme_menu_open: false,
+            stats_window: Duration::from_secs(300),
+            stats_source: StatsSource::Local,
+            stats_source_menu_open: false,
             theme_mode: Some(initial_mode),
             dragging: false,
             set_dir,
@@ -747,6 +766,22 @@ impl Gaggle {
 
     pub(crate) fn toggle_theme_menu(&mut self, cx: &mut Context<Self>) {
         self.theme_menu_open = !self.theme_menu_open;
+        cx.notify();
+    }
+
+    pub(crate) fn set_stats_window(&mut self, window: Duration, cx: &mut Context<Self>) {
+        self.stats_window = window;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_stats_source_menu(&mut self, cx: &mut Context<Self>) {
+        self.stats_source_menu_open = !self.stats_source_menu_open;
+        cx.notify();
+    }
+
+    pub(crate) fn set_stats_source(&mut self, source: StatsSource, cx: &mut Context<Self>) {
+        self.stats_source = source;
+        self.stats_source_menu_open = false;
         cx.notify();
     }
 

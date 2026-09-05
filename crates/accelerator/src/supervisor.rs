@@ -100,6 +100,10 @@ pub struct Supervisor {
     events_tx: mpsc::Sender<ShareEvent>,
     events_rx: mpsc::Receiver<ShareEvent>,
     tracker: TrackerRegistry,
+    /// Cumulative chunk bytes served to downloaders, refreshed by
+    /// [`refresh_served`](Self::refresh_served) before every [`publish`](Self::publish)
+    /// (the actual counters live on the `net` nodes and are read async).
+    last_served: u64,
 }
 
 impl Supervisor {
@@ -153,6 +157,7 @@ impl Supervisor {
             events_tx,
             events_rx,
             tracker,
+            last_served: 0,
         };
 
         let tokens = sup.config.shares.clone();
@@ -160,6 +165,7 @@ impl Supervisor {
             let (ack, _rx) = oneshot::channel();
             sup.add_share(token, ack).await;
         }
+        sup.refresh_served().await;
         sup.publish();
         Ok((sup, status_rx))
     }
@@ -181,15 +187,21 @@ impl Supervisor {
                             let _ = ack.send(result);
                         }
                     }
+                    self.refresh_served().await;
                     self.publish();
                     self.announce_to_tracker().await;
                 }
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event);
+                    self.refresh_served().await;
                     self.publish();
                     self.announce_to_tracker().await;
                 }
-                _ = announce.tick() => self.announce_to_tracker().await,
+                _ = announce.tick() => {
+                    self.refresh_served().await;
+                    self.publish();
+                    self.announce_to_tracker().await;
+                }
             }
         }
     }
@@ -386,6 +398,29 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Read the cumulative served-bytes counters off the running `net` nodes
+    /// (a relay's own forwarded-bytes total, or the sum across every NAS
+    /// share's serving node) into `self.last_served`, so the next sync
+    /// [`publish`](Self::publish) can report it in [`DaemonStatus`].
+    async fn refresh_served(&mut self) {
+        self.last_served = match &self.backend {
+            Backend::Relay { relay, .. } => {
+                relay.cache_stats().await.map(|s| s.bytes_served).unwrap_or(self.last_served)
+            }
+            Backend::Nas { .. } => {
+                let mut total = 0u64;
+                for record in self.shares.values() {
+                    if let ShareRecord::Ready { node: Some(node), .. } = record
+                        && let Ok(s) = node.serve_stats().await
+                    {
+                        total += s.bytes_served;
+                    }
+                }
+                total
+            }
+        };
+    }
+
     fn persist(&mut self) {
         self.config.shares = self.shares.values().map(|r| r.token().to_string()).collect();
         self.config.shares.sort();
@@ -453,6 +488,7 @@ impl Supervisor {
             role: self.config.role.as_str().to_string(),
             listen_addrs,
             shares,
+            bytes_served_total: Some(self.last_served),
         };
         let _ = self.status_tx.send(status);
     }

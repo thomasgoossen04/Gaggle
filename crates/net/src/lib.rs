@@ -34,7 +34,7 @@ use libp2p::kad::RecordKey;
 
 use behaviour::{PeerBehaviour, RelayBehaviour};
 
-pub use catalog::Catalog;
+pub use catalog::{Catalog, ServeStats};
 pub use link::ShareLink;
 pub use gaggle_core::{
     CacheStats, Capability, DiskChunkStore, Invite, LruChunkCache, Scope, ShareKeypair,

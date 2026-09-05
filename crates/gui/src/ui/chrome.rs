@@ -111,6 +111,7 @@ pub fn header(app: &Gaggle, window: &Window, cx: &mut Context<Gaggle>) -> impl I
                                 .child(tab_btn(app, cx, Tab::Transfers, "Transfers"))
                                 .child(tab_btn(app, cx, Tab::Shares, "Shares"))
                                 .child(tab_btn(app, cx, Tab::Accelerator, "Accelerator"))
+                                .child(tab_btn(app, cx, Tab::Stats, "Stats"))
                                 .child(tab_btn(app, cx, Tab::Settings, "Settings"))
                                 .child(tab_btn(app, cx, Tab::Logs, "Logs")),
                         ),

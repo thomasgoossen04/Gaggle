@@ -23,7 +23,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::behaviour::{PeerBehaviour, PeerBehaviourEvent};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, ServeStats};
 use crate::proto::{Request, Response};
 use crate::swarm::{
     SwarmConfig, SwarmDownload, SwarmProgress, fetch_share_from_swarm,
@@ -84,6 +84,7 @@ enum Command {
     Request { peer: PeerId, request: Request, reply: ReplyResult<Response> },
     SetCatalog(Box<Catalog>),
     Restrict { share: SharePublicKey, reply: ReplyResult<()> },
+    ServeStats(oneshot::Sender<ServeStats>),
 }
 
 fn unix_now() -> u64 {
@@ -306,6 +307,16 @@ impl Node {
     /// Replace the served catalog.
     pub async fn serve(&self, catalog: Catalog) -> anyhow::Result<()> {
         self.send(Command::SetCatalog(Box::new(catalog))).await
+    }
+
+    /// Cumulative bytes / chunks this node has served from its catalog since it
+    /// started (or since the last [`serve`](Self::serve)). Zero if the node is
+    /// download-only. Cheap — a single actor round-trip — so a caller can
+    /// sample it on a timer to derive an upload-throughput rate.
+    pub async fn serve_stats(&self) -> anyhow::Result<ServeStats> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::ServeStats(tx)).await?;
+        Ok(rx.await?)
     }
 
     /// Turn this node's share private: from now on it answers a
@@ -641,6 +652,10 @@ impl EventLoop {
             }
             Command::Request { peer, request, reply } => self.dispatch_request(peer, request, reply),
             Command::SetCatalog(catalog) => self.catalog = Some(*catalog),
+            Command::ServeStats(reply) => {
+                let stats = self.catalog.as_ref().map(Catalog::serve_stats).unwrap_or_default();
+                let _ = reply.send(stats);
+            }
             Command::Restrict { share, reply } => {
                 let result = match &self.catalog {
                     Some(catalog) => {

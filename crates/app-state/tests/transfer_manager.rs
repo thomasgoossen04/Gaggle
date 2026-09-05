@@ -1129,3 +1129,65 @@ async fn a_download_swarms_across_tracker_discovered_replicas() {
 
     dir_matches(folder.path(), &row.output_dir.clone().unwrap());
 }
+
+#[tokio::test]
+async fn stats_history_accumulates_local_download_and_upload_rates() {
+    // A real loopback transfer should leave both ends with a throughput
+    // history: the seeder with a non-zero *upload* rate (its serving node's
+    // cumulative bytes-served counter jumps across a sampling tick), and both
+    // ends with a steadily-growing sample count (the 2 s sampler is alive).
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| {
+            r.status == TransferStatus::Complete && r.share_addr.is_some()
+        })
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let addr = seed.share_addr.clone().unwrap();
+    let manifest_id = seed.manifest_id;
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![addr],
+        credential: None,
+    });
+
+    wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+
+    // The seeder's upload rate is derived from a cumulative counter, so a
+    // sample straddling the transfer is guaranteed once enough ticks pass.
+    let seeder_stats = wait_for(&seeder, 20, |s| {
+        s.stats.local.iter().any(|sample| sample.up_bps > 0)
+    })
+    .await;
+    assert!(
+        !seeder_stats.stats.local.is_empty(),
+        "the seeder should have a local throughput history"
+    );
+    assert!(
+        seeder_stats.stats.local.iter().any(|sample| sample.up_bps > 0),
+        "the seeder served ~24 MiB — some sample's up_bps must be non-zero"
+    );
+
+    // The leech serves nothing, so every one of its samples reports 0 up_bps…
+    let before = leech.snapshot();
+    assert!(!before.stats.local.is_empty(), "the leech should be sampling too");
+    assert!(
+        before.stats.local.iter().all(|sample| sample.up_bps == 0),
+        "the leech serves nothing — its up_bps must stay 0"
+    );
+
+    // …and the sampler keeps running: the history grows over the next few ticks.
+    let after = wait_for(&leech, 15, |s| s.stats.local.len() > before.stats.local.len()).await;
+    assert!(after.stats.local.len() > before.stats.local.len());
+}

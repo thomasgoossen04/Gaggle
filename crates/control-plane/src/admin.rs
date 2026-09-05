@@ -91,6 +91,12 @@ pub struct DaemonStatus {
     /// Dialable listen addresses of the daemon's main node.
     pub listen_addrs: Vec<String>,
     pub shares: Vec<ShareStatus>,
+    /// Cumulative chunk bytes this daemon has served to downloaders across all
+    /// shares, since it started. A client samples this on a timer and diffs
+    /// successive readings to plot the daemon's outbound throughput. Optional
+    /// so an older daemon that never sets it round-trips unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_served_total: Option<u64>,
 }
 
 /// One share a daemon accelerates.
