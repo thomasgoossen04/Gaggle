@@ -73,14 +73,20 @@ pub struct Settings {
     #[serde(default)]
     pub public_relay: Option<String>,
     /// An accelerator's control-plane base URL (e.g. `https://host:8749` —
-    /// typically the same accelerator as `public_relay`, on the same host)
-    /// used as a NAT-traversal *rendezvous* point: not a data relay, just a
-    /// place for two peers who have never talked before to swap their current
-    /// candidate addresses and punch a direct hole through each side's NAT.
-    /// Every locally-seeded share polls it for incoming connection attempts,
-    /// and every subscription checks it for the origin's fresh address,
-    /// before falling back to whatever the share link/relay already offers.
-    /// `None` skips this.
+    /// typically the same accelerator as `public_relay`, on the same host).
+    /// It serves two unauthenticated discovery endpoints this node uses:
+    ///
+    /// * a NAT-traversal *rendezvous* point — not a data relay, just a place
+    ///   for two peers who have never talked before to swap their current
+    ///   candidate addresses and punch a direct hole through each side's NAT;
+    /// * a *seeder tracker* — a live directory of who else is serving a given
+    ///   share, so a download swarms across every origin and replica, not
+    ///   just the one address baked into its share link.
+    ///
+    /// Every locally-served share both answers pending rendezvous requests
+    /// and re-announces itself to the tracker on a timer; every subscription
+    /// checks both before falling back to whatever the share link/relay
+    /// already offers. `None` skips all of this.
     #[serde(default)]
     pub rendezvous_url: Option<String>,
     /// A local accelerator (relay or NAS) to restart on the next launch,

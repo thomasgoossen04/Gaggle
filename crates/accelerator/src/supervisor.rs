@@ -20,17 +20,24 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use control_plane::admin::{AdminCommand, DaemonStatus, ReplicationProgress, ShareStatus};
+use control_plane::{PeerInfo, TrackerRegistry};
 use gaggle_core::{AgentKeypair, Hash};
 use net::accel::{ShareMeta, nas_add_share_with_progress, relay_add_share};
-use net::{Keypair, Node, RelayConfig, RelayNode, ShareLink, SwarmProgress};
+use net::{Keypair, Multiaddr, Node, RelayConfig, RelayNode, ShareLink, SwarmProgress};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
+use tokio::time::MissedTickBehavior;
 
 use crate::config::{AcceleratorConfig, Home, Role};
 
 /// How often a replicating share's progress may update `DaemonStatus` — a
 /// share with many small chunks must not flood the status watch channel.
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(500);
+
+/// How often every ready share is (re-)announced to the seeder tracker so
+/// downloaders pointed at this daemon discover it as a source. Comfortably
+/// under `control_plane::tracker`'s entry TTL.
+const TRACKER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A share the daemon is accelerating, or in the middle of adding.
 enum ShareRecord {
@@ -92,6 +99,7 @@ pub struct Supervisor {
     status_tx: watch::Sender<DaemonStatus>,
     events_tx: mpsc::Sender<ShareEvent>,
     events_rx: mpsc::Receiver<ShareEvent>,
+    tracker: TrackerRegistry,
 }
 
 impl Supervisor {
@@ -103,6 +111,7 @@ impl Supervisor {
         config: AcceleratorConfig,
         daemon: AgentKeypair,
         identity: Keypair,
+        tracker: TrackerRegistry,
     ) -> anyhow::Result<(Self, watch::Receiver<DaemonStatus>)> {
         let listen = config.listen_addr()?;
         let backend = match config.role {
@@ -143,6 +152,7 @@ impl Supervisor {
             status_tx,
             events_tx,
             events_rx,
+            tracker,
         };
 
         let tokens = sup.config.shares.clone();
@@ -157,6 +167,8 @@ impl Supervisor {
     /// Drive the supervisor: apply admin mutations and background replication
     /// events until the admin command channel closes.
     pub async fn run(mut self, mut commands: mpsc::Receiver<AdminCommand>) {
+        let mut announce = tokio::time::interval(TRACKER_ANNOUNCE_INTERVAL);
+        announce.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 cmd = commands.recv() => {
@@ -170,10 +182,46 @@ impl Supervisor {
                         }
                     }
                     self.publish();
+                    self.announce_to_tracker().await;
                 }
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event);
                     self.publish();
+                    self.announce_to_tracker().await;
+                }
+                _ = announce.tick() => self.announce_to_tracker().await,
+            }
+        }
+    }
+
+    /// (Re-)publish every ready share to the seeder tracker so a downloader
+    /// pointed at this daemon's control-plane URL discovers it as a source,
+    /// not only whatever address is in its share link. Best-effort: the
+    /// registry is in-process, so this can't fail, but a share with no
+    /// reachable address yet is simply skipped until it has one.
+    async fn announce_to_tracker(&self) {
+        match &self.backend {
+            Backend::Relay { relay, .. } => {
+                let addrs = relay.reachable_addrs().await.unwrap_or_default();
+                if addrs.is_empty() {
+                    return;
+                }
+                let me = peer_info(relay.peer_id().to_string(), &addrs);
+                for (id, record) in &self.shares {
+                    if matches!(record, ShareRecord::Ready { .. }) {
+                        self.tracker.announce(&id.to_hex(), me.clone());
+                    }
+                }
+            }
+            Backend::Nas { .. } => {
+                for (id, record) in &self.shares {
+                    let ShareRecord::Ready { node: Some(node), .. } = record else { continue };
+                    let addrs = node.reachable_addrs().await.unwrap_or_default();
+                    if addrs.is_empty() {
+                        continue;
+                    }
+                    self.tracker
+                        .announce(&id.to_hex(), peer_info(node.peer_id().to_string(), &addrs));
                 }
             }
         }
@@ -319,9 +367,15 @@ impl Supervisor {
 
         match record {
             ShareRecord::Replicating { abort, .. } => abort.abort(),
-            ShareRecord::Ready { node: Some(node), .. } => node.shutdown().await,
+            ShareRecord::Ready { node: Some(node), .. } => {
+                // Leave the tracker's seeder list right away rather than
+                // lingering as a dead address until the TTL expires.
+                self.tracker.withdraw(&id.to_hex(), &node.peer_id().to_string());
+                node.shutdown().await;
+            }
             ShareRecord::Ready { node: None, .. } => {
                 if let Backend::Relay { relay, .. } = &self.backend {
+                    self.tracker.withdraw(&id.to_hex(), &relay.peer_id().to_string());
                     relay.remove_share(id).await.ok();
                 }
             }
@@ -402,6 +456,12 @@ impl Supervisor {
         };
         let _ = self.status_tx.send(status);
     }
+}
+
+/// A `PeerInfo` for the seeder tracker from a peer id and its dialable
+/// addresses.
+fn peer_info(peer_id: String, addrs: &[Multiaddr]) -> PeerInfo {
+    PeerInfo { peer_id, addrs: addrs.iter().map(Multiaddr::to_string).collect() }
 }
 
 /// Deterministic per-share identity seed: `blake3(daemon-seed ++ manifest-id)`.

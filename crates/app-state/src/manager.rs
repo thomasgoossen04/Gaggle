@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use control_plane::{AdminClient, PeerInfo, RendezvousClient};
+use control_plane::{AdminClient, PeerInfo, RendezvousClient, TrackerClient};
 use gaggle_core::{
     AgentId, AgentKeypair, ChunkList, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
     ScanProgress, SignedCapability, SourceChunkStore, SyncOutcome, index_dir_with_progress,
@@ -288,6 +288,11 @@ impl App {
             last_remote_poll: Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now),
+            // "Long ago", so the first tick with a share + tracker configured
+            // announces immediately rather than after a full interval.
+            last_tracker_announce: Instant::now()
+                .checked_sub(TRACKER_ANNOUNCE_INTERVAL)
+                .unwrap_or_else(Instant::now),
         };
         tokio::spawn(manager.run());
 
@@ -490,8 +495,10 @@ struct AccelHandle {
     /// Relay role: a long-lived downloading node used to learn share metadata.
     meta: Option<Arc<Node>>,
     /// NAS role: replica root, and one serving node per share (drop = stop it).
+    /// `Arc` so [`Manager::tick`] can hand a clone to a background task that
+    /// announces the replica to the seeder tracker.
     nas_dir: Option<PathBuf>,
-    nas_nodes: Vec<(Hash, Node)>,
+    nas_nodes: Vec<(Hash, Arc<Node>)>,
     /// Per-share status rows and the `gaggleshare1…` token behind each.
     rows: Vec<AccelShareRow>,
     tokens: Vec<String>,
@@ -517,6 +524,7 @@ struct Manager {
     remotes: HashMap<String, Option<AgentId>>,
     last_resync_poll: Instant,
     last_remote_poll: Instant,
+    last_tracker_announce: Instant,
 }
 
 /// Load a persistent operator [`AgentKeypair`] from `operator.key` next to the
@@ -647,6 +655,30 @@ impl Manager {
                 let node = Arc::clone(&seed.node);
                 let url = url.clone();
                 tokio::spawn(async move { answer_rendezvous_requests(&node, &url).await });
+            }
+        }
+        // Seeder tracker: publish which shares this node serves — every
+        // origin seed plus any local NAS replica / relay cache — so a
+        // downloader pointed at the same accelerator discovers them all as
+        // sources, not just the one address baked into its share link. The
+        // timer is only advanced when there is actually something to
+        // announce, so a share that appears shortly after startup is
+        // published on the next tick rather than waiting out a full interval.
+        if let Some(url) = self.state.settings.rendezvous_url.clone() {
+            let mut nodes: Vec<(Hash, Arc<Node>)> = self
+                .seeds
+                .values()
+                .map(|s| (s.manifest_id, Arc::clone(&s.node)))
+                .collect();
+            let relay = self.accel.as_ref().and_then(|a| a.relay.clone());
+            if let Some(accel) = &self.accel {
+                nodes.extend(accel.nas_nodes.iter().map(|(id, n)| (*id, Arc::clone(n))));
+            }
+            if (!nodes.is_empty() || relay.is_some())
+                && self.last_tracker_announce.elapsed() >= TRACKER_ANNOUNCE_INTERVAL
+            {
+                self.last_tracker_announce = Instant::now();
+                tokio::spawn(async move { announce_to_tracker(&url, nodes, relay).await });
             }
         }
     }
@@ -1032,7 +1064,7 @@ impl Manager {
                     if let (Some(node), Ok(mid)) =
                         (node, Hash::from_hex(&row.manifest_id))
                     {
-                        h.nas_nodes.push((mid, *node));
+                        h.nas_nodes.push((mid, Arc::from(node)));
                     }
                     h.rows.retain(|r| r.manifest_id != row.manifest_id);
                     h.rows.push(*row.clone());
@@ -1174,7 +1206,14 @@ impl Manager {
         });
         if let Some(pos) = h.nas_nodes.iter().position(|(mid, _)| mid.to_hex() == id) {
             let (_, node) = h.nas_nodes.remove(pos);
-            tokio::spawn(async move { node.shutdown().await });
+            // Gracefully shut down if this was the last reference; a brief
+            // overlapping tracker-announce task just drops its clone and the
+            // node's own `Drop` aborts the swarm task.
+            tokio::spawn(async move {
+                if let Some(node) = Arc::into_inner(node) {
+                    node.shutdown().await;
+                }
+            });
         }
         if let (AcceleratorRole::Relay, Some(relay)) = (h.role, h.relay.clone())
             && let Ok(mid) = Hash::from_hex(&id)
@@ -1497,8 +1536,9 @@ impl Manager {
         let req = sub.request.clone();
         let have_version = sub.version;
         let tx = self.self_tx.clone();
+        let tracker_url = self.state.settings.rendezvous_url.clone();
         tokio::spawn(async move {
-            match check_remote_version(&node, &req).await {
+            match check_remote_version(&node, &req, tracker_url.as_deref()).await {
                 Ok(version) => {
                     // Compare by manifest version only — a scoped download stores
                     // a narrowed manifest whose id never equals the seed's.
@@ -1522,7 +1562,6 @@ impl Manager {
         let req = sub.request.clone();
         let output_dir = sub.output_dir.clone();
         let old_manifest = sub.manifest.clone();
-        let name = sanitize(&req.name).unwrap_or_else(|| hex(&req.manifest_id));
 
         if let Some(row) = self.state.transfers.get_mut(&id) {
             row.status = TransferStatus::Connecting;
@@ -1534,9 +1573,18 @@ impl Manager {
         self.publish();
 
         let tx = self.self_tx.clone();
+        let rendezvous_url = self.state.settings.rendezvous_url.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_resync(node.as_ref(), id, req, output_dir, old_manifest, name, tx.clone()).await
+            if let Err(e) = run_resync(
+                node.as_ref(),
+                id,
+                req,
+                output_dir,
+                old_manifest,
+                tx.clone(),
+                rendezvous_url,
+            )
+            .await
             {
                 let _ = tx.send(Command::WorkerFailed { id, error: format!("{e:#}") }).await;
             }
@@ -1909,6 +1957,86 @@ async fn reserve_relay(node: &Node, relay_addr: &str) -> anyhow::Result<Multiadd
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(8);
 const RENDEZVOUS_POLL_INTERVAL: Duration = Duration::from_millis(700);
 
+/// How often [`Manager::tick`] re-announces every locally-served share to the
+/// seeder tracker. Comfortably under `control_plane::tracker`'s entry TTL, so
+/// one missed announce doesn't drop a live seed from the directory.
+const TRACKER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a download waits on the seeder tracker before proceeding with
+/// just the share-link sources. Short — a slow tracker must not delay a
+/// transfer whose link already names a working source.
+const TRACKER_QUERY_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Publish every locally-served share to the seeder tracker at `url`
+/// (best-effort — a missing or unreachable tracker is a silent no-op).
+/// `nodes` are per-share serving nodes (origin seeds and NAS replicas);
+/// `relay`, if present, is announced for every share it currently caches.
+async fn announce_to_tracker(
+    url: &str,
+    nodes: Vec<(Hash, Arc<Node>)>,
+    relay: Option<Arc<RelayNode>>,
+) {
+    let client = TrackerClient::new(url);
+    for (id, node) in nodes {
+        let Ok(addrs) = node.reachable_addrs().await else { continue };
+        if addrs.is_empty() {
+            continue;
+        }
+        let me = PeerInfo {
+            peer_id: node.peer_id().to_string(),
+            addrs: addrs.iter().map(Multiaddr::to_string).collect(),
+        };
+        let _ = client.announce(&id.to_hex(), &me).await;
+    }
+    if let Some(relay) = relay {
+        let (Ok(addrs), Ok(shares)) = (relay.reachable_addrs().await, relay.shares().await) else {
+            return;
+        };
+        if addrs.is_empty() {
+            return;
+        }
+        let me = PeerInfo {
+            peer_id: relay.peer_id().to_string(),
+            addrs: addrs.iter().map(Multiaddr::to_string).collect(),
+        };
+        for id in shares {
+            let _ = client.announce(&id.to_hex(), &me).await;
+        }
+    }
+}
+
+/// Ask the seeder tracker at `url` which peers currently serve `manifest_id`
+/// and merge their addresses into `sources`, de-duplicated. Best-effort and
+/// time-bounded: a missing, slow, or empty tracker just means "no extra
+/// sources this time", never a hard failure. Every chunk a discovered source
+/// serves is still verified against the manifest root, exactly like one from
+/// the share link.
+async fn merge_tracked_sources(url: &str, manifest_id: Hash, sources: &mut Vec<Multiaddr>) {
+    let client = TrackerClient::new(url);
+    let found = match tokio::time::timeout(
+        TRACKER_QUERY_TIMEOUT,
+        client.seeders(&manifest_id.to_hex()),
+    )
+    .await
+    {
+        Ok(Ok(list)) => list,
+        _ => return,
+    };
+    let mut added = 0usize;
+    for info in found {
+        for addr in info.addrs {
+            if let Ok(addr) = addr.parse::<Multiaddr>()
+                && !sources.contains(&addr)
+            {
+                sources.push(addr);
+                added += 1;
+            }
+        }
+    }
+    if added > 0 {
+        tracing::info!(added, share = %manifest_id.to_hex(), "seeder tracker added extra source address(es)");
+    }
+}
+
 /// Subscriber side of the NAT-rendezvous handshake: register with `origin` at
 /// the accelerator hosting `rendezvous_url`, wait for it to answer with its
 /// own current candidate addresses, and dial them right away — that dial is
@@ -2134,6 +2262,12 @@ async fn run_download(
                 }
             }
         }
+        // Ask the accelerator's seeder tracker for any *other* peers serving
+        // this share (a NAS replica, a second origin) and swarm across them
+        // all, not just the address in the link.
+        if let Some(url) = rendezvous_url.as_deref() {
+            merge_tracked_sources(url, req.manifest_id, &mut req.sources).await;
+        }
         report_stage(
             &tx,
             &work_activity,
@@ -2207,14 +2341,19 @@ async fn run_resync(
     req: SubscribeRequest,
     output_dir: PathBuf,
     old_manifest: Manifest,
-    name: String,
     tx: mpsc::Sender<Command>,
+    rendezvous_url: Option<String>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
     let activity = Arc::new(Mutex::new(Instant::now()));
     let work_activity = activity.clone();
 
     let work = async move {
+        let mut req = req;
+        let name = sanitize(&req.name).unwrap_or_else(|| hex(&req.manifest_id));
+        if let Some(url) = rendezvous_url.as_deref() {
+            merge_tracked_sources(url, req.manifest_id, &mut req.sources).await;
+        }
         report_stage(
             &tx,
             &work_activity,
@@ -2231,7 +2370,7 @@ async fn run_resync(
         // Recover chunks that still live in the materialized output tree, so only
         // genuinely new bytes are pulled.
         let scan_dir = output_dir.clone();
-        let scan_name = name.clone();
+        let scan_name = name;
         let old_v = old_manifest.version;
         let mut mem = tokio::task::spawn_blocking(move || {
             let mut mem = MemoryChunkStore::new();
@@ -2285,11 +2424,20 @@ async fn run_resync(
     with_stall_watchdog(activity, work).await
 }
 
-/// Fetch the current manifest version from the first source that answers.
-async fn check_remote_version(node: &Node, req: &SubscribeRequest) -> anyhow::Result<u64> {
+/// Fetch the current manifest version from the first source that answers,
+/// including any extra seeders the tracker at `tracker_url` knows about.
+async fn check_remote_version(
+    node: &Node,
+    req: &SubscribeRequest,
+    tracker_url: Option<&str>,
+) -> anyhow::Result<u64> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
+    let mut sources = req.sources.clone();
+    if let Some(url) = tracker_url {
+        merge_tracked_sources(url, req.manifest_id, &mut sources).await;
+    }
     let mut last_err = None;
-    for addr in &req.sources {
+    for addr in &sources {
         let attempt = async {
             let peer = node.connect(addr.clone()).await?;
             if let Some(cred) = &req.credential {
@@ -2443,7 +2591,7 @@ async fn start_nas_accel(
 
     let mut rows = Vec::new();
     let mut tokens = Vec::new();
-    let mut nas_nodes: Vec<(Hash, Node)> = Vec::new();
+    let mut nas_nodes: Vec<(Hash, Arc<Node>)> = Vec::new();
     for link in &shares {
         let seed = derive_share_seed(&operator_seed, link.manifest_id);
         match nas_replicate(&dir, net::keypair_from_seed(seed), link, rendezvous_url.as_deref(), |_| {})
@@ -2451,7 +2599,7 @@ async fn start_nas_accel(
         {
             Ok((node, m, chunks)) => {
                 let addr = node.listen_addr().await.ok().map(|a| a.to_string());
-                nas_nodes.push((m.manifest_id, node));
+                nas_nodes.push((m.manifest_id, Arc::new(node)));
                 rows.push(row_from_meta(&m, Some(chunks as u64), addr));
                 tokens.push(link.clone().encode());
             }

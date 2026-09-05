@@ -3,7 +3,7 @@
 
 use anyhow::Context;
 use control_plane::admin::AdminState;
-use control_plane::{RendezvousRegistry, serve_daemon};
+use control_plane::{RendezvousRegistry, TrackerRegistry, serve_daemon};
 use gaggle_core::AgentKeypair;
 use tokio::sync::mpsc;
 
@@ -60,18 +60,24 @@ pub async fn run(home: Home, overrides: Overrides) -> anyhow::Result<()> {
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
+    let rendezvous = RendezvousRegistry::new();
+    // The seeder tracker: shared between the supervisor (which announces
+    // every share it serves into it) and the HTTP router (which hands that
+    // list to downloaders). One registry, so a daemon-run relay/NAS makes
+    // itself discoverable to clients pointed at this same accelerator.
+    let tracker = TrackerRegistry::new();
     let (supervisor, status_rx) = Supervisor::start(
         home.clone(),
         config.clone(),
         AgentKeypair::from_seed(seed),
         identity.clone(),
+        tracker.clone(),
     )
     .await
     .context("starting the accelerator backend")?;
     let sup_task = tokio::spawn(supervisor.run(cmd_rx));
 
     let state = AdminState::new(authorized, AgentKeypair::from_seed(seed), cmd_tx, status_rx);
-    let rendezvous = RendezvousRegistry::new();
     let listener = tokio::net::TcpListener::bind(&config.admin_listen)
         .await
         .with_context(|| format!("binding admin API to {}", config.admin_listen))?;
@@ -97,7 +103,7 @@ pub async fn run(home: Home, overrides: Overrides) -> anyhow::Result<()> {
     }
 
     tokio::select! {
-        r = serve_daemon(listener, state, rendezvous, rendezvous_listener) => r.context("admin/rendezvous server failed")?,
+        r = serve_daemon(listener, state, rendezvous, tracker, rendezvous_listener) => r.context("admin/rendezvous server failed")?,
         _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C — shutting down"),
     }
     sup_task.abort();

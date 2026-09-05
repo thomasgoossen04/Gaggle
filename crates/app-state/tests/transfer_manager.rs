@@ -1025,3 +1025,107 @@ async fn a_share_reachable_only_through_nat_rendezvous_still_completes() {
     let output = row.output_dir.clone().unwrap();
     dir_matches(folder.path(), &output);
 }
+
+async fn serve_tracker() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        control_plane::tracker::serve(listener, control_plane::TrackerRegistry::new())
+            .await
+            .unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// A source device and a fully-replicated NAS both point at the same
+/// accelerator's seeder tracker and announce the share. A third device
+/// subscribes with *only* the origin's address in its link — yet the
+/// completed download reports chunks pulled from two distinct sources,
+/// because `run_download` asked the tracker who else had the share and
+/// swarmed across all of them. This is the multi-source discovery the bare
+/// share link can't provide on its own.
+#[tokio::test]
+async fn a_download_swarms_across_tracker_discovered_replicas() {
+    let tracker_url = serve_tracker().await;
+
+    // Source device.
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.update_settings(Settings {
+        rendezvous_url: Some(tracker_url.clone()),
+        ..Settings::default()
+    });
+    wait_for(&seeder, 5, |s| s.settings.rendezvous_url.is_some()).await;
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let manifest_id = seed.manifest_id;
+    let seed_bytes = seed.total_bytes;
+    let origin_addr = seed.share_addr.clone().unwrap();
+    let link = ShareLink::new(seed.name.clone(), manifest_id, vec![origin_addr.clone()]);
+
+    // Fully-replicated NAS replica, also announcing to the tracker.
+    let replica_dir = TempDir::new().unwrap();
+    let nas = App::new(None).await.unwrap();
+    nas.update_settings(Settings {
+        rendezvous_url: Some(tracker_url.clone()),
+        ..Settings::default()
+    });
+    wait_for(&nas, 5, |s| s.settings.rendezvous_url.is_some()).await;
+    nas.start_accelerator(AcceleratorRequest::Nas {
+        dir: replica_dir.path().to_path_buf(),
+        shares: vec![link],
+    });
+    wait_for(&nas, 60, |s| {
+        s.accelerator.as_ref().is_some_and(|a| a.replica_chunks.unwrap_or(0) > 0)
+    })
+    .await;
+
+    // Wait until the tracker has heard from both the origin and the replica.
+    let tracker = control_plane::TrackerClient::new(&tracker_url);
+    let share_hex = manifest_id.to_hex();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if tracker.seeders(&share_hex).await.unwrap().len() >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("both seeders should register with the tracker");
+
+    // Third device: subscribe with ONLY the origin address in the request.
+    let out = TempDir::new().unwrap();
+    let leech = App::new(None).await.unwrap();
+    leech.update_settings(Settings {
+        download_dir: out.path().to_path_buf(),
+        rendezvous_url: Some(tracker_url),
+        ..Settings::default()
+    });
+    wait_for(&leech, 5, |s| s.settings.rendezvous_url.is_some()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![origin_addr],
+        credential: None,
+    });
+
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    assert_eq!(row.done_bytes, row.total_bytes);
+    assert_eq!(row.total_bytes, seed_bytes);
+    assert!(
+        row.sources.len() >= 2,
+        "expected chunks from the origin and the tracker-discovered replica, got {} source(s)",
+        row.sources.len()
+    );
+
+    dir_matches(folder.path(), &row.output_dir.clone().unwrap());
+}

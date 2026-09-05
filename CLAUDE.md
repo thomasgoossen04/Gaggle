@@ -223,6 +223,32 @@ share, and can be driven remotely:
   `spawn_serving_with`, for a caller that wants an explicit listen address without
   serving anything) support this from the `net` side.
 
+- **Seeder tracker** — `control_plane::tracker` (`TrackerRegistry`, `router`,
+  `TrackerClient`, re-exported at the crate root) is the discovery half of the
+  same idea: a small, unauthenticated, in-memory directory keyed by a share's
+  **manifest id (hex)** that answers "who else is serving this?". A peer serving
+  a share `POST /tracker/{manifest_id}`s its `PeerInfo` (entry TTL 150s, so a
+  gone seed drops itself); a downloader `GET /tracker/{manifest_id}` once and
+  swarms across everyone it gets back plus the addresses in its share link; a
+  clean shutdown can `DELETE /tracker/{manifest_id}/{peer_id}`. It fixes the
+  "download only pulled from one source" case where a share link names just the
+  origin even though a NAS replica (or a second origin) also has the whole share
+  — the link is static, the tracker is live. `serve_daemon` merges this router
+  onto the same listener(s) as `rendezvous` (unauthenticated, same trust model),
+  so any running accelerator is a tracker for free; it never sees chunk data,
+  and every discovered chunk is still verified against the manifest root.
+  `app-state` reuses `Settings.rendezvous_url` as the tracker URL too:
+  `Manager::tick` re-announces every locally-served share (origin seeds +
+  in-process NAS replicas + relay-cached shares) every `TRACKER_ANNOUNCE_INTERVAL`
+  (30s), and `run_download` / `run_resync` / `check_remote_version` merge the
+  tracker's seeder list into their sources up front (`merge_tracked_sources`,
+  bounded by `TRACKER_QUERY_TIMEOUT`, 4s). The standalone `accelerator` daemon's
+  `Supervisor` shares one `TrackerRegistry` with its HTTP router and announces
+  every ready share into it directly (in-process, no round trip), so a
+  daemon-run relay/NAS is discoverable the same way. Keyed by manifest id, so a
+  post-rescan share whose id changed simply returns nothing extra until the new
+  id propagates — the share link's own source still carries it.
+
 - **`gui`** — a gpui shell over `App`: Shares (add public / private folder, copy link,
   rescan, per-row ▸ panel with the invite form), Transfers (progress bars,
   pause/resume/remove, check-updates/resync, `update vN` badge, per-row ▸ swarm
@@ -254,7 +280,14 @@ subscribers waiting on the same origin at once. `a_share_reachable_only_through_
 in `app-state/tests/transfer_manager.rs` subscribes with only a deliberately-bogus,
 unreachable address for the origin (same peer id, garbage transport) and still
 completes — proof the transfer's reachability came from the rendezvous exchange, not
-the address in the link. `crates/net/tests/discovery.rs`'s dcutr test now pins every
+the address in the link. `crates/control-plane/tests/tracker.rs` round-trips
+announce / list / withdraw through a live seeder-tracker server, and
+`admin_tls.rs` checks the tracker rides the same (unauthenticated) listener as
+rendezvous, not the admin one. `a_download_swarms_across_tracker_discovered_replicas`
+in `app-state/tests/transfer_manager.rs` runs an origin + a fully-replicated NAS
+both announcing to one tracker, then a third `App` subscribes with only the
+origin's address in its request and still completes with chunks credited to
+**two** sources — the replica came from the tracker, not the link. `crates/net/tests/discovery.rs`'s dcutr test now pins every
 node to `127.0.0.1` (`Node::spawn_with`/`spawn_serving_with` + a loopback-only
 `RelayNode::spawn_with_opts`) — mDNS deliberately skips loopback, so without this a
 same-host relay/dcutr test races against (and loses to) mDNS finding the peer
@@ -380,7 +413,7 @@ Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), nine members und
 |---|---|---|
 | `crates/core` → **`gaggle-core`** | lib | Manifest format, chunking, merkle trees, dedup. Pure logic, no async, dependency-light. |
 | `crates/net` → `net` | lib | libp2p swarm: QUIC transport, Kademlia DHT, relay + dcutr NAT traversal. |
-| `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, NAT rendezvous (`rendezvous::{router, RendezvousRegistry, RendezvousClient}`), and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). `serve_daemon` merges the admin + rendezvous routers onto one listener. |
+| `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, NAT rendezvous (`rendezvous::{router, RendezvousRegistry, RendezvousClient}`), the seeder tracker (`tracker::{router, TrackerRegistry, TrackerClient}` — who else is serving a share), and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). `serve_daemon` merges admin + rendezvous + tracker routers onto one listener (or splits admin from the two unauthenticated ones). |
 | `crates/app-state` → `app-state` | lib | UI-framework-agnostic application state + transfer manager. Testable headless. |
 | `crates/ui-kit` → `gaggle-ui-kit` | lib | Shared `gpui` look: the colour `theme` (`Palette`, `DARK`/`LIGHT`, `active()`) + stateless `widgets`. Depends only on `gpui` + `gpui-component`. Used by `gui` and `launcher`. |
 | `crates/accelerator` → `accelerator` | **bin** | Headless daemon; `--role relay\|nas` selects bandwidth-heavy vs storage-heavy behaviour. |
@@ -421,7 +454,8 @@ and this maps directly onto the crate boundaries:
   `libp2p-relay` + `dcutr`. Relay accelerators *are* libp2p relay servers.
 - **Control plane** (`control-plane`): plain HTTPS/REST (`axum` server, `reqwest`
   client) for low-volume, request/response traffic — bootstrap, invite tokens,
-  accelerator registration, admin. Deliberately kept off QUIC/libp2p.
+  accelerator registration, admin, NAT-rendezvous signaling, and the seeder
+  tracker (peer discovery hints). Deliberately kept off QUIC/libp2p.
 
 Everything async runs on **Tokio**, shared across `net` and `control-plane`. The GUI
 runs `gpui`'s own executor; network code runs on separate Tokio tasks and the two are

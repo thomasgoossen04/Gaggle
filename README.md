@@ -86,7 +86,10 @@ can browse.
   optional expiry — no invite, no access.
 - **Multi-peer swarming.** Downloads pull from several sources at once, scheduling
   rarest-chunk-first with per-peer concurrency caps, and route around dead or partial
-  sources automatically.
+  sources automatically. A share link only names the origin, but if you point both ends
+  at an accelerator (**Settings → Rendezvous URL**) every seed announces itself to that
+  accelerator's live *seeder tracker*, so a download also swarms across any NAS replica
+  or extra origin the link never mentioned.
 - **NAT traversal built in, relay-free when possible.** mDNS finds same-LAN peers
   instantly; UPnP asks the router for a public port with no server involved at all; and
   when both peers are behind NAT with no accelerator, an accelerator's control-plane can
@@ -114,7 +117,7 @@ Gaggle splits the network into two independent planes:
   (via `rust-libp2p`), independently multiplexed so many chunks move concurrently with no
   head-of-line blocking.
 - **Control plane** — plain HTTPS for the low-volume stuff: invite exchange, NAT
-  rendezvous, and the accelerator admin API.
+  rendezvous, the seeder tracker (who else has a share), and the accelerator admin API.
 
 Trust flows from the manifest: a share's manifest id is authenticated by a signed invite
 capability, and every chunk is verified against the manifest's Merkle root regardless of
@@ -231,6 +234,14 @@ can swap current addresses and punch straight through each side's NAT, with no c
 ever routed through the accelerator. It's a fallback of last resort's opposite: try this
 *before* reserving a full relay circuit above, since it costs the accelerator only a few KB
 of signaling instead of carrying the transfer.
+
+The same URL also enables the accelerator's **seeder tracker**: while it's set, every
+folder this node serves (and every replica a local or remote NAS holds) announces itself
+there, and every download asks it who else has the share before starting. That's what lets
+a download fan out across a NAS replica and the origin at the same time even though the
+share link only ever carried the origin's address. No chunk data or share secret touches
+the tracker — it only exchanges peer ids and addresses, and every chunk is still verified
+against the manifest.
 
 ## Development
 

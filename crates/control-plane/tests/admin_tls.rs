@@ -6,7 +6,10 @@
 //! either leaking the other's trust model.
 
 use control_plane::admin::{AdminState, DaemonStatus};
-use control_plane::{AdminClient, PeerInfo, RendezvousClient, RendezvousRegistry, serve_daemon};
+use control_plane::{
+    AdminClient, PeerInfo, RendezvousClient, RendezvousRegistry, TrackerClient, TrackerRegistry,
+    serve_daemon,
+};
 use gaggle_core::{AgentId, AgentKeypair};
 use tokio::sync::{mpsc, watch};
 
@@ -72,11 +75,12 @@ async fn admin_and_rendezvous_share_one_tls_listener_with_separate_trust_models(
     let (cmd_tx, _cmd_rx) = mpsc::channel(8);
     let state = AdminState::new(vec![operator.public()], daemon, cmd_tx, status_rx);
     let rendezvous = RendezvousRegistry::new();
+    let tracker = TrackerRegistry::new();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        serve_daemon(listener, state, rendezvous, None).await.unwrap();
+        serve_daemon(listener, state, rendezvous, tracker, None).await.unwrap();
     });
     let base = format!("https://{addr}");
 
@@ -91,6 +95,13 @@ async fn admin_and_rendezvous_share_one_tls_listener_with_separate_trust_models(
     let pending = rendezvous_client.pending("origin").await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].request_id, request_id);
+
+    // Seeder tracker: also unauthenticated, also merged onto the same port.
+    let tracker_client = TrackerClient::new(&base);
+    tracker_client.announce("share-abc", &me).await.unwrap();
+    let seeders = tracker_client.seeders("share-abc").await.unwrap();
+    assert_eq!(seeders.len(), 1);
+    assert_eq!(seeders[0].peer_id, "sub");
 }
 
 /// The split-listener case: admin on one address, rendezvous on a different
@@ -105,6 +116,7 @@ async fn admin_and_rendezvous_can_run_on_separate_listeners() {
     let (cmd_tx, _cmd_rx) = mpsc::channel(8);
     let state = AdminState::new(vec![operator.public()], daemon, cmd_tx, status_rx);
     let rendezvous = RendezvousRegistry::new();
+    let tracker = TrackerRegistry::new();
 
     let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let admin_addr = admin_listener.local_addr().unwrap();
@@ -113,7 +125,9 @@ async fn admin_and_rendezvous_can_run_on_separate_listeners() {
     assert_ne!(admin_addr.port(), rendezvous_addr.port(), "test needs two distinct ports");
 
     tokio::spawn(async move {
-        serve_daemon(admin_listener, state, rendezvous, Some(rendezvous_listener)).await.unwrap();
+        serve_daemon(admin_listener, state, rendezvous, tracker, Some(rendezvous_listener))
+            .await
+            .unwrap();
     });
 
     let mut admin = AdminClient::new(format!("https://{admin_addr}"), operator, None).unwrap();
@@ -125,6 +139,24 @@ async fn admin_and_rendezvous_can_run_on_separate_listeners() {
     let pending = rendezvous_client.pending("origin").await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].request_id, request_id);
+
+    // The seeder tracker rides the same (rendezvous) listener, not the admin one.
+    TrackerClient::new(format!("https://{rendezvous_addr}"))
+        .announce("share-abc", &me)
+        .await
+        .unwrap();
+    assert_eq!(
+        TrackerClient::new(format!("https://{rendezvous_addr}"))
+            .seeders("share-abc")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        TrackerClient::new(format!("https://{admin_addr}")).seeders("share-abc").await.is_err(),
+        "the admin listener should not also serve the tracker"
+    );
 
     // The admin port doesn't answer rendezvous requests, and vice versa.
     assert!(
