@@ -271,6 +271,10 @@ cargo run -p gui                            # run the desktop app (binary: gaggl
 cargo run -p launcher                       # run the installer/updater (binary: gaggle-launcher)
 cargo run -p launcher -- check              # headless: is an update available? (exit 10 = yes)
 cargo run -p launcher -- --channel beta     # track pre-release builds (remembered in launcher.json)
+
+cargo run -p accelerator-launcher -- run -- run --role relay   # headless: update, then exec accelerator
+cargo run -p accelerator-launcher -- check --channel beta      # same exit-code convention as `launcher check`
+cargo run -p accelerator-launcher -- service --role nas        # print a systemd user-unit template
 ```
 
 `RUST_LOG=info` (or `debug`, `trace`) controls the `accelerator` daemon's logging via
@@ -295,10 +299,16 @@ build is cross-compiled on the Apple Silicon runner — no x86_64 macOS runners
 exist), runs
 `.github/scripts/make_latest.py <version> <tag> <channel> dist` to compose `latest.json`,
 and publishes a GitHub Release. Alongside each `gaggle-<platform>.zip` (+ `.sha256`) the
-release also carries the **standalone launcher** as its own asset,
-`gaggle-launcher-<platform>[.exe]` (+ `.sha256`) — so getting the installer is a single
-direct download, no unzip needed. `make_latest.py`/`latest.json` are unaffected: the
-self-update descriptor still points at the zips.
+release also carries three standalone binaries as their own assets (each
+`<name>-<platform>[.exe]` + `.sha256`, so getting any one of them is a single direct
+download, no unzip needed): the **launcher** (`gaggle-launcher-…`), the **accelerator
+daemon** (`gaggle-accelerator-…`), and its **auto-updating headless launcher**
+(`gaggle-accelerator-launcher-…`, see "Headless accelerator auto-update" below).
+`make_latest.py` composes *one* `latest.json` two independent consumers read from: the
+desktop launcher's own `platforms` map (the GUI+launcher zip, unaffected by any of
+this) and a sibling `accelerator` map (the standalone daemon binary, keyed the same
+way) that `accelerator-launcher` reads and the desktop launcher's `Manifest` type
+simply ignores.
 
 | Branch | Version | Tag | Release | Descriptor URL |
 |---|---|---|---|---|
@@ -328,9 +338,30 @@ straight to the installed GUI — no window — when it's already the latest ver
 the update check fails but something is installed (`updater::wants_auto_launch`, pure and
 unit-tested); otherwise it opens the window as before.
 
+**Headless accelerator auto-update (`crates/accelerator-launcher`, binary
+`gaggle-accelerator-launcher`)** — the headless, automatic counterpart of `launcher`, for
+running the `accelerator` daemon as an always-current systemd service with no GUI and no
+manual redeploys. `gaggle-accelerator-launcher run -- <accelerator args…>` best-effort
+-updates the standalone `accelerator` binary (falling back to whatever's already installed
+if the network check fails — a transient outage must never stop the daemon from starting),
+then **execs** it (`std::os::unix::process::CommandExt::exec`, so systemd tracks the
+daemon's own PID/exit code directly and `Restart=` policies apply to the real thing, not a
+wrapper — a plain spawn-and-wait on non-Unix targets). `check` / `update` mirror
+`gaggle-launcher`'s subcommands and exit-code convention (0 up to date, 10 update
+available, 1 error); `--channel` / `$GAGGLE_UPDATE_CHANNEL` / `--manifest-url` /
+`$GAGGLE_UPDATE_URL` work exactly like `gaggle-launcher`'s. It keeps entirely separate
+state under `<data-dir>/Gaggle/accelerator-launcher/` (its own `installed.json` +
+`launcher.json`) so it can never collide with a desktop-launcher install on the same
+machine. `service [--role …] [--listen …] [--admin-listen …] [--install]` prints (or
+writes to `~/.config/systemd/user/gaggle-accelerator.service`) a ready-to-use systemd
+**user** unit whose `ExecStart=` is `<this binary> run -- run --role … …` — the doubled
+`run` is intentional: the first is this launcher's own subcommand, the second is the
+`accelerator` binary's (everything after the outer `--` is passed through verbatim, so
+this launcher never needs to know the daemon's own CLI grammar).
+
 ## Workspace layout & dependency graph
 
-Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), eight members under
+Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), nine members under
 `crates/`:
 
 | Crate (package name) | Kind | Role |
@@ -343,12 +374,15 @@ Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), eight members un
 | `crates/accelerator` → `accelerator` | **bin** | Headless daemon; `--role relay\|nas` selects bandwidth-heavy vs storage-heavy behaviour. |
 | `crates/gui` → `gui` (binary `gaggle-gui`) | **bin** | `gpui` + `gpui-component` desktop frontend. |
 | `crates/launcher` → `launcher` (binary `gaggle-launcher`) | **bin** | Installer / updater / launcher: fetches `latest.json`, installs `gaggle-gui` under the per-user data dir, launches it. `gpui` window styled from `gaggle-ui-kit`; `updater.rs` is the headless engine. |
+| `crates/accelerator-launcher` → `accelerator-launcher` (binary `gaggle-accelerator-launcher`) | **bin** | Headless, no-GUI counterpart of `launcher`: update-then-`exec`s the `accelerator` binary, for an always-current systemd service. No shared code with `launcher` (deliberately self-contained, like `launcher` itself) beyond reading the same `latest.json`. |
 
 Dependency direction: `gaggle-core` is the leaf. `net` → core. `control-plane` → core.
 `app-state` → core + net + control-plane (the `AdminClient` for remote accelerators).
 `accelerator` → core + net + control-plane. `gaggle-ui-kit` → (gpui only).
-`gui` → app-state + gaggle-ui-kit. `launcher` → gaggle-ui-kit. `ShareLink` lives in
-`net` so the daemon config and the admin API can both round-trip its tokens.
+`gui` → app-state + gaggle-ui-kit. `launcher` → gaggle-ui-kit. `accelerator-launcher` has
+no workspace-internal dependencies at all — it never touches `net`/`accelerator`'s own
+types, only the release descriptor JSON and a plain child-process exec. `ShareLink` lives
+in `net` so the daemon config and the admin API can both round-trip its tokens.
 
 **The `crates/core` directory holds a package named `gaggle-core`, imported as
 `gaggle_core`.** Naming it `core` collides with Rust's built-in `core` crate — macro

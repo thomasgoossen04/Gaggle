@@ -1,34 +1,85 @@
 //! The `Supervisor` owns the running accelerator (a multi-share [`RelayNode`],
-//! or one serving [`Node`] per replicated share) and serialises every mutation
+//! or one serving [`Node`] per replicated share) and applies every mutation
 //! that arrives from the admin API, republishing a [`DaemonStatus`] after each
 //! and rewriting `config.toml` so the change survives a restart.
+//!
+//! A NAS share's replication runs in the background (`tokio::spawn`), not
+//! inline in the command loop: pulling a 100 GB share must not block adding or
+//! removing any other share, or answering `GET /admin/status`, for however
+//! long that takes. Progress lands via an internal `events` channel the main
+//! loop selects on alongside admin commands, so `GET /admin/status` shows a
+//! live [`ShareStatus::replicating`] the whole time. The share's token is
+//! persisted to `config.toml` as soon as it's accepted (not once it finishes),
+//! so an add that outlives this process still resumes on the next start —
+//! matching how a share that fails to start at boot is already retried every
+//! restart until an operator explicitly removes it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use control_plane::admin::{AdminCommand, DaemonStatus, ShareStatus};
+use control_plane::admin::{AdminCommand, DaemonStatus, ReplicationProgress, ShareStatus};
 use gaggle_core::{AgentKeypair, Hash};
-use net::accel::{ShareMeta, nas_add_share, relay_add_share};
-use net::{Keypair, Node, RelayConfig, RelayNode, ShareLink};
-use tokio::sync::{mpsc, watch};
+use net::accel::{ShareMeta, nas_add_share_with_progress, relay_add_share};
+use net::{Keypair, Node, RelayConfig, RelayNode, ShareLink, SwarmProgress};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::AbortHandle;
 
 use crate::config::{AcceleratorConfig, Home, Role};
 
-/// A share the daemon is accelerating.
-struct ShareRecord {
-    token: String,
-    meta: ShareMeta,
-    /// NAS role only: the node serving this share (drop = stop), and its chunk
-    /// count / address.
-    node: Option<Node>,
-    replica_chunks: Option<usize>,
-    listen_addr: Option<String>,
+/// How often a replicating share's progress may update `DaemonStatus` — a
+/// share with many small chunks must not flood the status watch channel.
+const PROGRESS_THROTTLE: Duration = Duration::from_millis(500);
+
+/// A share the daemon is accelerating, or in the middle of adding.
+enum ShareRecord {
+    /// NAS role only: replication under way in the background.
+    Replicating {
+        token: String,
+        name_hint: String,
+        progress: Option<ReplicationProgress>,
+        abort: AbortHandle,
+    },
+    Ready {
+        token: String,
+        meta: ShareMeta,
+        /// NAS role only: the node serving this share (drop = stop). `None`
+        /// for a relay-cached share.
+        node: Option<Node>,
+        replica_chunks: Option<usize>,
+        listen_addr: Option<String>,
+    },
+    Failed { token: String, name_hint: String, error: String },
+}
+
+impl ShareRecord {
+    fn token(&self) -> &str {
+        match self {
+            ShareRecord::Replicating { token, .. }
+            | ShareRecord::Ready { token, .. }
+            | ShareRecord::Failed { token, .. } => token,
+        }
+    }
 }
 
 enum Backend {
     Relay { relay: RelayNode, meta_node: Node, listen_addrs: Vec<String> },
     Nas { dir_root: PathBuf },
+}
+
+/// A background NAS replication reporting back to the main loop.
+enum ShareEvent {
+    Progress { manifest_id: Hash, progress: ReplicationProgress },
+    Ready {
+        manifest_id: Hash,
+        meta: ShareMeta,
+        node: Node,
+        chunks: usize,
+        listen_addr: Option<String>,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    Failed { manifest_id: Hash, error: String, ack: oneshot::Sender<Result<(), String>> },
 }
 
 pub struct Supervisor {
@@ -39,6 +90,8 @@ pub struct Supervisor {
     backend: Backend,
     shares: HashMap<Hash, ShareRecord>,
     status_tx: watch::Sender<DaemonStatus>,
+    events_tx: mpsc::Sender<ShareEvent>,
+    events_rx: mpsc::Receiver<ShareEvent>,
 }
 
 impl Supervisor {
@@ -79,6 +132,7 @@ impl Supervisor {
         };
 
         let (status_tx, status_rx) = watch::channel(DaemonStatus::default());
+        let (events_tx, events_rx) = mpsc::channel(64);
         let mut sup = Self {
             home,
             config,
@@ -87,102 +141,191 @@ impl Supervisor {
             backend,
             shares: HashMap::new(),
             status_tx,
+            events_tx,
+            events_rx,
         };
 
         let tokens = sup.config.shares.clone();
         for token in tokens {
-            if let Err(e) = sup.add_share_inner(&token).await {
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    token = %elide(&token),
-                    "could not start share from config"
-                );
-            }
+            let (ack, _rx) = oneshot::channel();
+            sup.add_share(token, ack).await;
         }
         sup.publish();
         Ok((sup, status_rx))
     }
 
-    /// Drive the supervisor: apply admin mutations until the channel closes.
+    /// Drive the supervisor: apply admin mutations and background replication
+    /// events until the admin command channel closes.
     pub async fn run(mut self, mut commands: mpsc::Receiver<AdminCommand>) {
-        while let Some(cmd) = commands.recv().await {
-            match cmd {
-                AdminCommand::AddShare { token, ack } => {
-                    let result = self.add_share(&token).await.map_err(|e| format!("{e:#}"));
-                    let _ = ack.send(result);
+        loop {
+            tokio::select! {
+                cmd = commands.recv() => {
+                    let Some(cmd) = cmd else { break };
+                    match cmd {
+                        AdminCommand::AddShare { token, ack } => self.add_share(token, ack).await,
+                        AdminCommand::RemoveShare { manifest_id, ack } => {
+                            let result =
+                                self.remove_share(&manifest_id).await.map_err(|e| format!("{e:#}"));
+                            let _ = ack.send(result);
+                        }
+                    }
+                    self.publish();
                 }
-                AdminCommand::RemoveShare { manifest_id, ack } => {
-                    let result =
-                        self.remove_share(&manifest_id).await.map_err(|e| format!("{e:#}"));
-                    let _ = ack.send(result);
+                Some(event) = self.events_rx.recv() => {
+                    self.handle_event(event);
+                    self.publish();
                 }
             }
-            self.publish();
         }
     }
 
-    async fn add_share(&mut self, token: &str) -> anyhow::Result<()> {
-        self.add_share_inner(token).await?;
-        self.persist();
-        Ok(())
-    }
-
-    async fn add_share_inner(&mut self, token: &str) -> anyhow::Result<()> {
-        let link = ShareLink::parse(token).context("parsing the share link")?;
-        if self.shares.contains_key(&link.manifest_id) {
-            anyhow::bail!("that share is already being accelerated");
-        }
-
-        let record = match &self.backend {
-            Backend::Relay { relay, meta_node, .. } => {
-                let meta = relay_add_share(relay, meta_node, &link).await?;
-                ShareRecord {
-                    token: token.to_string(),
-                    meta,
-                    node: None,
-                    replica_chunks: None,
-                    listen_addr: None,
-                }
-            }
-            Backend::Nas { dir_root } => {
-                let seed = share_identity_seed(&self.identity, link.manifest_id)?;
-                let (node, meta, chunks) =
-                    nas_add_share(dir_root, net::keypair_from_seed(seed), &link).await?;
-                let listen_addr = node.listen_addr().await.ok().map(|a| a.to_string());
-                ShareRecord {
-                    token: token.to_string(),
-                    meta,
-                    node: Some(node),
-                    replica_chunks: Some(chunks),
-                    listen_addr,
-                }
+    /// Accept `token`: for a relay it caches (fast, so this awaits fully and
+    /// acks immediately); for a NAS it spawns the replication in the
+    /// background and acks once [`ShareEvent::Ready`] / [`ShareEvent::Failed`]
+    /// lands, so other admin commands are never blocked behind it.
+    async fn add_share(&mut self, token: String, ack: oneshot::Sender<Result<(), String>>) {
+        let link = match ShareLink::parse(&token) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = ack.send(Err(format!("parsing the share link: {e:#}")));
+                return;
             }
         };
+        if self.shares.contains_key(&link.manifest_id) {
+            let _ = ack.send(Err("that share is already being accelerated".into()));
+            return;
+        }
 
-        tracing::info!(
-            share = %record.meta.manifest_id,
-            name = %record.meta.name,
-            files = record.meta.files,
-            "accelerating share"
-        );
-        self.shares.insert(link.manifest_id, record);
-        Ok(())
+        match &self.backend {
+            Backend::Relay { relay, meta_node, .. } => match relay_add_share(relay, meta_node, &link).await
+            {
+                Ok(meta) => {
+                    tracing::info!(share = %meta.manifest_id, name = %meta.name, files = meta.files, "accelerating share");
+                    self.shares.insert(
+                        link.manifest_id,
+                        ShareRecord::Ready { token, meta, node: None, replica_chunks: None, listen_addr: None },
+                    );
+                    self.persist();
+                    let _ = ack.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = ack.send(Err(format!("{e:#}")));
+                }
+            },
+            Backend::Nas { dir_root } => {
+                let dir_root = dir_root.clone();
+                let seed = match share_identity_seed(&self.identity, link.manifest_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = ack.send(Err(format!("{e:#}")));
+                        return;
+                    }
+                };
+                let identity = net::keypair_from_seed(seed);
+                let manifest_id = link.manifest_id;
+                let name_hint = link.name.clone();
+                let events_tx = self.events_tx.clone();
+
+                let task = tokio::spawn(async move {
+                    let mut last_sent = Instant::now()
+                        .checked_sub(PROGRESS_THROTTLE)
+                        .unwrap_or_else(Instant::now);
+                    let progress_tx = events_tx.clone();
+                    let result = nas_add_share_with_progress(&dir_root, identity, &link, |p: SwarmProgress| {
+                        let done = p.chunks_done >= p.chunks_total;
+                        if done || last_sent.elapsed() >= PROGRESS_THROTTLE {
+                            last_sent = Instant::now();
+                            let _ = progress_tx.try_send(ShareEvent::Progress {
+                                manifest_id,
+                                progress: ReplicationProgress {
+                                    chunks_done: p.chunks_done,
+                                    chunks_total: p.chunks_total,
+                                    bytes_done: p.bytes_done,
+                                    bytes_total: p.bytes_total,
+                                },
+                            });
+                        }
+                    })
+                    .await;
+                    match result {
+                        Ok((node, meta, chunks)) => {
+                            let listen_addr = node.listen_addr().await.ok().map(|a| a.to_string());
+                            let _ = events_tx
+                                .send(ShareEvent::Ready { manifest_id, meta, node, chunks, listen_addr, ack })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = events_tx
+                                .send(ShareEvent::Failed { manifest_id, error: format!("{e:#}"), ack })
+                                .await;
+                        }
+                    }
+                });
+
+                self.shares.insert(
+                    manifest_id,
+                    ShareRecord::Replicating { token, name_hint, progress: None, abort: task.abort_handle() },
+                );
+                self.persist();
+            }
+        }
     }
 
+    fn handle_event(&mut self, event: ShareEvent) {
+        match event {
+            ShareEvent::Progress { manifest_id, progress } => {
+                if let Some(ShareRecord::Replicating { progress: p, .. }) = self.shares.get_mut(&manifest_id)
+                {
+                    *p = Some(progress);
+                }
+            }
+            ShareEvent::Ready { manifest_id, meta, node, chunks, listen_addr, ack } => {
+                tracing::info!(share = %manifest_id, name = %meta.name, files = meta.files, "accelerating share");
+                let token = self.shares.get(&manifest_id).map(|r| r.token().to_string()).unwrap_or_default();
+                self.shares.insert(
+                    manifest_id,
+                    ShareRecord::Ready {
+                        token,
+                        meta,
+                        node: Some(node),
+                        replica_chunks: Some(chunks),
+                        listen_addr,
+                    },
+                );
+                let _ = ack.send(Ok(()));
+            }
+            ShareEvent::Failed { manifest_id, error, ack } => {
+                tracing::warn!(share = %manifest_id, %error, "could not replicate share");
+                if let Some(token) = self.shares.get(&manifest_id).map(|r| r.token().to_string()) {
+                    self.shares.insert(
+                        manifest_id,
+                        ShareRecord::Failed { token, name_hint: String::new(), error: error.clone() },
+                    );
+                } else {
+                    self.shares.remove(&manifest_id);
+                }
+                let _ = ack.send(Err(error));
+            }
+        }
+    }
+
+    /// Stop accelerating a share (aborting an in-flight replication, or
+    /// shutting down its serving node) — the on-disk replica bytes are kept,
+    /// so re-adding the same share resumes rather than starting over.
     async fn remove_share(&mut self, manifest_id: &str) -> anyhow::Result<()> {
         let id = Hash::from_hex(manifest_id.trim())
             .map_err(|_| anyhow::anyhow!("not a manifest id: {manifest_id:?}"))?;
         let record = self.shares.remove(&id).context("no such accelerated share")?;
 
-        match &self.backend {
-            Backend::Relay { relay, .. } => {
-                relay.remove_share(id).await.ok();
-            }
-            Backend::Nas { .. } => {
-                if let Some(node) = record.node {
-                    node.shutdown().await; // the on-disk replica is kept
+        match record {
+            ShareRecord::Replicating { abort, .. } => abort.abort(),
+            ShareRecord::Ready { node: Some(node), .. } => node.shutdown().await,
+            ShareRecord::Ready { node: None, .. } => {
+                if let Backend::Relay { relay, .. } = &self.backend {
+                    relay.remove_share(id).await.ok();
                 }
             }
+            ShareRecord::Failed { .. } => {}
         }
         tracing::info!(share = %id, "stopped accelerating share");
         self.persist();
@@ -190,7 +333,7 @@ impl Supervisor {
     }
 
     fn persist(&mut self) {
-        self.config.shares = self.shares.values().map(|r| r.token.clone()).collect();
+        self.config.shares = self.shares.values().map(|r| r.token().to_string()).collect();
         self.config.shares.sort();
         if let Err(e) = self.config.save(&self.home.config_path()) {
             tracing::warn!(error = %format!("{e:#}"), "could not rewrite config.toml");
@@ -205,18 +348,47 @@ impl Supervisor {
 
         let mut shares: Vec<ShareStatus> = self
             .shares
-            .values()
-            .map(|r| ShareStatus {
-                manifest_id: r.meta.manifest_id.to_hex(),
-                name: r.meta.name.clone(),
-                files: r.meta.files,
-                total_bytes: r.meta.total_bytes,
-                version: r.meta.version,
-                private: r.meta.private,
-                cached_chunks: None,
-                replica_chunks: r.replica_chunks.map(|n| n as u64),
-                listen_addr: r.listen_addr.clone(),
-                error: None,
+            .iter()
+            .map(|(id, r)| match r {
+                ShareRecord::Replicating { name_hint, progress, .. } => ShareStatus {
+                    manifest_id: id.to_hex(),
+                    name: name_hint.clone(),
+                    files: 0,
+                    total_bytes: 0,
+                    version: 0,
+                    private: false,
+                    cached_chunks: None,
+                    replica_chunks: None,
+                    listen_addr: None,
+                    replicating: progress.clone(),
+                    error: None,
+                },
+                ShareRecord::Ready { meta, replica_chunks, listen_addr, .. } => ShareStatus {
+                    manifest_id: meta.manifest_id.to_hex(),
+                    name: meta.name.clone(),
+                    files: meta.files,
+                    total_bytes: meta.total_bytes,
+                    version: meta.version,
+                    private: meta.private,
+                    cached_chunks: None,
+                    replica_chunks: replica_chunks.map(|n| n as u64),
+                    listen_addr: listen_addr.clone(),
+                    replicating: None,
+                    error: None,
+                },
+                ShareRecord::Failed { name_hint, error, .. } => ShareStatus {
+                    manifest_id: id.to_hex(),
+                    name: name_hint.clone(),
+                    files: 0,
+                    total_bytes: 0,
+                    version: 0,
+                    private: false,
+                    cached_chunks: None,
+                    replica_chunks: None,
+                    listen_addr: None,
+                    replicating: None,
+                    error: Some(error.clone()),
+                },
             })
             .collect();
         shares.sort_by(|a, b| a.name.cmp(&b.name));
@@ -239,8 +411,4 @@ fn share_identity_seed(identity: &Keypair, manifest_id: Hash) -> anyhow::Result<
     buf.extend_from_slice(&daemon_seed);
     buf.extend_from_slice(manifest_id.as_bytes());
     Ok(*Hash::of(&buf).as_bytes())
-}
-
-fn elide(s: &str) -> String {
-    if s.len() > 24 { format!("{}…", &s[..24]) } else { s.to_string() }
 }

@@ -179,7 +179,19 @@ pub struct AccelShareRow {
     pub replica_chunks: Option<u64>,
     /// NAS role: this share's own serving address.
     pub listen_addr: Option<String>,
+    /// NAS role: set while the initial replication is still under way.
+    pub replicating: Option<ReplicaProgress>,
     pub error: Option<String>,
+}
+
+/// A NAS share's replication progress, reported once per chunk while it is
+/// still under way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaProgress {
+    pub chunks_done: usize,
+    pub chunks_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
 }
 
 /// Live status of an in-process accelerator this node is running.

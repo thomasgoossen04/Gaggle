@@ -696,6 +696,18 @@ fn accel_share_row(
     let key = format!("{prefix}-{}", s.manifest_id);
     let meta = if let Some(e) = &s.error {
         format!("!! {e}")
+    } else if let Some(p) = &s.replicating {
+        if p.chunks_total == 0 {
+            "replicating — fetching metadata…".to_string()
+        } else {
+            format!(
+                "replicating {}/{} chunks ({} of {})",
+                p.chunks_done,
+                p.chunks_total,
+                human_bytes(p.bytes_done),
+                human_bytes(p.bytes_total)
+            )
+        }
     } else if let Some(n) = s.replica_chunks {
         format!("{} files · {} · {n} chunks", s.files, human_bytes(s.total_bytes))
     } else {

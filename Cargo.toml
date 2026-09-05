@@ -5,6 +5,7 @@ members = [
     "crates/net",
     "crates/control-plane",
     "crates/accelerator",
+    "crates/accelerator-launcher",
     "crates/app-state",
     "crates/ui-kit",
     "crates/gui",

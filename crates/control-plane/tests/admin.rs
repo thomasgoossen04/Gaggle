@@ -141,6 +141,7 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
                         cached_chunks: Some(0),
                         replica_chunks: None,
                         listen_addr: None,
+                        replicating: None,
                         error: None,
                     });
                     let _ = status_tx.send(s);

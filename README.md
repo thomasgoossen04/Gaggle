@@ -41,6 +41,31 @@ cache. Windows and macOS builds are published too, as `gaggle-accelerator-window
 launcher under the same `releases/latest/download/` (stable) and `releases/download/beta/`
 (beta) paths.
 
+### Auto-updating accelerator (systemd)
+
+For a box you want to just keep running — updating itself on every restart, no manual
+redeploy — use `gaggle-accelerator-launcher` instead: it's the same idea as the desktop
+launcher, headless. Point a systemd unit's `ExecStart=` at it and it checks for a newer
+`accelerator` build, installs it if there is one (falling back to whatever's already
+installed if the check fails, so a network blip never stops the service from starting),
+then runs the daemon.
+
+```bash
+curl -fsSL -o gaggle-accelerator-launcher https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-accelerator-launcher-linux-x86_64
+chmod +x gaggle-accelerator-launcher
+sudo mv gaggle-accelerator-launcher /usr/local/bin/   # give it a stable path first
+
+gaggle-accelerator-launcher service --role relay --install
+systemctl --user daemon-reload
+systemctl --user enable --now gaggle-accelerator.service
+loginctl enable-linger "$USER"   # so it runs without staying logged in
+```
+
+`service` prints (rather than installs, without `--install`) a ready-to-use systemd user
+unit; `--channel beta` tracks pre-release builds, same flag as the desktop launcher.
+`gaggle-accelerator-launcher check` / `update` work the same way for scripting, and
+`--no-update` on `run` skips the check for a quick manual restart.
+
 Gaggle is a hybrid-P2P application for sharing very large folders (100GB+ — think modded
 game installs, media libraries, datasets) over private, invite-based swarms. Peers exchange
 content-addressed chunks directly with each other; optional always-on **accelerator nodes**
@@ -120,7 +145,7 @@ Requires a recent stable Rust toolchain.
 ```bash
 git clone https://github.com/thomasgoossen04/Gaggle.git
 cd Gaggle
-cargo build --release -p gui -p launcher -p accelerator
+cargo build --release -p gui -p launcher -p accelerator -p accelerator-launcher
 ```
 
 The GUI needs the usual system libraries for a windowed GPU app on Linux
@@ -186,6 +211,10 @@ cargo run -p accelerator -- identity                # print its public key
 cargo run -p accelerator -- authorize <operator-key-hex>   # let yourself manage it remotely
 cargo run -p accelerator -- share add gaggleshare1…  # queue a share to carry, offline
 ```
+
+For a box that should stay current on its own with no manual redeploys, run it through
+`gaggle-accelerator-launcher` instead of the daemon directly — see
+["Auto-updating accelerator (systemd)"](#auto-updating-accelerator-systemd) above.
 
 Once authorized, add it as a **remote accelerator** from the GUI's Accelerator tab (label +
 its admin URL + the public key it printed) to manage its shares and watch its status from

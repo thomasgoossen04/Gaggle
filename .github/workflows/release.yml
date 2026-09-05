@@ -60,7 +60,7 @@ jobs:
         run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
 
       - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} -p gui -p launcher -p accelerator
+        run: cargo build --release --locked --target ${{ matrix.target }} -p gui -p launcher -p accelerator -p accelerator-launcher
 
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
@@ -84,6 +84,12 @@ jobs:
           cp "$BIN/accelerator" "$ACCEL"
           shasum -a 256 "$ACCEL" | awk '{print $1}' > "$ACCEL.sha256"
 
+          # And its auto-updating headless launcher, standalone — this is the
+          # one a systemd unit's ExecStart= should point at (see README).
+          ACCEL_LAUNCHER="dist/gaggle-accelerator-launcher-${{ matrix.name }}"
+          cp "$BIN/gaggle-accelerator-launcher" "$ACCEL_LAUNCHER"
+          shasum -a 256 "$ACCEL_LAUNCHER" | awk '{print $1}' > "$ACCEL_LAUNCHER.sha256"
+
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -104,6 +110,11 @@ jobs:
           $accel = "dist/gaggle-accelerator-${{ matrix.name }}.exe"
           Copy-Item "$bin/accelerator.exe" $accel
           (Get-FileHash $accel -Algorithm SHA256).Hash.ToLower() | Out-File -NoNewline "$accel.sha256"
+
+          # And its auto-updating headless launcher, standalone.
+          $accelLauncher = "dist/gaggle-accelerator-launcher-${{ matrix.name }}.exe"
+          Copy-Item "$bin/gaggle-accelerator-launcher.exe" $accelLauncher
+          (Get-FileHash $accelLauncher -Algorithm SHA256).Hash.ToLower() | Out-File -NoNewline "$accelLauncher.sha256"
 
       - uses: actions/upload-artifact@v4
         with:

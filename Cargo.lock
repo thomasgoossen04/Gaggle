@@ -20,6 +20,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "accelerator-launcher"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs 6.0.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "ureq",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

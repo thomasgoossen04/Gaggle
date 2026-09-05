@@ -104,9 +104,24 @@ pub struct ShareStatus {
     /// NAS role: this share's own serving address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+    /// NAS role: set while the initial replication is still under way — the
+    /// share is accepted and persisted (it'll retry across restarts) as soon
+    /// as it's added, well before it's fully on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicating: Option<ReplicationProgress>,
     /// Populated if the share failed to start / replicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// A NAS share's replication progress, reported once per chunk while it is
+/// still under way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationProgress {
+    pub chunks_done: usize,
+    pub chunks_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
 }
 
 // --- backend channel -----------------------------------------------------

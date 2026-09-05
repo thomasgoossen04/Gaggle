@@ -19,21 +19,21 @@ use gaggle_core::{
     ScanProgress, SignedCapability, SourceChunkStore, SyncOutcome, index_dir_with_progress,
     snapshot_dir, sync_share, write_share,
 };
-use net::accel::{nas_add_share, relay_add_share};
+use net::accel::{nas_pull_with_progress, nas_serve, relay_add_share};
 use net::{
-    CacheStats, Capability, Catalog, Invite, Multiaddr, Node, PeerId, RelayConfig, RelayNode, Scope,
-    ShareKeypair, ShareLink, SwarmConfig, SwarmProgress, peer_id_of,
+    CacheStats, Capability, Catalog, Invite, Keypair, Multiaddr, Node, PeerId, RelayConfig,
+    RelayNode, Scope, ShareKeypair, ShareLink, SwarmConfig, SwarmProgress, peer_id_of,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::persist::{PersistedSeed, PersistedState};
-use crate::settings::Settings;
+use crate::settings::{PersistedAccelRole, PersistedAccelerator, Settings};
 use crate::state::{
     AccelShareRow, AcceleratorRole, AcceleratorState, AppState, BenchmarkResult, MintedInvite,
-    RemoteAccelState, SourceStats, SwarmStatus, TransferId, TransferKind, TransferRow,
-    TransferStatus,
+    RemoteAccelState, ReplicaProgress, SourceStats, SwarmStatus, TransferId, TransferKind,
+    TransferRow, TransferStatus,
 };
 
 /// A discrete thing that happened, for callers that would rather react than poll.
@@ -160,11 +160,17 @@ enum Command {
     ResyncProgress { id: TransferId, p: SwarmProgress },
     ResyncDone { id: TransferId, outcome: Box<ResyncOutcome> },
     BenchmarkDone(BenchmarkResult),
-    AcceleratorReady { handle: Box<AccelHandle>, state: Box<AcceleratorState> },
+    AcceleratorReady {
+        handle: Box<AccelHandle>,
+        state: Box<AcceleratorState>,
+        request: Box<AcceleratorRequest>,
+    },
     AcceleratorStartFailed(String),
     AcceleratorStatsRefresh(CacheStats),
     AccelSharesRefresh(Vec<AccelShareRow>),
     AccelShareAdded { node: Option<Box<Node>>, row: Box<AccelShareRow>, token: String },
+    /// A NAS share added to an already-running local accelerator made progress.
+    AccelShareProgress { manifest_id: String, progress: ReplicaProgress },
     RemoteStatusRefresh { label: String, state: Box<RemoteAccelState> },
     RepollRemote(String),
 }
@@ -712,6 +718,7 @@ impl Manager {
             Command::StopAccelerator => {
                 self.accel = None;
                 self.state.accelerator = None;
+                self.save_accelerator_settings(None);
                 self.publish();
                 let _ = self.events.send(AppEvent::AcceleratorChanged);
             }
@@ -979,9 +986,10 @@ impl Manager {
                 self.publish();
                 let _ = self.events.send(AppEvent::BenchmarkReady);
             }
-            Command::AcceleratorReady { handle, state } => {
+            Command::AcceleratorReady { handle, state, request } => {
                 self.accel = Some(*handle);
                 self.state.accelerator = Some(*state);
+                self.save_accelerator_settings(Some(&request));
                 self.publish();
                 let _ = self.events.send(AppEvent::AcceleratorChanged);
             }
@@ -1023,8 +1031,20 @@ impl Manager {
                         a.shares = rows.clone();
                         a.detail = accel_detail(a.role, &rows);
                     }
+                    self.sync_accelerator_shares();
                     self.publish();
                     let _ = self.events.send(AppEvent::AcceleratorChanged);
+                }
+            }
+            Command::AccelShareProgress { manifest_id, progress } => {
+                if let Some(h) = &mut self.accel
+                    && let Some(row) = h.rows.iter_mut().find(|r| r.manifest_id == manifest_id)
+                {
+                    row.replicating = Some(progress);
+                    if let Some(a) = &mut self.state.accelerator {
+                        a.shares = h.rows.clone();
+                    }
+                    self.publish();
                 }
             }
             Command::RepollRemote(label) => self.spawn_remote_status(label),
@@ -1055,6 +1075,7 @@ impl Manager {
         let meta = h.meta.clone();
         let dir_root = h.nas_dir.clone();
         let operator_seed = self.operator.to_seed();
+        let rendezvous_url = self.state.settings.rendezvous_url.clone();
         let tx = self.self_tx.clone();
         let existing = h.rows.clone();
         let token_owned = token.trim().to_string();
@@ -1070,7 +1091,35 @@ impl Manager {
                 AcceleratorRole::Nas => match dir_root {
                     Some(dir) => {
                         let seed = derive_share_seed(&operator_seed, link.manifest_id);
-                        match nas_add_share(&dir, net::keypair_from_seed(seed), &link).await {
+                        let manifest_id = link.manifest_id.to_hex();
+                        let progress_tx = tx.clone();
+                        let mut last_sent = Instant::now()
+                            .checked_sub(Duration::from_millis(500))
+                            .unwrap_or_else(Instant::now);
+                        let on_progress = move |p: SwarmProgress| {
+                            let done = p.chunks_done >= p.chunks_total;
+                            if done || last_sent.elapsed() >= Duration::from_millis(500) {
+                                last_sent = Instant::now();
+                                let _ = progress_tx.try_send(Command::AccelShareProgress {
+                                    manifest_id: manifest_id.clone(),
+                                    progress: ReplicaProgress {
+                                        chunks_done: p.chunks_done,
+                                        chunks_total: p.chunks_total,
+                                        bytes_done: p.bytes_done,
+                                        bytes_total: p.bytes_total,
+                                    },
+                                });
+                            }
+                        };
+                        match nas_replicate(
+                            &dir,
+                            net::keypair_from_seed(seed),
+                            &link,
+                            rendezvous_url.as_deref(),
+                            on_progress,
+                        )
+                        .await
+                        {
                             Ok((node, m, chunks)) => {
                                 let addr = node.listen_addr().await.ok().map(|a| a.to_string());
                                 Ok((
@@ -1126,8 +1175,47 @@ impl Manager {
             a.shares = rows.clone();
             a.detail = accel_detail(a.role, &rows);
         }
+        self.sync_accelerator_shares();
         self.publish();
         let _ = self.events.send(AppEvent::AcceleratorChanged);
+    }
+
+    /// Persist what a running local accelerator is carrying, so it can be
+    /// restarted with the same role/dir/cache and share set on the next
+    /// launch. `request` is `None` to clear it ([`StopAccelerator`](Command::StopAccelerator)).
+    fn save_accelerator_settings(&mut self, request: Option<&AcceleratorRequest>) {
+        self.state.settings.accelerator = request.map(|r| match r {
+            AcceleratorRequest::Relay { cache_bytes, shares } => PersistedAccelerator {
+                role: PersistedAccelRole::Relay,
+                cache_bytes: *cache_bytes,
+                dir: None,
+                shares: shares.iter().map(|l| l.clone().encode()).collect(),
+            },
+            AcceleratorRequest::Nas { dir, shares } => PersistedAccelerator {
+                role: PersistedAccelRole::Nas,
+                cache_bytes: 0,
+                dir: Some(dir.clone()),
+                shares: shares.iter().map(|l| l.clone().encode()).collect(),
+            },
+        });
+        if let Some(path) = &self.config_path {
+            let _ = self.state.settings.save(path);
+        }
+    }
+
+    /// Refresh the persisted share-token list for a running local accelerator
+    /// to match what it's actually carrying (after `accel_add_share` /
+    /// `accel_remove_share`), so a restart resumes the current set rather
+    /// than only the one it was started with.
+    fn sync_accelerator_shares(&mut self) {
+        let Some(h) = &self.accel else { return };
+        let tokens = h.tokens.clone();
+        if let Some(acc) = &mut self.state.settings.accelerator {
+            acc.shares = tokens;
+            if let Some(path) = &self.config_path {
+                let _ = self.state.settings.save(path);
+            }
+        }
     }
 
     fn add_remote_accelerator(&mut self, label: String, admin_url: String) {
@@ -1463,13 +1551,15 @@ impl Manager {
         }
         let tx = self.self_tx.clone();
         let operator_seed = self.operator.to_seed();
+        let rendezvous_url = self.state.settings.rendezvous_url.clone();
+        let request_saved = request.clone();
         tokio::spawn(async move {
             let result = match request {
                 AcceleratorRequest::Relay { cache_bytes, shares } => {
                     start_relay_accel(cache_bytes, shares).await
                 }
                 AcceleratorRequest::Nas { dir, shares } => {
-                    start_nas_accel(dir, shares, operator_seed).await
+                    start_nas_accel(dir, shares, operator_seed, rendezvous_url).await
                 }
             };
             match result {
@@ -1478,6 +1568,7 @@ impl Manager {
                         .send(Command::AcceleratorReady {
                             handle: Box::new(handle),
                             state: Box::new(state),
+                            request: Box::new(request_saved),
                         })
                         .await;
                 }
@@ -1669,6 +1760,9 @@ impl Manager {
         if !self.state.settings.persist_shares {
             return;
         }
+        if let Some(saved) = self.state.settings.accelerator.clone() {
+            self.restore_accelerator(saved);
+        }
         let Some(path) = self.shares_path() else { return };
         let Ok(bytes) = std::fs::read(&path) else { return };
         let persisted: PersistedState = match serde_json::from_slice(&bytes) {
@@ -1684,6 +1778,34 @@ impl Manager {
         for request in persisted.subscriptions {
             self.subscribe(request);
         }
+    }
+
+    /// Restart the local accelerator [`Settings::accelerator`] describes —
+    /// the "always-on" NAS/relay this node was running before it last
+    /// restarted. An unparseable saved share token is dropped with a warning
+    /// rather than failing the whole restore.
+    fn restore_accelerator(&mut self, saved: PersistedAccelerator) {
+        let shares: Vec<ShareLink> = saved
+            .shares
+            .iter()
+            .filter_map(|t| match ShareLink::parse(t) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::warn!(error = %e, "dropping an unparseable saved accelerator share");
+                    None
+                }
+            })
+            .collect();
+        let request = match saved.role {
+            PersistedAccelRole::Relay => {
+                AcceleratorRequest::Relay { cache_bytes: saved.cache_bytes, shares }
+            }
+            PersistedAccelRole::Nas => AcceleratorRequest::Nas {
+                dir: saved.dir.unwrap_or_else(|| self.state.settings.download_dir.join(".gaggle-nas")),
+                shares,
+            },
+        };
+        self.start_accelerator(request);
     }
 
     /// Rewrite `shares.json` from the live seed/download/subscription maps.
@@ -1849,6 +1971,38 @@ async fn answer_rendezvous_requests(node: &Node, rendezvous_url: &str) {
             }
         }
     }
+}
+
+/// Replicate `link` onto `dir_root` under a NAS replica's persistent
+/// `identity`, trying a NAT-rendezvous punch first when `rendezvous_url` is
+/// set and the link names a peer id (same idea as [`run_download`]'s: the
+/// punch has to happen on the very node that then does the real connect/pull,
+/// since that's the node whose NAT mapping it opens a hole in — so this
+/// spawns its own scratch node rather than reusing [`nas_add_share`]'s).
+/// Reports [`SwarmProgress`] once per chunk via `on_progress`.
+async fn nas_replicate(
+    dir_root: &std::path::Path,
+    identity: Keypair,
+    link: &ShareLink,
+    rendezvous_url: Option<&str>,
+    on_progress: impl FnMut(SwarmProgress),
+) -> anyhow::Result<(Node, net::accel::ShareMeta, usize)> {
+    let scratch = Node::spawn().await?;
+    let mut link = link.clone();
+    if let Some(url) = rendezvous_url
+        && let Some(origin) = link.sources.iter().find_map(peer_id_of)
+        && let Ok(extra) = punch_via_rendezvous(&scratch, url, origin).await
+    {
+        for addr in extra {
+            if !link.sources.contains(&addr) {
+                link.sources.push(addr);
+            }
+        }
+    }
+    let pulled = nas_pull_with_progress(&scratch, dir_root, &link, on_progress).await;
+    scratch.shutdown().await;
+    let (manifest, chunk_lists, disk, chunks) = pulled?;
+    nas_serve(manifest, chunk_lists, disk, chunks, identity, &link).await
 }
 
 /// A throttled [`index_dir_with_progress`] callback that forwards
@@ -2166,6 +2320,7 @@ fn row_from_meta(
         private: m.private,
         replica_chunks,
         listen_addr,
+        replicating: None,
         error: None,
     }
 }
@@ -2180,6 +2335,7 @@ fn err_row(name: &str, manifest_id: &str, error: String) -> AccelShareRow {
         private: false,
         replica_chunks: None,
         listen_addr: None,
+        replicating: None,
         error: Some(error),
     }
 }
@@ -2194,6 +2350,12 @@ fn share_status_row(s: &control_plane::ShareStatus) -> AccelShareRow {
         private: s.private,
         replica_chunks: s.replica_chunks,
         listen_addr: s.listen_addr.clone(),
+        replicating: s.replicating.as_ref().map(|p| ReplicaProgress {
+            chunks_done: p.chunks_done,
+            chunks_total: p.chunks_total,
+            bytes_done: p.bytes_done,
+            bytes_total: p.bytes_total,
+        }),
         error: s.error.clone(),
     }
 }
@@ -2259,6 +2421,7 @@ async fn start_nas_accel(
     dir: PathBuf,
     shares: Vec<ShareLink>,
     operator_seed: [u8; 32],
+    rendezvous_url: Option<String>,
 ) -> anyhow::Result<(AccelHandle, AcceleratorState)> {
     anyhow::ensure!(!shares.is_empty(), "a NAS accelerator needs at least one share");
     tokio::fs::create_dir_all(&dir).await.ok();
@@ -2268,7 +2431,9 @@ async fn start_nas_accel(
     let mut nas_nodes: Vec<(Hash, Node)> = Vec::new();
     for link in &shares {
         let seed = derive_share_seed(&operator_seed, link.manifest_id);
-        match nas_add_share(&dir, net::keypair_from_seed(seed), link).await {
+        match nas_replicate(&dir, net::keypair_from_seed(seed), link, rendezvous_url.as_deref(), |_| {})
+            .await
+        {
             Ok((node, m, chunks)) => {
                 let addr = node.listen_addr().await.ok().map(|a| a.to_string());
                 nas_nodes.push((m.manifest_id, node));

@@ -47,10 +47,20 @@ pub struct SwarmConfig {
     pub prefer: Vec<PeerId>,
     /// Restrict the download to these manifest paths (a scoped invite). `None`
     /// pulls the whole share; `Some(paths)` fetches chunk lists and chunks only
-    /// for those files, and the returned [`DownloadedShare::manifest`] is
-    /// narrowed to them — so a request for a file the capability excludes is
-    /// never made.
+    /// for those files — so a request for a file the capability excludes is
+    /// never made. Whether the *returned* manifest also shrinks to match is
+    /// controlled by [`narrow_manifest`](Self::narrow_manifest).
     pub allowed_paths: Option<Vec<String>>,
+    /// When `allowed_paths` narrows the fetch, also narrow the *returned*
+    /// [`DownloadedShare::manifest`] to just those files. The default (`true`)
+    /// is correct for a downloader that only wants to materialize what it's
+    /// granted. A partial-store replica that must keep re-serving under the
+    /// origin's real manifest id sets this `false`: `Manifest::id()` hashes the
+    /// manifest's content, so narrowing it would change the id and break every
+    /// legitimate invite holder's manifest-id check against the replica — the
+    /// full manifest comes back, but the chunk lists (and so the store) still
+    /// only cover `allowed_paths`.
+    pub narrow_manifest: bool,
     /// Which share to ask each source for. `Some(manifest_id)` is required when a
     /// source serves several shares at once (a multi-share relay accelerator);
     /// `None` asks for "the one share you serve".
@@ -63,6 +73,7 @@ impl Default for SwarmConfig {
             per_peer_parallelism: 4,
             prefer: Vec::new(),
             allowed_paths: None,
+            narrow_manifest: true,
             manifest_id: None,
         }
     }
@@ -160,10 +171,13 @@ where
         anyhow::bail!("a source returned a different manifest than the one requested");
     }
 
-    // A scoped invite: narrow the manifest to the files it grants, so we never
-    // ask a source for a file it will refuse.
-    if let Some(allowed) = &config.allowed_paths {
-        let allow: HashSet<&str> = allowed.iter().map(String::as_str).collect();
+    // A scoped invite: never ask a source for a file it will refuse. Narrowing
+    // `manifest` itself (so it also comes back trimmed) is opt-out via
+    // `narrow_manifest` — a partial-store replica needs the full manifest back
+    // to keep re-serving under the same id (see `SwarmConfig::narrow_manifest`).
+    let allow: Option<HashSet<&str>> =
+        config.allowed_paths.as_ref().map(|a| a.iter().map(String::as_str).collect());
+    if config.narrow_manifest && let Some(allow) = &allow {
         manifest.files.retain(|f| allow.contains(f.path.as_str()));
         manifest
             .dirs
@@ -182,10 +196,15 @@ where
     // (which bounds concurrent *chunk* transfers) without risking memory or
     // bandwidth blowup — a single QUIC connection multiplexes this fine.
     const LIST_FETCH_CONCURRENCY: usize = 64;
+    // Filtered independent of `narrow_manifest`: even when the *returned*
+    // manifest stays full, we still only fetch (and so only store) chunk
+    // lists for the files this run is actually pulling.
+    let wanted = |f: &&FileEntry| allow.as_ref().is_none_or(|a| a.contains(f.path.as_str()));
+    let files_to_fetch = manifest.files.iter().filter(wanted).count();
     let list_concurrency =
-        (LIST_FETCH_CONCURRENCY * sources.len()).max(1).min(manifest.files.len().max(1));
+        (LIST_FETCH_CONCURRENCY * sources.len()).max(1).min(files_to_fetch.max(1));
     let mut chunk_lists: BTreeMap<String, ChunkList> = BTreeMap::new();
-    let mut files_iter = manifest.files.iter();
+    let mut files_iter = manifest.files.iter().filter(wanted);
     let mut list_fetches = FuturesUnordered::new();
     // `&request` (not `request`) so this closure is reusable — a `Copy`
     // reference, unlike `F` itself, can be captured into each call's `async

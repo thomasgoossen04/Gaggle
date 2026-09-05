@@ -83,6 +83,38 @@ pub struct Settings {
     /// `None` skips this.
     #[serde(default)]
     pub rendezvous_url: Option<String>,
+    /// A local accelerator (relay or NAS) to restart on the next launch,
+    /// mirroring the standalone `accelerator` daemon's own restart-on-boot
+    /// behavior — otherwise the "always-on" NAS/relay this node was running
+    /// silently stops the moment the GUI quits, even though the replicated
+    /// bytes remain on disk. `None` = don't start one automatically; gated by
+    /// [`persist_shares`](Self::persist_shares) like everything else this node
+    /// remembers across restarts.
+    #[serde(default)]
+    pub accelerator: Option<PersistedAccelerator>,
+}
+
+/// What [`Settings::accelerator`] needs to restart a local accelerator —
+/// mirrors [`crate::manager::AcceleratorRequest`] in a serializable form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAccelerator {
+    pub role: PersistedAccelRole,
+    /// Relay role: hot-chunk cache budget in bytes.
+    #[serde(default)]
+    pub cache_bytes: u64,
+    /// NAS role: replica root.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// `gaggleshare1…` tokens this accelerator carries.
+    #[serde(default)]
+    pub shares: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PersistedAccelRole {
+    Relay,
+    Nas,
 }
 
 /// A remote accelerator daemon registered in Settings — its admin URL and the
@@ -113,6 +145,7 @@ impl Default for Settings {
             persist_shares: default_persist_shares(),
             public_relay: None,
             rendezvous_url: None,
+            accelerator: None,
         }
     }
 }
