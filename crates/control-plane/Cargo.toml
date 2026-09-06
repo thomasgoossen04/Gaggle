@@ -13,6 +13,9 @@ serde_json.workspace = true
 axum = "0.8"
 getrandom = "0.2"
 base64 = "0.22"
+# Decode a libp2p peer id back to the Ed25519 public key it embeds, so the
+# seeder tracker can check that an announce is signed by the peer it names.
+bs58 = "0.5"
 reqwest = { version = "0.13", default-features = false, features = ["json", "http2", "charset", "rustls"] }
 # TLS for the admin API: a self-signed cert derived from the daemon's own
 # `AgentKeypair` (rcgen), served over rustls (axum-server), pinned client-side

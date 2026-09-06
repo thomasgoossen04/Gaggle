@@ -336,10 +336,13 @@ pub fn sync_share(
         outcome.written.push(file.path.clone());
     }
 
-    // Removed files. Only unlink a real file at that path — never follow a
-    // symlink that may have been planted there.
+    // Removed files. Resolve through `safe_dest` first so a symlinked *parent*
+    // component planted in the tree can't redirect the unlink outside `root`,
+    // then only unlink a real file (never a symlink) at the leaf itself.
     for file in &diff.removed {
-        let dest = root.join(&file.path);
+        let Ok(dest) = safe_dest(root, &file.path) else {
+            continue;
+        };
         match fs::symlink_metadata(&dest) {
             Ok(md) if md.file_type().is_file() => {
                 fs::remove_file(&dest)?;

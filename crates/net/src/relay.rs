@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::behaviour::{RelayBehaviour, RelayBehaviourEvent};
 use crate::proto::{Request, Response};
-use crate::{LISTEN_QUIC, build_relay_swarm};
+use crate::LISTEN_QUIC;
 
 /// How big the relay's hot-chunk cache may grow.
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +88,10 @@ struct ShareEntry {
 pub struct RelayNode {
     commands: Option<mpsc::Sender<Command>>,
     peer_id: PeerId,
+    /// The 32-byte Ed25519 seed of this relay's libp2p identity, so it can sign
+    /// a seeder-tracker announce for the shares it caches without reaching into
+    /// the swarm task.
+    identity_seed: [u8; 32],
     task: Option<JoinHandle<()>>,
 }
 
@@ -128,10 +132,10 @@ impl RelayNode {
         keypair: Option<crate::Keypair>,
         listen: Option<Multiaddr>,
     ) -> anyhow::Result<Self> {
-        let mut swarm = match keypair {
-            Some(kp) => crate::build_relay_swarm_with(kp)?,
-            None => build_relay_swarm()?,
-        };
+        let keypair = keypair.unwrap_or_else(crate::Keypair::generate_ed25519);
+        let identity_seed = crate::identity_seed(&keypair)
+            .map_err(|_| anyhow::anyhow!("a Gaggle relay needs an Ed25519 identity"))?;
+        let mut swarm = crate::build_relay_swarm_with(keypair)?;
         let peer_id = *swarm.local_peer_id();
         match listen {
             Some(addr) => swarm.listen_on(addr)?,
@@ -156,7 +160,17 @@ impl RelayNode {
             EventLoop::new(swarm, config, commands_rx).run().await;
         });
 
-        Ok(Self { commands: Some(commands_tx), peer_id, task: Some(task) })
+        Ok(Self { commands: Some(commands_tx), peer_id, identity_seed, task: Some(task) })
+    }
+
+    /// Sign `msg` with this relay's libp2p Ed25519 identity key — see
+    /// [`Node::sign_identity`](crate::Node::sign_identity).
+    pub fn sign_identity(&self, msg: &[u8]) -> [u8; 64] {
+        crate::keypair_from_seed(self.identity_seed)
+            .sign(msg)
+            .expect("Ed25519 signing is infallible")
+            .try_into()
+            .expect("an Ed25519 signature is 64 bytes")
     }
 
     pub fn peer_id(&self) -> PeerId {

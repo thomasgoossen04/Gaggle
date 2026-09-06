@@ -22,6 +22,7 @@ mod channel;
 mod manifest;
 mod paths;
 mod service;
+mod signing;
 mod updater;
 
 use anyhow::Context;

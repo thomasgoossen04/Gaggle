@@ -13,6 +13,20 @@ use control_plane::{
 use gaggle_core::{AgentId, AgentKeypair};
 use tokio::sync::{mpsc, watch};
 
+/// A real Ed25519 seeder identity: the libp2p-style peer id string that embeds
+/// its key, a `PeerInfo`, and a signing closure the tracker will accept.
+fn seeder(seed: u8) -> (AgentKeypair, PeerInfo) {
+    let kp = AgentKeypair::from_seed([seed; 32]);
+    let mut mh = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+    mh.extend_from_slice(kp.public().as_bytes());
+    let peer_id = bs58::encode(mh).into_string();
+    let info = PeerInfo {
+        peer_id: peer_id.clone(),
+        addrs: vec![format!("/ip4/203.0.113.1/udp/1/quic-v1/p2p/{peer_id}")],
+    };
+    (kp, info)
+}
+
 fn sample_status(agent: &AgentId) -> DaemonStatus {
     DaemonStatus {
         agent_id: agent.to_hex(),
@@ -97,12 +111,18 @@ async fn admin_and_rendezvous_share_one_tls_listener_with_separate_trust_models(
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].request_id, request_id);
 
-    // Seeder tracker: also unauthenticated, also merged onto the same port.
+    // Seeder tracker: also unauthenticated (no operator key), also merged onto
+    // the same port — but an announce still has to be signed by the key its
+    // peer id embeds.
+    let (kp, seeder_info) = seeder(50);
     let tracker_client = TrackerClient::new(&base);
-    tracker_client.announce("share-abc", &me).await.unwrap();
+    tracker_client
+        .announce("share-abc", &seeder_info, |m| kp.sign(m).to_bytes())
+        .await
+        .unwrap();
     let seeders = tracker_client.seeders("share-abc").await.unwrap();
     assert_eq!(seeders.len(), 1);
-    assert_eq!(seeders[0].peer_id, "sub");
+    assert_eq!(seeders[0].peer_id, seeder_info.peer_id);
 }
 
 /// The split-listener case: admin on one address, rendezvous on a different
@@ -142,8 +162,9 @@ async fn admin_and_rendezvous_can_run_on_separate_listeners() {
     assert_eq!(pending[0].request_id, request_id);
 
     // The seeder tracker rides the same (rendezvous) listener, not the admin one.
+    let (kp, seeder_info) = seeder(51);
     TrackerClient::new(format!("https://{rendezvous_addr}"))
-        .announce("share-abc", &me)
+        .announce("share-abc", &seeder_info, |m| kp.sign(m).to_bytes())
         .await
         .unwrap();
     assert_eq!(

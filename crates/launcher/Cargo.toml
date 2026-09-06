@@ -20,6 +20,9 @@ clap = { version = "4.6", features = ["derive"] }
 # Blocking HTTP with rustls; follows GitHub's release-download redirects.
 ureq = { version = "2", features = ["json"] }
 sha2 = "0.10"
+# Verifies the detached Ed25519 signature on the release descriptor before any
+# downloaded archive is unzipped or executed (see `signing.rs`).
+ed25519-dalek = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]

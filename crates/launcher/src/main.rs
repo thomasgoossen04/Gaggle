@@ -15,6 +15,7 @@ mod channel;
 mod desktop;
 mod manifest;
 mod paths;
+mod signing;
 mod ui;
 mod updater;
 

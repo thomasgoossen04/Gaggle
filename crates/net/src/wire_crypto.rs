@@ -43,6 +43,17 @@ const FLAG_COMPRESSED: u8 = 1 << 0;
 
 const NONCE_LEN: usize = 24;
 
+/// Hard ceiling on the plaintext a single [`open`] call will reconstruct from a
+/// compressed frame. The largest legitimate chunk is `ChunkerConfig::HUGE`
+/// (16 MiB); this leaves generous headroom while stopping a hostile peer from
+/// handing us a tiny frame whose length prefix claims gigabytes — `lz4_flex`'s
+/// `decompress_size_prepended` otherwise pre-allocates that claimed size before
+/// it has decompressed a single byte, so one 4-byte field becomes a
+/// multi-gigabyte allocation (a memory-amplification DoS). The wire key is
+/// baked into every build, so *any* peer can produce a frame that decrypts
+/// cleanly — the check has to sit here, before the allocation.
+const MAX_PLAINTEXT: usize = 32 * 1024 * 1024;
+
 fn cipher() -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new((&GLOBAL_KEY).into())
 }
@@ -80,7 +91,26 @@ pub fn open(sealed: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|_| "chunk failed authentication (corrupt or tampered in transit)".to_string())?;
 
     if flags & FLAG_COMPRESSED != 0 {
-        lz4_flex::decompress_size_prepended(&payload).map_err(|e| format!("chunk decompression failed: {e}"))
+        // `payload` is `u32-LE uncompressed size || lz4 block` (what
+        // `compress_prepend_size` produces). Bound the *claimed* size before
+        // anything is allocated, then decompress into a buffer of exactly that
+        // size: `decompress_into` cannot write past it, so the frame can cost
+        // us at most `MAX_PLAINTEXT`, not whatever a hostile length prefix or a
+        // pathologically-expanding block asks for.
+        let (size_bytes, block) = payload
+            .split_first_chunk::<4>()
+            .ok_or("compressed chunk is missing its size prefix")?;
+        let size = u32::from_le_bytes(*size_bytes) as usize;
+        if size > MAX_PLAINTEXT {
+            return Err(format!(
+                "compressed chunk claims {size} bytes, over the {MAX_PLAINTEXT}-byte limit"
+            ));
+        }
+        let mut out = vec![0u8; size];
+        let n = lz4_flex::decompress_into(block, &mut out)
+            .map_err(|e| format!("chunk decompression failed: {e}"))?;
+        out.truncate(n);
+        Ok(out)
     } else {
         Ok(payload)
     }
@@ -144,5 +174,24 @@ mod tests {
     fn truncated_frame_is_rejected() {
         assert!(open(&[]).is_err());
         assert!(open(&[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn a_lying_size_prefix_cannot_force_a_huge_allocation() {
+        // Hand-craft a sealed frame that decrypts to `FLAG_COMPRESSED` with a
+        // size prefix of `u32::MAX` and a one-byte lz4 block. `open` must reject
+        // it on the bound check, not try to allocate ~4 GiB.
+        let mut payload = (u32::MAX).to_le_bytes().to_vec();
+        payload.push(0);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ciphertext = cipher()
+            .encrypt(&nonce, Payload { msg: &payload, aad: AAD })
+            .unwrap();
+        let mut sealed = vec![FLAG_COMPRESSED];
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&ciphertext);
+
+        let err = open(&sealed).unwrap_err();
+        assert!(err.contains("limit"), "unexpected error: {err}");
     }
 }

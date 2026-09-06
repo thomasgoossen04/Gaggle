@@ -17,6 +17,7 @@ use crate::channel::Channel;
 use crate::desktop;
 use crate::manifest::{Asset, Manifest, platform_key};
 use crate::paths;
+use crate::signing;
 
 /// An explicit descriptor-URL override: `--manifest-url`, else `$GAGGLE_UPDATE_URL`.
 /// `None` means "use the selected channel's URL" ([`Channel::manifest_url`]).
@@ -127,8 +128,10 @@ pub fn installed_record() -> Option<Installed> {
     })
 }
 
-/// Fetch + parse the descriptor. Accepts `http(s)://…`, `file://<path>`, or a
-/// bare local path (the last two for local testing).
+/// Fetch + parse the descriptor. Accepts `https://…`, `file://<path>`, or a
+/// bare local path (the last two for local testing). Plain `http://` is
+/// refused. Every descriptor — remote or local — must be accompanied by a
+/// valid Ed25519 signature at `<url>.sig`; see [`crate::signing`].
 pub fn fetch_manifest(url: &str) -> Result<Manifest> {
     fetch_manifest_with_timeout(url, None)
 }
@@ -137,23 +140,35 @@ pub fn fetch_manifest(url: &str) -> Result<Manifest> {
 /// the pre-launch "should we auto-launch?" probe so a slow/dead network can't
 /// hang what should feel like an instant open.
 fn fetch_manifest_with_timeout(url: &str, timeout: Option<Duration>) -> Result<Manifest> {
-    let raw = if let Some(path) = url.strip_prefix("file://") {
-        std::fs::read_to_string(path).with_context(|| format!("read {path}"))?
+    signing::require_https_if_remote(url)?;
+
+    let (raw, sig) = if let Some(path) = url.strip_prefix("file://") {
+        (read_local(path)?, read_local(&format!("{path}.sig"))?)
     } else if !url.contains("://") {
-        std::fs::read_to_string(url).with_context(|| format!("read {url}"))?
+        (read_local(url)?, read_local(&format!("{url}.sig"))?)
     } else {
-        let agent = match timeout {
-            Some(t) => ureq::AgentBuilder::new().timeout(t).build(),
-            None => ureq::agent(),
+        let fetch = |u: &str| -> Result<String> {
+            let agent = match timeout {
+                Some(t) => ureq::AgentBuilder::new().timeout(t).build(),
+                None => ureq::agent(),
+            };
+            Ok(agent.get(u).call().with_context(|| format!("GET {u}"))?.into_string()?)
         };
-        agent
-            .get(url)
-            .call()
-            .with_context(|| format!("GET {url}"))?
-            .into_string()
-            .context("read manifest body")?
+        let body = fetch(url).context("read manifest body")?;
+        // Mandatory for a network fetch: this is what stops a tampered
+        // descriptor or a swapped release asset from choosing which archive we
+        // unzip and run. TLS to GitHub does not cover those.
+        let sig = fetch(&format!("{url}.sig"))
+            .context("fetching the release descriptor signature (latest.json.sig)")?;
+        (body, sig)
     };
+
+    signing::verify(raw.as_bytes(), &sig).context("verifying the release descriptor")?;
     serde_json::from_str(&raw).context("parse manifest JSON")
+}
+
+fn read_local(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("read {path}"))
 }
 
 /// A thread-safe handle to the update state machine.
@@ -319,6 +334,9 @@ pub fn wants_auto_launch(
 
 /// Stream `asset.url` to a temp file, hashing as it goes; verify the SHA-256.
 fn download_to_temp(asset: &Asset, progress: &dyn Fn(u64, u64)) -> Result<PathBuf> {
+    if !asset.url.starts_with("https://") {
+        bail!("refusing to download an update asset from a non-https URL: {}", asset.url);
+    }
     let resp = ureq::get(&asset.url)
         .call()
         .with_context(|| format!("GET {}", asset.url))?;
@@ -352,10 +370,14 @@ fn download_to_temp(asset: &Asset, progress: &dyn Fn(u64, u64)) -> Result<PathBu
     Ok(path)
 }
 
-/// Compare a hex SHA-256 against what was computed. An empty `expected` skips
-/// the check (descriptor opted out).
+/// Compare a hex SHA-256 against what was computed. A missing/empty `expected`
+/// is a hard error: the descriptor is signed, so an absent hash is a broken
+/// release, not an opt-out — never run an unverified archive.
 fn verify_sha(expected: &str, got: &str) -> Result<()> {
-    if !expected.is_empty() && !got.eq_ignore_ascii_case(expected) {
+    if expected.is_empty() {
+        bail!("release descriptor carries no sha256 for this platform's asset — refusing to install it unverified");
+    }
+    if !got.eq_ignore_ascii_case(expected) {
         bail!("sha256 mismatch: expected {expected}, got {got}");
     }
     Ok(())
@@ -543,10 +565,39 @@ mod tests {
     }
 
     #[test]
-    fn verify_sha_matches_case_insensitively_and_skips_when_empty() {
-        assert!(verify_sha("", "anything").is_ok());
+    fn verify_sha_matches_case_insensitively_and_rejects_an_empty_expectation() {
         assert!(verify_sha("ABCD", "abcd").is_ok());
         assert!(verify_sha("abcd", "ef01").is_err());
+        // An empty expected digest is now fatal, not a silent skip.
+        assert!(verify_sha("", "anything").is_err());
+    }
+
+    #[test]
+    fn fetch_manifest_requires_a_valid_signature_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("latest.json");
+        // Byte-exact: the pinned signature below is over these exact bytes.
+        let body = r#"{"version":"2.0.deadbee","platforms":{}}"#;
+        let good_sig = "892f1a8241b0bb773eb25fc707db261501b151656f41765b5bfdd5c60df3070d50b011ce035523de8fffa3a447c56f8dfd46c7eee028388c0e05c91336cd6e07";
+        std::fs::write(&path, body).unwrap();
+        let url = path.to_str().unwrap();
+
+        // No `.sig` next to it ⇒ refused.
+        assert!(fetch_manifest(url).is_err());
+
+        // A bogus `.sig` ⇒ refused.
+        std::fs::write(format!("{url}.sig"), "00".repeat(64)).unwrap();
+        assert!(fetch_manifest(url).is_err());
+
+        // The genuine signature (over `DOMAIN || body`) ⇒ accepted.
+        std::fs::write(format!("{url}.sig"), good_sig).unwrap();
+        let m = fetch_manifest(url).unwrap();
+        assert_eq!(m.version, "2.0.deadbee");
+    }
+
+    #[test]
+    fn fetch_manifest_refuses_plain_http() {
+        assert!(fetch_manifest("http://example.com/latest.json").is_err());
     }
 
     #[test]

@@ -130,6 +130,43 @@ async fn a_captured_request_cannot_be_replayed() {
 }
 
 #[tokio::test]
+async fn tampering_with_the_query_string_breaks_the_signature() {
+    use base64::Engine as _;
+    use gaggle_core::Hash;
+
+    let operator = AgentKeypair::from_seed([1u8; 32]);
+    let h = spawn(vec![operator.public()]).await;
+
+    // Sign a DELETE for the bare path, then send it with `?keep_data=1` bolted
+    // on — the daemon verifies against path+query, so the signature no longer
+    // matches and the request is refused.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+    let nonce = "tamper-nonce";
+    let canonical = format!(
+        "gaggle-admin\nDELETE\n/admin/shares/deadbeef\n{ts}\n{nonce}\n{}",
+        Hash::of(b"").to_hex()
+    );
+    let sig = operator.sign(canonical.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .delete(format!("{}/admin/shares/deadbeef?keep_data=1", h.base))
+        .header("x-gaggle-agent", operator.public().to_hex())
+        .header("x-gaggle-timestamp", &ts)
+        .header("x-gaggle-nonce", nonce)
+        .header("x-gaggle-signature", &sig_b64)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "a bolted-on query param must invalidate the signature");
+}
+
+#[tokio::test]
 async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
     let operator = AgentKeypair::from_seed([1u8; 32]);
     let mut h = spawn(vec![operator.public()]).await;

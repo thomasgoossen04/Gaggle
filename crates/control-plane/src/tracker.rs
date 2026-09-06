@@ -42,6 +42,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use gaggle_core::{AgentId, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::rendezvous::PeerInfo;
@@ -56,8 +57,87 @@ const ENTRY_TTL: Duration = Duration::from_secs(150);
 const MAX_SEEDERS_PER_SHARE: usize = 128;
 /// Upper bound on distinct shares tracked at all, FIFO-evicted.
 const MAX_SHARES: usize = 100_000;
+/// How far a signed announce's `signed_at` may be from the tracker's clock.
+/// Generous — this only needs to bound signature replay, and a seeder
+/// re-announces every ~30 s anyway.
+const ANNOUNCE_MAX_SKEW_SECS: i64 = 300;
 
 const JSON: &[(&str, &str)] = &[("content-type", "application/json")];
+
+const ANNOUNCE_DOMAIN: &str = "gaggle-tracker-announce-v1";
+
+/// The exact bytes a seeder signs with its libp2p Ed25519 identity key to prove
+/// it controls `peer_id` before the tracker will hand that peer's address out.
+/// `addrs` is sorted so the seeder and the tracker agree regardless of order.
+pub fn announce_signing_bytes(
+    manifest_id: &str,
+    peer_id: &str,
+    addrs: &[String],
+    signed_at: u64,
+) -> Vec<u8> {
+    let mut addrs = addrs.to_vec();
+    addrs.sort();
+    format!(
+        "{ANNOUNCE_DOMAIN}\n{manifest_id}\n{peer_id}\n{}\n{signed_at}",
+        addrs.join(",")
+    )
+    .into_bytes()
+}
+
+/// Pull the raw Ed25519 public key out of a libp2p peer id string. Gaggle nodes
+/// all use Ed25519 identities, whose protobuf-encoded public key (36 bytes) is
+/// short enough that libp2p wraps it in an *identity* multihash — so the peer id
+/// literally contains the key: `bs58( 0x00 0x24 | 0x08 0x01 0x12 0x20 | key32 )`.
+/// Returns `None` for anything else (a hashed multihash, a non-Ed25519 key).
+fn ed25519_pubkey_from_peer_id(peer_id: &str) -> Option<[u8; 32]> {
+    let mh = bs58::decode(peer_id).into_vec().ok()?;
+    // identity-hash (0x00), length 0x24 = 36, then protobuf PublicKey:
+    //   field 1 (type) = 1 (Ed25519)  -> 0x08 0x01
+    //   field 2 (data), len 32        -> 0x12 0x20
+    const PREFIX: [u8; 6] = [0x00, 0x24, 0x08, 0x01, 0x12, 0x20];
+    if mh.len() == PREFIX.len() + 32 && mh[..PREFIX.len()] == PREFIX {
+        mh[PREFIX.len()..].try_into().ok()
+    } else {
+        None
+    }
+}
+
+fn hex64(bytes: &[u8; 64]) -> String {
+    let mut s = String::with_capacity(128);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn unhex64(s: &str) -> Option<[u8; 64]> {
+    let s = s.trim();
+    if s.len() != 128 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Check a signed announce: the peer id must be an Ed25519 identity, the
+/// timestamp fresh, and the signature valid over [`announce_signing_bytes`]
+/// under the key the peer id embeds.
+fn verify_announce(manifest_id: &str, a: &SeederAnnounce) -> Result<(), &'static str> {
+    let now = unix_now() as i64;
+    if (now - a.signed_at as i64).abs() > ANNOUNCE_MAX_SKEW_SECS {
+        return Err("announce timestamp is outside the accepted window");
+    }
+    let pubkey = ed25519_pubkey_from_peer_id(&a.peer.peer_id)
+        .ok_or("peer id is not a self-describing Ed25519 identity")?;
+    let sig = unhex64(&a.signature).ok_or("signature is not 128 hex chars")?;
+    let msg = announce_signing_bytes(manifest_id, &a.peer.peer_id, &a.peer.addrs, a.signed_at);
+    AgentId::from_bytes(pubkey)
+        .verify(&msg, &Signature::from_bytes(sig))
+        .map_err(|_| "announce signature does not verify")
+}
 
 /// The body of a `POST /tracker/{manifest_id}` — a seeder's [`PeerInfo`] plus
 /// the two bits of share metadata the open [directory](TrackerRegistry::directory)
@@ -78,6 +158,16 @@ pub struct SeederAnnounce {
     /// [directory](TrackerRegistry::directory).
     #[serde(default)]
     pub private: bool,
+    /// Unix seconds when this announce was signed. Bounds signature replay.
+    #[serde(default)]
+    pub signed_at: u64,
+    /// Hex Ed25519 signature (128 chars) over [`announce_signing_bytes`], made
+    /// with the libp2p identity key whose public half is embedded in
+    /// `peer.peer_id`. The HTTP endpoint rejects an announce without a valid
+    /// one — that is what stops a stranger announcing a victim's address as a
+    /// seeder (a traffic-reflection vector).
+    #[serde(default)]
+    pub signature: String,
 }
 
 /// One row of the open share [directory](TrackerRegistry::directory): a public
@@ -259,6 +349,12 @@ async fn announce_handler(
     let Ok(axum::Json(a)) = body else {
         return (StatusCode::BAD_REQUEST, "expected a SeederAnnounce body").into_response();
     };
+    // The one authenticated step in an otherwise-open service: prove control of
+    // the announced peer id, so nobody can list a third party's address as a
+    // seeder and turn every downloader into a packet source aimed at them.
+    if let Err(why) = verify_announce(&manifest_id, &a) {
+        return (StatusCode::UNAUTHORIZED, why).into_response();
+    }
     registry.announce_with_meta(&manifest_id, a.peer, a.name, a.private);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -313,26 +409,44 @@ impl TrackerClient {
 
     /// Publish (or refresh) `me` as a current seeder of `manifest_id`, with no
     /// share metadata — the share never shows up in the open [`directory`].
-    pub async fn announce(&self, manifest_id: &str, me: &PeerInfo) -> anyhow::Result<()> {
-        self.announce_share(manifest_id, me, None, false).await
+    ///
+    /// `sign` must produce a raw 64-byte Ed25519 signature over its argument
+    /// using the identity key behind `me.peer_id` (in `net`, that is
+    /// `Node::sign_identity` / `RelayNode::sign_identity`). The tracker rejects
+    /// an announce whose signature does not check out against the key its peer
+    /// id embeds.
+    pub async fn announce(
+        &self,
+        manifest_id: &str,
+        me: &PeerInfo,
+        sign: impl Fn(&[u8]) -> [u8; 64],
+    ) -> anyhow::Result<()> {
+        self.announce_share(manifest_id, me, None, false, sign).await
     }
 
     /// Publish (or refresh) `me` as a current seeder of `manifest_id`, tagging
     /// it with a human-readable `name` and whether it is `private`. A public
     /// share announced this way is discoverable through [`directory`](Self::directory)
-    /// with no share link.
+    /// with no share link. See [`announce`](Self::announce) for `sign`.
     pub async fn announce_share(
         &self,
         manifest_id: &str,
         me: &PeerInfo,
         name: Option<&str>,
         private: bool,
+        sign: impl Fn(&[u8]) -> [u8; 64],
     ) -> anyhow::Result<()> {
         let url = format!("{}/tracker/{manifest_id}", self.base);
+        let signed_at =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let msg = announce_signing_bytes(manifest_id, &me.peer_id, &me.addrs, signed_at);
+        let signature = hex64(&sign(&msg));
         let body = SeederAnnounce {
             peer: me.clone(),
             name: name.map(str::to_string),
             private,
+            signed_at,
+            signature,
         };
         let (status, _, _) =
             self.http.send("POST", &url, JSON, serde_json::to_vec(&body)?).await?;
@@ -395,6 +509,56 @@ mod tests {
         reg.announce("s", info("p"));
         reg.announce("s", info("p"));
         assert_eq!(reg.seeders("s").len(), 1);
+    }
+
+    /// A libp2p-style peer id string for a raw Ed25519 public key: the identity
+    /// multihash of the protobuf-wrapped key, base58btc-encoded.
+    fn peer_id_for(pubkey: &[u8; 32]) -> String {
+        let mut buf = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        buf.extend_from_slice(pubkey);
+        bs58::encode(buf).into_string()
+    }
+
+    #[test]
+    fn a_signed_announce_verifies_and_tampering_is_caught() {
+        use gaggle_core::AgentKeypair;
+        let kp = AgentKeypair::from_seed([7u8; 32]);
+        let peer_id = peer_id_for(kp.public().as_bytes());
+        let addrs = vec![format!("/ip4/203.0.113.9/udp/4001/quic-v1/p2p/{peer_id}")];
+        let signed_at = unix_now();
+
+        let msg = announce_signing_bytes("mani-1", &peer_id, &addrs, signed_at);
+        let sig = hex64(&kp.sign(&msg).to_bytes());
+
+        let good = SeederAnnounce {
+            peer: PeerInfo { peer_id: peer_id.clone(), addrs: addrs.clone() },
+            name: None,
+            private: false,
+            signed_at,
+            signature: sig.clone(),
+        };
+        assert!(verify_announce("mani-1", &good).is_ok());
+
+        // Wrong manifest id, swapped address, and a future timestamp each fail.
+        assert!(verify_announce("mani-2", &good).is_err());
+        let mut moved = good.clone();
+        moved.peer.addrs = vec!["/ip4/198.51.100.1/udp/4001/quic-v1".into()];
+        assert!(verify_announce("mani-1", &moved).is_err());
+        let mut stale = good.clone();
+        stale.signed_at = signed_at + (ANNOUNCE_MAX_SKEW_SECS as u64) + 10;
+        assert!(verify_announce("mani-1", &stale).is_err());
+
+        // A different key's signature for the same peer id is rejected.
+        let other = AgentKeypair::from_seed([9u8; 32]);
+        let mut forged = good.clone();
+        forged.signature = hex64(&other.sign(&msg).to_bytes());
+        assert!(verify_announce("mani-1", &forged).is_err());
+    }
+
+    #[test]
+    fn a_bare_peer_id_string_has_no_embedded_key() {
+        assert!(ed25519_pubkey_from_peer_id("origin-peer").is_none());
+        assert!(ed25519_pubkey_from_peer_id("12D3KooWnotreal").is_none());
     }
 
     #[test]

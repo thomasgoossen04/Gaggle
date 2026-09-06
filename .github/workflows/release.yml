@@ -165,6 +165,18 @@ jobs:
           echo "--- latest.json ---"
           cat dist/latest.json
 
+      - name: Sign latest.json
+        env:
+          GAGGLE_RELEASE_SIGNING_KEY: ${{ secrets.GAGGLE_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          # Both launchers refuse a descriptor without a valid signature, so this
+          # step is release-blocking: it fails loudly if the secret is unset.
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          python3 .github/scripts/sign_latest.py dist/latest.json
+          echo "--- latest.json.sig ---"
+          cat dist/latest.json.sig; echo
+
       - name: Reset the rolling beta release
         if: github.ref_name == 'beta'
         env:
@@ -186,3 +198,4 @@ jobs:
             dist/gaggle-launcher-*
             dist/gaggle-accelerator-*
             dist/latest.json
+            dist/latest.json.sig

@@ -255,10 +255,11 @@ share, and can be driven remotely:
   forgetting it: token + NAS replica kept), `DELETE /admin/shares/{id}` (add
   `?keep_data=1` to
   keep a NAS replica's bytes for a resume; the default and `AdminClient::remove_share`
-  delete them — `remove_share_keep_data` opts out; the flag rides only the URL,
-  not the signed canonical path). `ShareStatus.seeding: bool` (`#[serde(default)]`
+  delete them — `remove_share_keep_data` opts out). `ShareStatus.seeding: bool` (`#[serde(default)]`
   true) reports whether a share is currently served. Every request is signed
-  by the operator's `AgentKeypair` (canonical `METHOD\nPATH\nTS\nNONCE\nblake3(body)`,
+  by the operator's `AgentKeypair` (canonical `METHOD\nPATH+QUERY\nTS\nNONCE\nblake3(body)`
+  — the query string is inside the signature, so `?keep_data=…` can't be added or
+  stripped on the wire,
   headers `x-gaggle-agent|timestamp|nonce|signature`, ±60 s skew, checked against
   `AdminState.authorized`); every response is signed by the daemon key
   (`x-gaggle-daemon[-signature]`) so `AdminClient` TOFU-pins it. Mutations go out
@@ -375,12 +376,18 @@ share, and can be driven remotely:
 
 - **Seeder tracker** — `control_plane::tracker` (`TrackerRegistry`, `router`,
   `TrackerClient`, re-exported at the crate root) is the discovery half of the
-  same idea: a small, unauthenticated, in-memory directory keyed by a share's
+  same idea: a small, in-memory directory keyed by a share's
   **manifest id (hex)** that answers "who else is serving this?". A peer serving
   a share `POST /tracker/{manifest_id}`s a `SeederAnnounce` (its `PeerInfo`
-  flattened + optional `name` + `private` flag; a bare `PeerInfo` still
-  deserializes) (entry TTL 150s, so a
-  gone seed drops itself); a downloader `GET /tracker/{manifest_id}` once and
+  flattened + optional `name` + `private` flag + `signed_at` + hex `signature`);
+  the HTTP handler **rejects any announce not signed by the libp2p Ed25519 key
+  its `peer_id` embeds** (`Node`/`RelayNode::sign_identity` produce it,
+  `TrackerClient::announce{,_share}` take the closure, `tracker::announce_signing_bytes`
+  is the canonical form, ±300 s skew) — so a stranger can't list a third party's
+  address as a seeder and reflect every downloader's dial at them. `GET` /
+  `DELETE` and the in-process `TrackerRegistry::announce*` (a same-machine
+  daemon path) stay unauthenticated. Entry TTL 150s, so a
+  gone seed drops itself; a downloader `GET /tracker/{manifest_id}` once and
   swarms across everyone it gets back plus the addresses in its share link; a
   clean shutdown can `DELETE /tracker/{manifest_id}/{peer_id}`. It fixes the
   "download only pulled from one source" case where a share link names just the
@@ -571,7 +578,18 @@ linux-x86_64 / windows-x86_64 / macos-aarch64 / macos-x86_64 (the Intel macOS
 build is cross-compiled on the Apple Silicon runner — no x86_64 macOS runners
 exist), runs
 `.github/scripts/make_latest.py <version> <tag> <channel> dist` to compose `latest.json`,
-and publishes a GitHub Release. Alongside each `gaggle-<platform>.zip` (+ `.sha256`) the
+then `.github/scripts/sign_latest.py dist/latest.json` to write `latest.json.sig`
+(a detached Ed25519 signature over `"gaggle-release-descriptor-v1\n" || latest.json`,
+128 hex chars), and publishes a GitHub Release with both. The signing key comes
+from the **`GAGGLE_RELEASE_SIGNING_KEY`** repo secret (64-hex raw Ed25519 seed);
+the step is release-blocking — a release without it fails rather than shipping an
+unsigned descriptor. The matching public key is compiled into both launchers at
+`crates/{launcher,accelerator-launcher}/src/signing.rs::RELEASE_PUBLIC_KEY_HEX`,
+and `fetch_manifest` refuses a descriptor whose `<url>.sig` is missing or does not
+verify (and refuses a plain-`http://` descriptor or asset URL, and a descriptor
+with an empty `sha256` for this platform). To rotate: new seed → set the secret →
+replace `RELEASE_PUBLIC_KEY_HEX` + the pinned test vectors in both crates → release.
+Alongside each `gaggle-<platform>.zip` (+ `.sha256`) the
 release also carries three standalone binaries as their own assets (each
 `<name>-<platform>[.exe]` + `.sha256`, so getting any one of them is a single direct
 download, no unzip needed): the **launcher** (`gaggle-launcher-…`), the **accelerator

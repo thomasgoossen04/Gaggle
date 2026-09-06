@@ -18,12 +18,15 @@
 //! Both use private protocol names so a Gaggle swarm never touches the public
 //! IPFS DHT.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{StreamProtocol, dcutr, identify, kad, mdns, relay, request_response, upnp};
+use libp2p::{
+    StreamProtocol, connection_limits, dcutr, identify, kad, mdns, relay, request_response, upnp,
+};
 
 use crate::codec::GaggleCodec;
 use crate::proto::PROTOCOL;
@@ -50,33 +53,60 @@ pub(crate) fn chunk_exchange() -> request_response::Behaviour<GaggleCodec> {
 /// The stock relay defaults cap a circuit at 128 KiB / 2 minutes — fine for
 /// hole-punch signalling but far too tight for pulling chunks through the relay
 /// as a fallback. An accelerator's whole job is to carry that traffic, so lift
-/// the byte cap and stretch the durations.
+/// the per-circuit byte cap (a 100 GB share stitched through the relay while
+/// dcutr keeps failing to upgrade must not hit a wall) and stretch the
+/// durations.
 ///
-/// The defaults also throttle *how often* a peer may open a reservation/circuit
-/// at all: a per-peer token bucket of 30, refilling at just one token every 2
-/// minutes once drained. That's sized for a public, untrusted relay — on our
-/// private accelerator it means any firewalled peer leaning on relay fallback
-/// (exactly the case it exists for) burns the burst in seconds and then gets a
-/// "resource limit exceeded" on nearly every subsequent dial. Drop those rate
-/// limiters entirely; `max_circuits(_per_peer)` / `max_reservations(_per_peer)`
-/// below are the real ceiling.
+/// The stock *rate* limiters, though, are the only thing keeping an
+/// unauthenticated relay from being an open, unmetered transit for anyone who
+/// learns its address — 512 concurrent circuits, an hour each, no per-source
+/// bound. The defaults (a 30-token burst refilling one per 2 minutes) are just
+/// too tight: a firewalled peer leaning on relay fallback — exactly the case
+/// this exists for — drains the burst in seconds and then gets "resource limit
+/// exceeded" on nearly every dial. So keep rate limiting, but sized for real
+/// Gaggle use: a downloader opens on the order of one circuit per relayed
+/// source, holds a reservation for the session, and reconnects a handful of
+/// times. These per-IP / per-peer buckets are generous for that and still cap
+/// a flood well under `max_circuits`.
 fn relay_config() -> relay::Config {
+    let per_min = |n: u32| NonZeroU32::new(n).expect("non-zero");
+    let minute = Duration::from_secs(60);
     relay::Config {
-        max_circuit_bytes: 0, // unlimited
+        max_circuit_bytes: 0, // unlimited — see above
         max_circuit_duration: Duration::from_secs(60 * 60),
         reservation_duration: Duration::from_secs(60 * 60),
         max_circuits: 512,
-        max_circuits_per_peer: 64,
+        max_circuits_per_peer: 16,
         max_reservations: 1024,
-        max_reservations_per_peer: 16,
+        max_reservations_per_peer: 8,
         reservation_rate_limiters: Vec::new(),
         circuit_src_rate_limiters: Vec::new(),
-        ..relay::Config::default()
     }
+    .reservation_rate_per_ip(per_min(60), minute)
+    .reservation_rate_per_peer(per_min(30), minute)
+    .circuit_src_per_ip(per_min(60), minute)
+    .circuit_src_per_peer(per_min(30), minute)
 }
 
 fn kademlia(peer: libp2p::PeerId, config: kad::Config) -> kad::Behaviour<MemoryStore> {
     kad::Behaviour::with_config(peer, MemoryStore::new(peer), config)
+}
+
+/// A backstop against connection floods from an unauthenticated peer. Caps only
+/// the two unambiguous abuse signals — half-open inbound connections, and how
+/// many established connections a *single* peer may hold — and leaves the total
+/// inbound count generous so a genuinely popular share isn't throttled. Every
+/// request still costs the serving loop work, so this pairs with the memoized
+/// inventory in [`crate::Catalog`] and the relay rate limiters above.
+///
+/// `per_peer` is higher for the relay role, where a single peer legitimately
+/// holds one connection per relay circuit it opens (see `max_circuits_per_peer`
+/// in [`relay_config`]).
+fn connection_limits(per_peer: u32) -> connection_limits::Behaviour {
+    let limits = connection_limits::ConnectionLimits::default()
+        .with_max_pending_incoming(Some(256))
+        .with_max_established_per_peer(Some(per_peer));
+    connection_limits::Behaviour::new(limits)
 }
 
 fn identify(key: &Keypair) -> identify::Behaviour {
@@ -89,6 +119,7 @@ fn identify(key: &Keypair) -> identify::Behaviour {
 /// Behaviour for a standard peer.
 #[derive(NetworkBehaviour)]
 pub(crate) struct PeerBehaviour {
+    pub connection_limits: connection_limits::Behaviour,
     pub chunk_exchange: request_response::Behaviour<GaggleCodec>,
     pub kademlia: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
@@ -107,6 +138,7 @@ impl PeerBehaviour {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let peer = key.public().to_peer_id();
         Ok(Self {
+            connection_limits: connection_limits(16),
             chunk_exchange: chunk_exchange(),
             kademlia: kademlia(peer, kad::Config::new(KAD_PROTOCOL)),
             identify: identify(key),
@@ -121,6 +153,7 @@ impl PeerBehaviour {
 /// Behaviour for an accelerator acting as relay + bootstrap + hot-chunk cache.
 #[derive(NetworkBehaviour)]
 pub(crate) struct RelayBehaviour {
+    pub connection_limits: connection_limits::Behaviour,
     pub relay: relay::Behaviour,
     pub kademlia: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
@@ -139,6 +172,9 @@ impl RelayBehaviour {
         // A bootstrap node answers queries from the start.
         kademlia.set_mode(Some(kad::Mode::Server));
         Self {
+            // Above `max_circuits_per_peer` (16) plus the peer's own direct +
+            // reservation connections and dcutr's transient upgrade sockets.
+            connection_limits: connection_limits(96),
             relay: relay::Behaviour::new(peer, relay_config()),
             kademlia,
             identify: identify(key),

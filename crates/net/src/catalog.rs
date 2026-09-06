@@ -1,6 +1,7 @@
 //! [`Catalog`] — everything the serving side of a share can answer with.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gaggle_core::{ChunkList, ChunkStore, Hash, Manifest, Scope};
@@ -45,6 +46,15 @@ pub struct Catalog {
     /// signal the Stats view samples.
     bytes_served: AtomicU64,
     chunks_served: AtomicU64,
+    /// Memoized full (`Scope::All`) inventory, tagged with the `store.len()` it
+    /// was computed at. Rebuilding it is `O(chunks)` — for a 100 GB share that
+    /// is a million-plus hashes into a `BTreeSet` — and it runs inline on the
+    /// libp2p event loop, so an unauthenticated peer spamming
+    /// [`Request::GetInventory`] against a large public share would otherwise
+    /// burn the seeder's CPU and stall every other connection. `store.len()` is
+    /// cheap and only grows while a replica fills, so keying on it recomputes
+    /// exactly when the answer can have changed.
+    inventory_cache: Mutex<Option<(usize, Vec<Hash>)>>,
 }
 
 impl Catalog {
@@ -81,6 +91,7 @@ impl Catalog {
             store: Box::new(store),
             bytes_served: AtomicU64::new(0),
             chunks_served: AtomicU64::new(0),
+            inventory_cache: Mutex::new(None),
         }
     }
 
@@ -100,9 +111,19 @@ impl Catalog {
 
     /// The chunk hashes this catalog can actually serve: every chunk referenced
     /// by the share that is present in the store, de-duplicated. This is the
-    /// answer to [`Request::GetInventory`].
+    /// answer to [`Request::GetInventory`]. Memoized against `store.len()` — see
+    /// [`inventory_cache`](Self#structfield.inventory_cache).
     pub fn inventory(&self) -> Vec<Hash> {
-        self.inventory_scoped(&Scope::All)
+        let len = self.store.len();
+        let mut cache = self.inventory_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_len, hashes)) = cache.as_ref()
+            && *cached_len == len
+        {
+            return hashes.clone();
+        }
+        let hashes = self.inventory_scoped(&Scope::All);
+        *cache = Some((len, hashes.clone()));
+        hashes
     }
 
     /// [`inventory`](Self::inventory) restricted to chunks that belong to a file

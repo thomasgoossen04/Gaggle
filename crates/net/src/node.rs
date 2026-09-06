@@ -30,7 +30,7 @@ use crate::swarm::{
     fetch_share_from_swarm_with_progress,
 };
 use crate::transfer::{DownloadedShare, fetch_manifest_and_lists, fetch_share};
-use crate::{LISTEN_QUIC, ShareKey, build_peer_swarm};
+use crate::{LISTEN_QUIC, ShareKey};
 
 /// Something worth telling the caller about that is not a direct reply to a
 /// command.
@@ -96,6 +96,10 @@ fn unix_now() -> u64 {
 pub struct Node {
     commands: Option<mpsc::Sender<Command>>,
     peer_id: PeerId,
+    /// The 32-byte Ed25519 seed of this node's libp2p identity, kept so the
+    /// node can sign things off the swarm task (e.g. a seeder-tracker announce)
+    /// without reaching into the swarm. Never leaves the process.
+    identity_seed: [u8; 32],
     events: broadcast::Sender<NodeEvent>,
     task: Option<JoinHandle<()>>,
 }
@@ -153,10 +157,10 @@ impl Node {
         keypair: Option<crate::Keypair>,
         listen: Option<Multiaddr>,
     ) -> anyhow::Result<Self> {
-        let mut swarm = match keypair {
-            Some(kp) => crate::build_peer_swarm_with(kp)?,
-            None => build_peer_swarm()?,
-        };
+        let keypair = keypair.unwrap_or_else(crate::Keypair::generate_ed25519);
+        let identity_seed = crate::identity_seed(&keypair)
+            .map_err(|_| anyhow::anyhow!("a Gaggle node needs an Ed25519 identity"))?;
+        let mut swarm = crate::build_peer_swarm_with(keypair)?;
         let peer_id = *swarm.local_peer_id();
         match listen {
             Some(addr) => swarm.listen_on(addr)?,
@@ -184,7 +188,26 @@ impl Node {
             EventLoop::new(swarm, catalog, commands_rx, loop_events).run().await;
         });
 
-        Ok(Self { commands: Some(commands_tx), peer_id, events: events_tx, task: Some(task) })
+        Ok(Self {
+            commands: Some(commands_tx),
+            peer_id,
+            identity_seed,
+            events: events_tx,
+            task: Some(task),
+        })
+    }
+
+    /// Sign `msg` with this node's libp2p Ed25519 identity key. The 64-byte
+    /// signature verifies against the public key embedded in
+    /// [`peer_id`](Self::peer_id) (Gaggle identities are Ed25519, so the peer id
+    /// is an identity multihash of the key). Used to prove to the seeder
+    /// tracker that an announce really comes from this peer.
+    pub fn sign_identity(&self, msg: &[u8]) -> [u8; 64] {
+        crate::keypair_from_seed(self.identity_seed)
+            .sign(msg)
+            .expect("Ed25519 signing is infallible")
+            .try_into()
+            .expect("an Ed25519 signature is 64 bytes")
     }
 
     pub fn peer_id(&self) -> PeerId {

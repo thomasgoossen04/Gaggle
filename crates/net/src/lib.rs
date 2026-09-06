@@ -139,10 +139,6 @@ impl ShareKey {
     }
 }
 
-pub(crate) fn build_peer_swarm() -> anyhow::Result<Swarm<PeerBehaviour>> {
-    build_peer_swarm_with(Keypair::generate_ed25519())
-}
-
 pub(crate) fn build_peer_swarm_with(keypair: Keypair) -> anyhow::Result<Swarm<PeerBehaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -152,10 +148,6 @@ pub(crate) fn build_peer_swarm_with(keypair: Keypair) -> anyhow::Result<Swarm<Pe
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
     Ok(swarm)
-}
-
-pub(crate) fn build_relay_swarm() -> anyhow::Result<Swarm<RelayBehaviour>> {
-    build_relay_swarm_with(Keypair::generate_ed25519())
 }
 
 pub(crate) fn build_relay_swarm_with(keypair: Keypair) -> anyhow::Result<Swarm<RelayBehaviour>> {

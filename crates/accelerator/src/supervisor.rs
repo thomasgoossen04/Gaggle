@@ -102,6 +102,11 @@ impl ShareRecord {
     }
 }
 
+// One `Backend` per daemon, held for the whole process lifetime — the
+// stack-vs-heap size gap the lint flags (widened slightly when `Node` /
+// `RelayNode` gained an inline identity seed for signing tracker announces)
+// is not worth a `Box` indirection here.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Relay { relay: RelayNode, meta_node: Node, listen_addrs: Vec<String> },
     Nas { dir_root: PathBuf, compress: bool },
@@ -330,7 +335,15 @@ impl Supervisor {
                 for (id, record) in &self.shares {
                     if matches!(record, ShareRecord::Ready { .. }) {
                         let (name, private) = link_meta(record.token());
-                        self.announce_one(remote.as_ref(), id, &me, name.as_deref(), private).await;
+                        self.announce_one(
+                            remote.as_ref(),
+                            id,
+                            &me,
+                            name.as_deref(),
+                            private,
+                            |m| relay.sign_identity(m),
+                        )
+                        .await;
                     }
                 }
             }
@@ -356,6 +369,7 @@ impl Supervisor {
                         &peer_info(node.peer_id().to_string(), &addrs),
                         name.as_deref(),
                         private,
+                        |m| node.sign_identity(m),
                     )
                     .await;
                 }
@@ -374,7 +388,10 @@ impl Supervisor {
         me: &PeerInfo,
         name: Option<&str>,
         private: bool,
+        sign: impl Fn(&[u8]) -> [u8; 64],
     ) {
+        // In-process registry: trusted same-machine path, no signature needed
+        // (only the inbound HTTP `POST /tracker/{id}` is an attack surface).
         self.tracker.announce_with_meta(
             &id.to_hex(),
             me.clone(),
@@ -394,7 +411,9 @@ impl Supervisor {
                     .collect(),
             };
             if !far.addrs.is_empty() {
-                let _ = client.announce_share(&id.to_hex(), &far, name, private).await;
+                // The external tracker verifies this against the key `far.peer_id`
+                // embeds.
+                let _ = client.announce_share(&id.to_hex(), &far, name, private, sign).await;
             }
         }
     }

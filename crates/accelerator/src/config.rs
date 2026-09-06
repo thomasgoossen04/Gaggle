@@ -163,13 +163,16 @@ impl AcceleratorConfig {
         }
     }
 
-    /// Write to `path` (pretty TOML), creating parent directories.
+    /// Write to `path` (pretty TOML), creating parent directories. Written
+    /// `0600` on unix: `shares` can carry private-share capability tokens, so
+    /// the file gets the same protection as `identity.key` beside it.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        write_private(path, text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 
@@ -200,5 +203,27 @@ impl AcceleratorConfig {
                     .with_context(|| format!("bad authorized key {k:?}"))
             })
             .collect()
+    }
+}
+
+/// Write `bytes` to `path`, `0600` on unix (re-tightened even if the file
+/// already existed with looser permissions).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
     }
 }

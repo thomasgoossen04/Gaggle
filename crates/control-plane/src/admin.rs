@@ -77,7 +77,9 @@ pub fn normalize_base(input: &str) -> String {
     }
 }
 
-/// The bytes an operator signs / a daemon verifies for one request.
+/// The bytes an operator signs / a daemon verifies for one request. `path`
+/// carries the full path **and query string** (`/admin/shares/x?keep_data=1`),
+/// so every request parameter is inside the signature.
 fn canonical(method: &str, path: &str, ts: &str, nonce: &str, body: &[u8]) -> Vec<u8> {
     let body_hash = Hash::of(body).to_hex();
     format!("gaggle-admin\n{method}\n{path}\n{ts}\n{nonce}\n{body_hash}").into_bytes()
@@ -340,10 +342,19 @@ async fn auth_and_sign(State(state): State<AdminState>, req: Request, next: Next
         Err(_) => return (StatusCode::BAD_REQUEST, "request body too large").into_response(),
     };
 
+    // Sign over path *and* query — otherwise `?keep_data=…` on
+    // `DELETE /admin/shares/{id}` (which flips whether a NAS replica's bytes are
+    // kept or deleted) rides unsigned and an on-path attacker could add or strip
+    // it.
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| parts.uri.path());
     if let Err((code, msg)) = verify_request(
         &state,
         parts.method.as_str(),
-        parts.uri.path(),
+        path_and_query,
         &parts.headers,
         &bytes,
     ) {
@@ -519,13 +530,14 @@ impl AdminClient {
         let mut nonce = [0u8; 12];
         getrandom::getrandom(&mut nonce).expect("system RNG unavailable");
         let nonce = b64(&nonce);
-        // Signed over the bare path only — the daemon verifies against
-        // `uri.path()`, which excludes the query string.
-        let sig = self.operator.sign(&canonical(method, path, &ts, &nonce, &body));
+        // Signed over path + query together — the daemon verifies against
+        // `uri.path_and_query()`, so `?keep_data=…` is covered by the signature.
+        let signed_path = format!("{path}{query}");
+        let sig = self.operator.sign(&canonical(method, &signed_path, &ts, &nonce, &body));
         let agent_hex = self.operator.public().to_hex();
         let sig_b64 = b64(&sig.to_bytes());
 
-        let url = format!("{}{path}{query}", self.base);
+        let url = format!("{}{signed_path}", self.base);
         let headers = [
             (H_AGENT, agent_hex.as_str()),
             (H_TIMESTAMP, ts.as_str()),

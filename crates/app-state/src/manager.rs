@@ -668,18 +668,21 @@ fn load_or_create_operator(config_path: Option<&std::path::Path>) -> AgentKeypai
     kp
 }
 
-/// Write secret bytes to a freshly created file, `0600` on unix.
+/// Write secret bytes to `path`, `0600` on unix — including when `path` already
+/// exists with looser permissions (the `mode()` on `OpenOptions` only lands on
+/// creation, so re-tighten explicitly afterwards).
 fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         f.write_all(bytes)
     }
     #[cfg(not(unix))]
@@ -2646,7 +2649,11 @@ impl Manager {
         }
         match serde_json::to_vec_pretty(&persisted) {
             Ok(bytes) => {
-                if let Err(e) = std::fs::write(&path, bytes) {
+                // `shares.json` holds private-share signing seeds and invite
+                // credentials — as sensitive as `operator.key` next to it, so
+                // it gets the same `0600` treatment, not a world-readable
+                // `fs::write`.
+                if let Err(e) = write_secret_file(&path, &bytes) {
                     tracing::warn!(path = %path.display(), error = %e, "could not save persisted shares");
                 }
             }
@@ -2751,7 +2758,9 @@ async fn announce_to_tracker(
             peer_id: node.peer_id().to_string(),
             addrs: addrs.iter().map(Multiaddr::to_string).collect(),
         };
-        let _ = client.announce_share(&id.to_hex(), &me, Some(&name), private).await;
+        let _ = client
+            .announce_share(&id.to_hex(), &me, Some(&name), private, |m| node.sign_identity(m))
+            .await;
     }
     if let Some(relay) = relay {
         let (Ok(mut addrs), Ok(shares)) = (relay.reachable_addrs().await, relay.shares().await)
@@ -2772,7 +2781,9 @@ async fn announce_to_tracker(
                 .find(|(h, _, _)| *h == id)
                 .map(|(_, n, p)| (n.clone(), *p))
                 .unwrap_or_default();
-            let _ = client.announce_share(&id.to_hex(), &me, Some(&name), private).await;
+            let _ = client
+                .announce_share(&id.to_hex(), &me, Some(&name), private, |m| relay.sign_identity(m))
+                .await;
         }
     }
 }
