@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use control_plane::admin::{AdminCommand, DaemonStatus, ReplicationProgress, ShareStatus};
-use control_plane::{PeerInfo, TrackerRegistry};
+use control_plane::{PeerInfo, RendezvousClient, TrackerClient, TrackerRegistry};
 use gaggle_core::{AgentKeypair, Hash};
 use net::accel::{ShareMeta, nas_add_share_with_progress, relay_add_share};
 use net::{Keypair, Multiaddr, Node, RelayConfig, RelayNode, ShareLink, SwarmProgress};
@@ -39,6 +39,29 @@ const PROGRESS_THROTTLE: Duration = Duration::from_millis(500);
 /// under `control_plane::tracker`'s entry TTL.
 const TRACKER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often the daemon checks the external rendezvous point (when
+/// `config.rendezvous_url` is set) for subscribers waiting to NAT-punch
+/// through to one of its served shares. Short — a subscriber only waits a
+/// few seconds for the answer before falling back to the share link.
+const RENDEZVOUS_ANSWER_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Upper bound on one rendezvous-answer sweep (and on each per-share request
+/// within it), so a slow/hung rendezvous server can never wedge the command
+/// loop — status still flows over its own `watch` channel regardless, and
+/// the next sweep retries in [`RENDEZVOUS_ANSWER_INTERVAL`].
+const RENDEZVOUS_SWEEP_TIMEOUT: Duration = Duration::from_secs(3);
+const RENDEZVOUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cap on one punch-dial. Its job is just to get the outbound packet out
+/// (which happens the moment the dial is issued) — a dead subscriber address
+/// must not stall the sweep waiting for a connection that will never form.
+const PUNCH_DIAL_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// Cap on reserving a circuit on `config.public_relay` when a NAS replica
+/// comes up — an unreachable relay must not hold the share short of `Ready`
+/// (it still serves on its own listen addresses without a circuit).
+const RELAY_RESERVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// A share the daemon is accelerating, or in the middle of adding.
 enum ShareRecord {
     /// NAS role only: replication under way in the background.
@@ -56,6 +79,11 @@ enum ShareRecord {
         node: Option<Node>,
         replica_chunks: Option<usize>,
         listen_addr: Option<String>,
+        /// NAS role: a `/p2p-circuit/…` address reserved on `config.public_relay`,
+        /// advertised alongside the node's own listen addresses so a NAT'd
+        /// replica is still reachable. `None` when no relay is configured or
+        /// the reservation failed.
+        circuit_addr: Option<String>,
     },
     /// An operator paused this share: the token stays in config and (NAS) the
     /// replica stays on disk, but nothing serves it until it is resumed.
@@ -85,9 +113,12 @@ enum ShareEvent {
     Ready {
         manifest_id: Hash,
         meta: ShareMeta,
-        node: Node,
+        // Boxed: much larger than the other variants, and it only moves
+        // through the channel once per share.
+        node: Box<Node>,
         chunks: usize,
         listen_addr: Option<String>,
+        circuit_addr: Option<String>,
         ack: oneshot::Sender<Result<(), String>>,
     },
     Failed { manifest_id: Hash, error: String, ack: oneshot::Sender<Result<(), String>> },
@@ -197,6 +228,8 @@ impl Supervisor {
     pub async fn run(mut self, mut commands: mpsc::Receiver<AdminCommand>) {
         let mut announce = tokio::time::interval(TRACKER_ANNOUNCE_INTERVAL);
         announce.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut punch = tokio::time::interval(RENDEZVOUS_ANSWER_INTERVAL);
+        punch.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 cmd = commands.recv() => {
@@ -233,16 +266,60 @@ impl Supervisor {
                     self.publish();
                     self.announce_to_tracker().await;
                 }
+                _ = punch.tick() => {
+                    let _ = tokio::time::timeout(
+                        RENDEZVOUS_SWEEP_TIMEOUT,
+                        self.answer_rendezvous(),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Answer NAT-rendezvous punch requests aimed at any share this daemon
+    /// serves, via the external accelerator in `config.rendezvous_url`. NAS
+    /// role only — a relay is a libp2p relay server, expected to be publicly
+    /// reachable already. Silent on error: this is a best-effort optimization
+    /// on top of the addresses already in the share link / tracker.
+    async fn answer_rendezvous(&self) {
+        let Some(url) = self.config.rendezvous_url.as_deref() else { return };
+        if !matches!(self.backend, Backend::Nas { .. }) {
+            return;
+        }
+        let ready = self
+            .shares
+            .values()
+            .any(|r| matches!(r, ShareRecord::Ready { node: Some(_), .. }));
+        if !ready {
+            return;
+        }
+        let client = RendezvousClient::new(url);
+        for record in self.shares.values() {
+            let ShareRecord::Ready { node: Some(node), circuit_addr, .. } = record else { continue };
+            match tokio::time::timeout(
+                RENDEZVOUS_REQUEST_TIMEOUT,
+                answer_punch_requests(&client, node, circuit_addr.as_deref()),
+            )
+            .await
+            {
+                Ok(Err(e)) => tracing::debug!(error = %format!("{e:#}"), "rendezvous answer failed"),
+                Err(_) => tracing::debug!("rendezvous answer timed out"),
+                Ok(Ok(())) => {}
             }
         }
     }
 
     /// (Re-)publish every ready share to the seeder tracker so a downloader
-    /// pointed at this daemon's control-plane URL discovers it as a source,
-    /// not only whatever address is in its share link. Best-effort: the
-    /// registry is in-process, so this can't fail, but a share with no
-    /// reachable address yet is simply skipped until it has one.
+    /// discovers it as a source, not only whatever address is in its share
+    /// link. Always announces to this daemon's own in-process tracker (a
+    /// downloader pointed straight at this daemon); when `config.rendezvous_url`
+    /// is set, also announces over HTTP to that *external* accelerator's
+    /// tracker, so a downloader pointed at a public relay finds this
+    /// (possibly private / NAT'd) daemon too. Best-effort — a share with no
+    /// reachable address yet is skipped until it has one.
     async fn announce_to_tracker(&self) {
+        let remote = self.config.rendezvous_url.as_deref().map(TrackerClient::new);
         match &self.backend {
             Backend::Relay { relay, .. } => {
                 let addrs = relay.reachable_addrs().await.unwrap_or_default();
@@ -252,21 +329,38 @@ impl Supervisor {
                 let me = peer_info(relay.peer_id().to_string(), &addrs);
                 for (id, record) in &self.shares {
                     if matches!(record, ShareRecord::Ready { .. }) {
-                        self.tracker.announce(&id.to_hex(), me.clone());
+                        self.announce_one(remote.as_ref(), id, &me).await;
                     }
                 }
             }
             Backend::Nas { .. } => {
                 for (id, record) in &self.shares {
-                    let ShareRecord::Ready { node: Some(node), .. } = record else { continue };
-                    let addrs = node.reachable_addrs().await.unwrap_or_default();
+                    let ShareRecord::Ready { node: Some(node), circuit_addr, .. } = record else {
+                        continue;
+                    };
+                    let mut addrs = node.reachable_addrs().await.unwrap_or_default();
+                    if let Some(circuit) =
+                        circuit_addr.as_deref().and_then(|s| s.parse::<Multiaddr>().ok())
+                        && !addrs.contains(&circuit)
+                    {
+                        addrs.push(circuit);
+                    }
                     if addrs.is_empty() {
                         continue;
                     }
-                    self.tracker
-                        .announce(&id.to_hex(), peer_info(node.peer_id().to_string(), &addrs));
+                    self.announce_one(remote.as_ref(), id, &peer_info(node.peer_id().to_string(), &addrs))
+                        .await;
                 }
             }
+        }
+    }
+
+    /// Announce one share/`PeerInfo` pair to the in-process tracker and, when
+    /// configured, the external one.
+    async fn announce_one(&self, remote: Option<&TrackerClient>, id: &Hash, me: &PeerInfo) {
+        self.tracker.announce(&id.to_hex(), me.clone());
+        if let Some(client) = remote {
+            let _ = client.announce(&id.to_hex(), me).await;
         }
     }
 
@@ -294,7 +388,14 @@ impl Supervisor {
                     tracing::info!(share = %meta.manifest_id, name = %meta.name, files = meta.files, "accelerating share");
                     self.shares.insert(
                         link.manifest_id,
-                        ShareRecord::Ready { token, meta, node: None, replica_chunks: None, listen_addr: None },
+                        ShareRecord::Ready {
+                            token,
+                            meta,
+                            node: None,
+                            replica_chunks: None,
+                            listen_addr: None,
+                            circuit_addr: None,
+                        },
                     );
                     self.persist();
                     let _ = ack.send(Ok(()));
@@ -317,6 +418,7 @@ impl Supervisor {
                 let manifest_id = link.manifest_id;
                 let name_hint = link.name.clone();
                 let events_tx = self.events_tx.clone();
+                let public_relay = self.config.public_relay.clone();
 
                 let task = tokio::spawn(async move {
                     let mut last_sent = Instant::now()
@@ -342,8 +444,45 @@ impl Supervisor {
                     match result {
                         Ok((node, meta, chunks)) => {
                             let listen_addr = node.listen_addr().await.ok().map(|a| a.to_string());
+                            // Reserve a circuit on the configured relay so a
+                            // NAT'd replica is dialable through it (dcutr then
+                            // upgrades to direct). Best-effort — a share still
+                            // serves on its listen addresses without it.
+                            let circuit_addr = match &public_relay {
+                                Some(relay_addr) => match tokio::time::timeout(
+                                    RELAY_RESERVE_TIMEOUT,
+                                    reserve_relay_circuit(&node, relay_addr),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(c)) => Some(c.to_string()),
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(
+                                            share = %manifest_id, error = %format!("{e:#}"),
+                                            "NAS replica could not reserve a relay circuit"
+                                        );
+                                        None
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            share = %manifest_id,
+                                            "NAS replica relay-circuit reservation timed out"
+                                        );
+                                        None
+                                    }
+                                },
+                                None => None,
+                            };
                             let _ = events_tx
-                                .send(ShareEvent::Ready { manifest_id, meta, node, chunks, listen_addr, ack })
+                                .send(ShareEvent::Ready {
+                                    manifest_id,
+                                    meta,
+                                    node: Box::new(node),
+                                    chunks,
+                                    listen_addr,
+                                    circuit_addr,
+                                    ack,
+                                })
                                 .await;
                         }
                         Err(e) => {
@@ -371,7 +510,7 @@ impl Supervisor {
                     *p = Some(progress);
                 }
             }
-            ShareEvent::Ready { manifest_id, meta, node, chunks, listen_addr, ack } => {
+            ShareEvent::Ready { manifest_id, meta, node, chunks, listen_addr, circuit_addr, ack } => {
                 // Paused while its replication was still running: keep the
                 // fresh replica on disk but don't start serving it.
                 if let Some(ShareRecord::Paused { .. }) = self.shares.get(&manifest_id) {
@@ -387,9 +526,10 @@ impl Supervisor {
                     ShareRecord::Ready {
                         token,
                         meta,
-                        node: Some(node),
+                        node: Some(*node),
                         replica_chunks: Some(chunks),
                         listen_addr,
+                        circuit_addr,
                     },
                 );
                 let _ = ack.send(Ok(()));
@@ -686,6 +826,62 @@ fn dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
 /// addresses.
 fn peer_info(peer_id: String, addrs: &[Multiaddr]) -> PeerInfo {
     PeerInfo { peer_id, addrs: addrs.iter().map(Multiaddr::to_string).collect() }
+}
+
+/// Dial the relay at `relay_addr` (a `…/p2p/<id>` multiaddr), reserve a
+/// circuit slot, and return the resulting `/p2p-circuit/…/p2p/<self>`
+/// address — dialable by a downloader even when `node` sits behind a NAT
+/// with no shared network path, with dcutr opportunistically upgrading to a
+/// direct connection once both ends have connected through the relay.
+async fn reserve_relay_circuit(node: &Node, relay_addr: &str) -> anyhow::Result<Multiaddr> {
+    let addr: Multiaddr = relay_addr.trim().parse()?;
+    // `bootstrap` dials the relay (blocking until the connection is live — the
+    // reservation needs one) and joins its DHT, so the replica also becomes
+    // discoverable through the relay's bootstrap role.
+    let relay = node.bootstrap(addr.clone()).await?;
+    let circuit = node.reserve_relay_slot(relay, addr).await?;
+    tracing::info!(%relay, %circuit, "NAS replica reserved a relay circuit");
+    Ok(circuit)
+}
+
+/// Origin side of the NAT-rendezvous handshake for one served share: check
+/// whether any subscriber is waiting for `node` to show up, publish `node`'s
+/// current addresses (plus its relay circuit, if any) as the answer, then
+/// dial each subscriber's candidates — that outbound dial is this side's
+/// half of the punch, opening the pinhole for their inbound one. Answering
+/// happens *before* the dials so a slow/dead punch dial never delays the
+/// subscriber seeing the answer.
+async fn answer_punch_requests(
+    client: &RendezvousClient,
+    node: &Node,
+    circuit_addr: Option<&str>,
+) -> anyhow::Result<()> {
+    let my_id = node.peer_id().to_string();
+    let pending = client.pending(&my_id).await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut addrs: Vec<String> =
+        node.reachable_addrs().await?.iter().map(Multiaddr::to_string).collect();
+    if let Some(circuit) = circuit_addr
+        && !addrs.iter().any(|a| a == circuit)
+    {
+        addrs.push(circuit.to_string());
+    }
+    let me = PeerInfo { peer_id: my_id.clone(), addrs };
+
+    for req in pending {
+        if let Err(e) = client.answer(&my_id, &req.request_id, &me).await {
+            tracing::debug!(error = %format!("{e:#}"), "rendezvous answer failed");
+            continue;
+        }
+        for addr in &req.subscriber.addrs {
+            if let Ok(addr) = addr.parse::<Multiaddr>() {
+                let _ = tokio::time::timeout(PUNCH_DIAL_TIMEOUT, node.bootstrap(addr)).await;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Deterministic per-share identity seed: `blake3(daemon-seed ++ manifest-id)`.

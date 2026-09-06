@@ -86,6 +86,17 @@ struct RunArgs {
     /// to go back to serving both on --admin-listen.
     #[arg(long)]
     rendezvous_listen: Option<String>,
+    /// External accelerator control-plane URL (e.g. https://relay.example:8749)
+    /// whose rendezvous + seeder tracker this daemon uses as a client:
+    /// answers NAT punches for its shares and announces them there so
+    /// downloaders pointed at that accelerator discover this daemon. Point it
+    /// at the same accelerator the downloaders use. Empty string clears it.
+    #[arg(long)]
+    rendezvous_url: Option<String>,
+    /// Relay …/p2p/<id> multiaddr a NAS replica reserves a circuit slot on so
+    /// a NAT'd replica is reachable through the relay. Empty string clears it.
+    #[arg(long)]
+    public_relay: Option<String>,
     /// Multiaddr to listen on, e.g. /ip4/0.0.0.0/udp/4001/quic-v1.
     #[arg(long)]
     listen: Option<String>,
@@ -116,6 +127,8 @@ async fn main() -> anyhow::Result<()> {
                     compress_replica: if args.no_compress_replica { Some(false) } else { None },
                     admin_listen: args.admin_listen,
                     rendezvous_listen: args.rendezvous_listen,
+                    rendezvous_url: args.rendezvous_url,
+                    public_relay: args.public_relay,
                     listen: args.listen,
                 },
             )

@@ -2605,23 +2605,30 @@ async fn run_download(
 
     let work = async move {
         let mut req = req;
-        if let Some(url) = rendezvous_url.as_deref()
-            && let Some(origin) = req.sources.iter().find_map(peer_id_of)
-        {
-            report_stage(&tx, &work_activity, id, "trying a direct NAT punch…");
-            if let Ok(extra) = punch_via_rendezvous(node, url, origin).await {
-                for addr in extra {
-                    if !req.sources.contains(&addr) {
-                        req.sources.push(addr);
+        // Ask the accelerator's seeder tracker for any *other* peers serving
+        // this share (a NAS replica, a second origin) and swarm across them
+        // all, not just the address in the link. Done *before* the NAT punch
+        // so the punch can target those discovered peers too — a NAS replica
+        // behind its own NAT is exactly the case a share link never names.
+        if let Some(url) = rendezvous_url.as_deref() {
+            merge_tracked_sources(url, req.manifest_id, &mut req.sources).await;
+        }
+        if let Some(url) = rendezvous_url.as_deref() {
+            let mut punched: Vec<PeerId> = Vec::new();
+            for peer in req.sources.iter().filter_map(peer_id_of).collect::<Vec<_>>() {
+                if punched.contains(&peer) {
+                    continue;
+                }
+                punched.push(peer);
+                report_stage(&tx, &work_activity, id, "trying a direct NAT punch…");
+                if let Ok(extra) = punch_via_rendezvous(node, url, peer).await {
+                    for addr in extra {
+                        if !req.sources.contains(&addr) {
+                            req.sources.push(addr);
+                        }
                     }
                 }
             }
-        }
-        // Ask the accelerator's seeder tracker for any *other* peers serving
-        // this share (a NAS replica, a second origin) and swarm across them
-        // all, not just the address in the link.
-        if let Some(url) = rendezvous_url.as_deref() {
-            merge_tracked_sources(url, req.manifest_id, &mut req.sources).await;
         }
         report_stage(
             &tx,

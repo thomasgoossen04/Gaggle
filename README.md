@@ -255,6 +255,28 @@ share link only ever carried the origin's address. No chunk data or share secret
 the tracker — it only exchanges peer ids and addresses, and every chunk is still verified
 against the manifest.
 
+**Making a headless NAS reachable from outside its own network.** A standalone
+`accelerator` daemon *hosts* those rendezvous/tracker endpoints for others but, by
+default, never registers *itself* with any — so a NAS replica reachable only over a VPN
+(Tailscale, no port-forward) can't be downloaded from a device that isn't on that VPN,
+even with a public relay running. Give the daemon the other two flags so it acts as a
+*client* of a public accelerator too:
+
+```bash
+cargo run -p accelerator -- run --role nas \
+  --rendezvous-url https://relay.example:8749 \
+  --public-relay /ip4/203.0.113.4/udp/4001/quic-v1/p2p/12D3Koo…relay
+```
+
+`--rendezvous-url` (point it at the same accelerator your downloaders use as their
+Rendezvous URL — usually the public relay) makes the daemon answer NAT punches for its
+shares and announce them to that accelerator's tracker over HTTP, so a downloader pointed
+at the relay discovers the NAS. `--public-relay` makes each NAS replica reserve a relay
+circuit on boot and advertise it, so the replica is dialable through the relay while
+`dcutr` tries to upgrade to a direct connection. Both persist to `config.toml`; pass an
+empty string to clear either. A relay-role daemon only needs `--rendezvous-url` (it's
+already a relay server, assumed publicly reachable).
+
 ### Watch throughput
 
 The **Stats** tab graphs download and upload speed over time. Pick a window with the

@@ -87,6 +87,27 @@ pub struct AcceleratorConfig {
     /// tunnel) while rendezvous sits on a publicly reachable one. `None`
     /// (the default) serves both on `admin_listen`, as before this existed.
     pub rendezvous_listen: Option<String>,
+    /// An *external* accelerator's control-plane base URL (e.g.
+    /// `https://relay.example:8749`) whose unauthenticated rendezvous + seeder
+    /// tracker this daemon uses as a **client**:
+    ///
+    /// * it answers NAT-rendezvous punch requests aimed at the shares it
+    ///   serves (NAS role — a relay is expected to be publicly reachable
+    ///   already), and
+    /// * it announces every ready share to that tracker over HTTP,
+    ///
+    /// so a downloader pointed at the same accelerator discovers this daemon
+    /// as a source even when no address for it is in the share link. Point it
+    /// at the same accelerator the downloading peers use as their
+    /// `rendezvous_url`. `None` skips both.
+    pub rendezvous_url: Option<String>,
+    /// A relay's dialable `…/p2p/<id>` multiaddr. NAS role: every serving node
+    /// reserves a circuit slot on it and advertises the resulting
+    /// `/p2p-circuit/…` address (via the tracker in `rendezvous_url`), so a
+    /// NAT'd replica with no shared network path to a downloader is still
+    /// reachable through the relay — dcutr then upgrades to a direct
+    /// hole-punch opportunistically. `None` skips it.
+    pub public_relay: Option<String>,
     /// Relay role: hot-chunk cache budget in MiB.
     pub cache_mib: u64,
     /// NAS role: replica root. Relative paths resolve under the home dir.
@@ -114,6 +135,8 @@ impl Default for AcceleratorConfig {
             listen: String::new(),
             admin_listen: "127.0.0.1:8749".to_string(),
             rendezvous_listen: None,
+            rendezvous_url: None,
+            public_relay: None,
             cache_mib: 256,
             replica_dir: None,
             compress_replica: true,

@@ -23,6 +23,13 @@ pub struct Overrides {
     /// `None` (merged onto `admin_listen`); `Some(addr)` sets it; `None`
     /// leaves whatever `config.toml` already has.
     pub rendezvous_listen: Option<String>,
+    /// External accelerator control-plane URL this daemon uses as a
+    /// rendezvous + tracker client. `Some("")` clears it, `Some(url)` sets
+    /// it, `None` leaves `config.toml`.
+    pub rendezvous_url: Option<String>,
+    /// Relay `…/p2p/<id>` multiaddr a NAS replica reserves a circuit on.
+    /// `Some("")` clears it, `Some(addr)` sets it, `None` leaves `config.toml`.
+    pub public_relay: Option<String>,
     pub listen: Option<String>,
 }
 
@@ -48,6 +55,12 @@ pub async fn run(home: Home, overrides: Overrides) -> anyhow::Result<()> {
     }
     if let Some(v) = overrides.rendezvous_listen {
         config.rendezvous_listen = if v.trim().is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = overrides.rendezvous_url {
+        config.rendezvous_url = if v.trim().is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = overrides.public_relay {
+        config.public_relay = if v.trim().is_empty() { None } else { Some(v) };
     }
     if let Some(v) = overrides.listen {
         config.listen = v;
@@ -126,5 +139,11 @@ fn banner(home: &Home, identity: &net::Keypair, config: &AcceleratorConfig) {
     tracing::info!(%peer_id, "libp2p peer id");
     tracing::info!(public_key = %agent.to_hex(), "operator-facing identity — hand this to whoever manages the daemon");
     tracing::info!(home = %home.dir().display(), "state directory");
+    if let Some(url) = &config.rendezvous_url {
+        tracing::info!(%url, "using external rendezvous + seeder tracker (answering punches, announcing shares)");
+    }
+    if let Some(relay) = &config.public_relay {
+        tracing::info!(%relay, "NAS replicas will reserve a circuit on this relay");
+    }
     tracing::info!("──────────────────────────────────────────────");
 }

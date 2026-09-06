@@ -212,7 +212,8 @@ share, and can be driven remotely:
   admin_listen, cache_mib, replica_dir, `compress_replica` (default true; `accelerator
   run --no-compress-replica` opts out — NAS stores the replica zstd-compressed on
   disk), `authorized_keys`, `shares`, `paused_shares` (manifest-id hex of shares
-  kept in config + on disk but not served until resumed)),
+  kept in config + on disk but not served until resumed), `rendezvous_url` +
+  `public_relay` (see below)),
   `supervisor.rs` (`Supervisor` owns a multi-share `RelayNode` **or** a
   `HashMap<Hash, Node>` of per-share replicas; applies `AdminCommand`s and
   rewrites `config.toml`; `RemoveShare` deletes the replica dir unless `keep_data`;
@@ -225,6 +226,26 @@ share, and can be driven remotely:
   `publish()`, incl. on the 30 s tracker-announce tick), `run.rs` (identity + config +
   supervisor + admin server). Prints its peer id + public key on every start.
   Offline `accelerator share rm <manifest-id>` also deletes the replica dir.
+- **Daemon as a rendezvous/tracker/relay *client*** (`config.rendezvous_url` +
+  `config.public_relay`, `accelerator run --rendezvous-url <url> --public-relay
+  <maddr>`) — without these a standalone daemon only *hosts* rendezvous/tracker
+  endpoints for others; it never registers itself, so a NAS replica behind NAT
+  (Tailscale-only, no port-forward) is unreachable from a downloader that isn't
+  on the same overlay, even with a public relay in the mix. With `rendezvous_url`
+  set (point it at the *same* accelerator the downloaders use — typically the
+  public relay's control-plane URL) `Supervisor` (a) answers NAT-rendezvous
+  punch requests aimed at every served share on a fast 2 s tick
+  (`answer_punch_requests`, NAS role only — a relay is a libp2p relay server,
+  assumed publicly reachable), and (b) also announces every ready share to that
+  *external* tracker over HTTP (`TrackerClient`) alongside its own in-process
+  one, so `merge_tracked_sources` on a downloader pointed at the relay discovers
+  the daemon. With `public_relay` set, each NAS serving node
+  `reserve_relay_circuit`s a `/p2p-circuit/…` address on boot and advertises it
+  in the tracker announce (`ShareRecord::Ready::circuit_addr`), so the replica is
+  dialable through the relay with dcutr upgrading to direct. `app-state`'s
+  `run_download` now merges tracked sources *before* the NAT punch and punches
+  every distinct peer id it then has (not just the origin in the link), so a
+  tracker-discovered NAS replica gets a punch too.
 - **`app-state`** — `App` keeps a persistent operator `AgentKeypair` at
   `operator.key` (`App::operator_public_key()`). `AcceleratorRequest::{Relay,Nas}`
   take `shares: Vec<ShareLink>` (Nas also `paused: Vec<String>`);
