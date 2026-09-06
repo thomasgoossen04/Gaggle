@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_state::{
-    AcceleratorRequest, App, AppState, Hash, LogHandle, LogLevel, LogLine, ReachLink, Scope,
-    Settings, ShareLink, Theme, TransferId, TransferKind, TransferRow,
+    AcceleratorRequest, App, AppState, Hash, LauncherChannel, LogHandle, LogLevel, LogLine,
+    ReachLink, Scope, Settings, ShareLink, Theme, TransferId, TransferKind, TransferRow,
 };
 use gpui::prelude::*;
 use gpui::{ClipboardItem, Entity, FocusHandle, PathPromptOptions, SharedString, Timer, Window, div};
@@ -147,6 +147,13 @@ pub struct Gaggle {
     pub(crate) confirm_focus: FocusHandle,
     /// The Settings theme dropdown is open.
     pub(crate) theme_menu_open: bool,
+    /// The desktop launcher's current release channel, read from
+    /// `launcher.json` at startup and after each change from the dropdown.
+    /// Advanced-mode Settings only — a plain GUI run (no launcher) still shows
+    /// it but the switch simply has no launcher to act on.
+    pub(crate) launcher_channel: LauncherChannel,
+    /// The Settings release-channel dropdown is open.
+    pub(crate) launcher_menu_open: bool,
     /// Stats tab: how far back the graphs reach. Ephemeral view state — never
     /// persisted to `Settings`.
     pub(crate) stats_window: Duration,
@@ -294,6 +301,10 @@ impl Gaggle {
             confirm: None,
             confirm_focus: cx.focus_handle(),
             theme_menu_open: false,
+            launcher_channel: app_state::launcher_channel::default_path()
+                .map(|p| app_state::launcher_channel::read(&p))
+                .unwrap_or_default(),
+            launcher_menu_open: false,
             stats_window: Duration::from_secs(300),
             stats_source: StatsSource::Local,
             stats_source_menu_open: false,
@@ -916,6 +927,35 @@ impl Gaggle {
     pub(crate) fn toggle_theme_menu(&mut self, cx: &mut Context<Self>) {
         self.theme_menu_open = !self.theme_menu_open;
         cx.notify();
+    }
+
+    pub(crate) fn toggle_launcher_menu(&mut self, cx: &mut Context<Self>) {
+        self.launcher_menu_open = !self.launcher_menu_open;
+        cx.notify();
+    }
+
+    /// Write the chosen release channel into the launcher's `launcher.json`.
+    /// It takes effect the next time `gaggle-launcher` runs its update check
+    /// (e.g. next launch from the shortcut); the running GUI is untouched.
+    pub(crate) fn set_launcher_channel(&mut self, channel: LauncherChannel, cx: &mut Context<Self>) {
+        self.launcher_menu_open = false;
+        let Some(path) = app_state::launcher_channel::default_path() else {
+            self.set_notice("No launcher config location on this platform", cx);
+            return;
+        };
+        match app_state::launcher_channel::write(&path, channel) {
+            Ok(()) => {
+                self.launcher_channel = channel;
+                self.set_notice(
+                    format!(
+                        "Update channel → {} — applies on the launcher's next run",
+                        channel.label()
+                    ),
+                    cx,
+                );
+            }
+            Err(e) => self.set_notice(format!("Couldn't write launcher config: {e}"), cx),
+        }
     }
 
     pub(crate) fn set_stats_window(&mut self, window: Duration, cx: &mut Context<Self>) {

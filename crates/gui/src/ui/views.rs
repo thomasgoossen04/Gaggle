@@ -4,8 +4,8 @@
 use std::time::{Duration, SystemTime};
 
 use app_state::{
-    AccelShareRow, AcceleratorRole, AcceleratorState, DiscoveredShare, LogLevel, RemoteAccelState,
-    SourceStats, SpeedSample, Theme, TransferKind, TransferRow, TransferStatus,
+    AccelShareRow, AcceleratorRole, AcceleratorState, DiscoveredShare, LauncherChannel, LogLevel,
+    RemoteAccelState, SourceStats, SpeedSample, Theme, TransferKind, TransferRow, TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -1165,6 +1165,66 @@ fn theme_dropdown(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     wrap.into_any_element()
 }
 
+/// The release-channel selector (advanced mode): writes the desktop launcher's
+/// `launcher.json`, so the next `gaggle-launcher` run updates from that stream.
+fn launcher_channel_dropdown(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    let cur = app.launcher_channel;
+    let open = app.launcher_menu_open;
+
+    let trigger = div()
+        .id("channel-trigger")
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .bg(t.panel_hi)
+        .border_1()
+        .border_color(t.accent_dim)
+        .text_xs()
+        .font_weight(FontWeight::BOLD)
+        .text_color(t.accent)
+        .cursor_pointer()
+        .hover(|s| s.border_color(t.accent))
+        .child(cur.label().to_uppercase())
+        .child(div().text_color(t.muted).child(if open { "▲" } else { "▼" }))
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_launcher_menu(cx)));
+
+    let mut wrap = div().relative().child(trigger);
+    if open {
+        let menu = div()
+            .absolute()
+            .top_full()
+            .right_0()
+            .mt_1()
+            .min_w(px(140.0))
+            .flex()
+            .flex_col()
+            .bg(t.panel)
+            .border_1()
+            .border_color(t.accent_dim)
+            .children(LauncherChannel::ALL.map(|opt| {
+                div()
+                    .id(("channel-opt", opt as usize))
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .bg(if opt == cur { t.panel_hi } else { t.panel })
+                    .text_color(if opt == cur { t.accent } else { t.fg })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.panel_hi).text_color(t.accent))
+                    .child(opt.label().to_uppercase())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_launcher_channel(opt, cx)
+                    }))
+            }));
+        wrap = wrap.child(deferred(menu));
+    }
+    wrap.into_any_element()
+}
+
 /// Editable settings.
 pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     let s = &app.state.settings;
@@ -1216,7 +1276,31 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                      section below into editable fields with a “Copy as link” button. \
                      Off by default — a normal setup only needs Transfers, Shares, Stats \
                      and Settings, and receives reachability config as a single paste.",
-                )),
+                ))
+                .when(s.advanced_ui, |c| {
+                    c.child(
+                        div()
+                            .mt_2()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family(theme::MONO)
+                                    .text_color(t.muted)
+                                    .child("UPDATE CHANNEL"),
+                            )
+                            .child(launcher_channel_dropdown(app, cx)),
+                    )
+                    .child(hint(
+                        "Which release stream the desktop launcher updates from — \
+                         Stable (default) or Beta (newer, less tested). Saved to the \
+                         launcher's config; it takes effect the next time \
+                         gaggle-launcher runs (e.g. next launch from the shortcut), \
+                         not this session.",
+                    ))
+                }),
         )
         .child(
             card()

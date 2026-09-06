@@ -424,7 +424,12 @@ share, and can be driven remotely:
   Settings → Interface card): off = only the Transfers / Shares / Stats / Settings tabs,
   and the Reachability card is a single "Paste reachability link" button
   (`Gaggle::paste_reachability`); on = also the Accelerator + Logs tabs
-  (`chrome::header` + `views::body` both gate on the flag), and the Reachability card
+  (`chrome::header` + `views::body` both gate on the flag), the Interface card gains an
+  "Update channel" Stable/Beta dropdown (`Gaggle::set_launcher_channel` writes the desktop
+  launcher's `launcher.json` via `app_state::launcher_channel::{default_path, read, write}`
+  — a byte-compatible re-impl of `launcher::channel`, since `gui` can't depend on the
+  launcher binary; the switch lands on `gaggle-launcher`'s next run, not the live session),
+  and the Reachability card
   shows the editable `public_relay` / `rendezvous_url` fields plus a "Copy as link"
   button (`Gaggle::copy_reachability`). The link is `app_state::ReachLink` (`reach.rs`):
   `{public_relay, rendezvous_url}` postcard-encoded behind a `gagglenet1` prefix, same
@@ -569,7 +574,9 @@ simply ignores.
 
 The launcher tracks a channel (`Channel::{Stable,Beta}` in `crates/launcher/src/channel.rs`),
 persisted in `<data-dir>/Gaggle/launcher.json`, chosen via the in-window `CH: STABLE|BETA`
-toggle or `gaggle-launcher --channel beta` (remembered) / `$GAGGLE_UPDATE_CHANNEL`.
+toggle, the GUI's Settings → Interface "Update channel" dropdown in advanced mode
+(`app_state::launcher_channel` writes the same file — a merge that preserves other keys),
+or `gaggle-launcher --channel beta` (remembered) / `$GAGGLE_UPDATE_CHANNEL`.
 `--manifest-url` / `$GAGGLE_UPDATE_URL` still override the URL entirely. `installed.json`
 records the installed version **and** channel, so flipping channels always shows an
 update. Branch setup: `git branch beta main && git push -u origin beta` once `main` exists.

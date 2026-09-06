@@ -117,7 +117,9 @@ can browse.
   connected remote accelerator.
 - **Simple by default, deep when you need it.** The GUI opens with just Transfers, Shares,
   Stats and Settings. Flip **Settings → Advanced mode** on to unlock the Accelerator and
-  Logs tabs and the editable relay / rendezvous fields. With Advanced mode off, network
+  Logs tabs, the editable relay / rendezvous fields, and an **Update channel** (Stable /
+  Beta) dropdown that switches which release stream the launcher updates from. With
+  Advanced mode off, network
   reachability is configured in one step: someone who has it set clicks **Copy as link**
   to get a short `gagglenet1…` token, and you **Paste reachability link** on the other
   device.
@@ -156,8 +158,9 @@ the check fails and you're offline) it hands off straight to the app with no ext
 Open it again any time — from the shortcut it just created — to update or launch.
 
 Two release channels are available: **stable** (default) and **beta** (newer, less
-tested). Switch with the `CH` toggle in the launcher window, or
-`gaggle-launcher --channel beta`.
+tested). Switch with the `CH` toggle in the launcher window, the **Update channel**
+dropdown in the GUI's **Settings → Advanced mode**, or `gaggle-launcher --channel beta`.
+Whichever you use, the change takes effect the next time the launcher runs.
 
 ### Build from source
 

@@ -9,6 +9,7 @@
 //!
 //! Nothing here depends on `gpui`; the `gui` crate is a thin renderer on top.
 
+pub mod launcher_channel;
 mod logs;
 mod manager;
 mod persist;
@@ -18,6 +19,7 @@ mod state;
 mod stats;
 
 pub use gaggle_core::{Hash, Invite};
+pub use launcher_channel::LauncherChannel;
 pub use logs::{LogHandle, LogLevel, LogLine, init as init_logging};
 pub use manager::{App, AppEvent, AcceleratorRequest, SubscribeRequest};
 pub use net::ShareLink;
