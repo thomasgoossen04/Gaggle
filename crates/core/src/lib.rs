@@ -47,5 +47,5 @@ pub use snapshot::{
 };
 pub use store::{
     CacheStats, ChunkLocation, ChunkStore, DedupStats, DISK_ZSTD_LEVEL, DiskChunkStore,
-    LruChunkCache, MemoryChunkStore, SourceChunkStore,
+    LruChunkCache, MemoryChunkStore, SharedChunkStore, SourceChunkStore,
 };

@@ -820,6 +820,23 @@ impl Gaggle {
         );
     }
 
+    pub(crate) fn toggle_seed_while_downloading(&mut self, cx: &mut Context<Self>) {
+        let next = !self.state.settings.seed_while_downloading;
+        self.state.settings.seed_while_downloading = next;
+        self.app.update_settings(Settings {
+            seed_while_downloading: next,
+            ..self.state.settings.clone()
+        });
+        self.set_notice(
+            if next {
+                "Downloads will seed the chunks they already have"
+            } else {
+                "Downloads will only seed once complete"
+            },
+            cx,
+        );
+    }
+
     pub(crate) fn run_benchmark(&mut self, cx: &mut Context<Self>) {
         self.app.benchmark();
         self.set_notice("Benchmarking the download volume…", cx);

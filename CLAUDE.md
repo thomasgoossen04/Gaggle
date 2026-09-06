@@ -206,6 +206,22 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   gets a per-row Start/Pause-seeding button and a `seeding` chip; Settings → Startup gets
   the global toggle. A restart re-runs the subscription, which re-completes and re-seeds
   (unless paused) — no separate persisted seed record needed.
+- **Seed-while-downloading** — when `Settings::seed_while_downloading` is set (default
+  true), a subscription doesn't wait for completion to give back: `run_download`
+  wraps the download's `DiskChunkStore` in `gaggle_core::SharedChunkStore` (a
+  cloneable `Arc<RwLock<S>>` handle — reads take a shared lock, `put` the exclusive
+  one), stands up its *own* serving `Node` over a clone (`start_partial_seed`:
+  `fetch_share_meta` → `Catalog::new` → `Node::spawn_serving`, `restrict_to_invite_holders`
+  for a whole-share private invite), and reports it via `Command::PartialSeedReady`.
+  So a leech uploads the chunks it already holds while still fetching the rest —
+  `TransferRow::seeding` + `share_addrs`, folded into the same `Manager::tick`
+  tracker-announce / rendezvous / `sample_local_stats` loops as a completed seed.
+  The node lives on `DownloadJob::partial_seed` and is retired
+  (`Manager::stop_partial_seed` → withdraw from tracker + drop) on pause / failure /
+  removal; on `DownloadDone` it is dropped just before `clear_partial`, then the
+  normal completed-seed path stands up a fresh `SourceChunkStore`-backed node over
+  the materialized tree. Skipped for a file-scoped invite (its narrowed catalog only
+  exists once the granted files are written) — those still seed on completion.
 - `Manager::remove` / a stopped local NAS / `accel_remove_share` now also best-effort
   withdraw from the seeder tracker (`Manager::withdraw_from_tracker`), and
   `announce_to_tracker` strips loopback from what it publishes (matching the standalone
@@ -468,7 +484,10 @@ disk) / resumes / and Remove deletes the replica dir**, **a seed streams a folde
 several times its
 `seed_cache_bytes` budget from disk and still serves every chunk**, **a finished
 download keeps seeding — a third peer pulls the whole share from only the first
-leech's node, and the per-row pause/resume control stops and restarts it**, **a real
+leech's node, and the per-row pause/resume control stops and restarts it**, **a
+running download seeds the chunks it already has — the row reports `seeding` on
+its own address while still mid-flight, then the completed seed takes over**, **a
+real
 loopback transfer leaves the seeder with a non-zero-`up_bps` `stats.local` history and
 both ends with a growing sample count**. `app-state` unit
 tests cover `Settings`
@@ -525,7 +544,9 @@ test exists to cover. `crates/core/tests/snapshot.rs` adds a
 source file that changed after the scan; and `DiskChunkStore` zstd compression —
 a compressible chunk is stored `.zst` (footprint shrinks) while an incompressible
 one falls back to raw, and a raw store reopened with compression on keeps reading
-old chunks while writing new ones compressed.
+old chunks while writing new ones compressed; and `SharedChunkStore` — a clone sees
+a write through the other handle, and `into_inner` only yields once every clone is
+dropped.
 
 ## Commands
 
@@ -751,6 +772,10 @@ reads. Module layout and how the pieces chain:
   the range from the source file, re-hashes it — a since-changed file yields `None` —
   and caches it; `put` is a no-op — the streaming seed). Dedup is just content
   addressing: `put` is a no-op if the hash is already present.
+  `SharedChunkStore<S>` is not a fifth backend but a wrapper: a cloneable
+  `Arc<RwLock<S>>` handle so one store can back a `&mut` writer and a serving
+  `Catalog` at once (reads share-locked, `put` exclusive) — used by
+  seed-while-downloading to serve a still-filling `DiskChunkStore`.
 - **`snapshot`** — ties it together: `snapshot_dir` walks a dir → chunks each file into
   a `ChunkStore` → `Snapshot { manifest, chunk_lists, skipped }`. `index_dir` is the
   same walk but records a `Hash -> ChunkLocation` map instead of storing bytes →

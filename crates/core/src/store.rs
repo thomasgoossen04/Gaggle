@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hash::Hash;
@@ -478,6 +478,61 @@ impl DiskChunkStore {
     }
 }
 
+/// A cloneable handle to one shared [`ChunkStore`]. Every clone locks and
+/// delegates to the same inner store, so an in-progress download can keep
+/// writing landed chunks through one handle while a serving `Catalog` built
+/// from another answers `GetChunk` for the chunks that have already arrived —
+/// the way a still-downloading peer uploads the part of a share it holds.
+///
+/// Reads ([`contains`](ChunkStore::contains) / [`get`](ChunkStore::get) /
+/// [`len`](ChunkStore::len)) take a shared lock and run concurrently;
+/// [`put`](ChunkStore::put) takes the exclusive lock for the brief insert. The
+/// inner store's own work still happens under that lock, so this fits stores
+/// whose ops are short (a map insert, one chunk-file read or write) — not a
+/// whole-share pass.
+pub struct SharedChunkStore<S> {
+    inner: Arc<RwLock<S>>,
+}
+
+impl<S> Clone for SharedChunkStore<S> {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl<S> SharedChunkStore<S> {
+    pub fn new(store: S) -> Self {
+        Self { inner: Arc::new(RwLock::new(store)) }
+    }
+
+    /// Recover the inner store once every other handle (and every `Catalog`
+    /// built from a clone) has been dropped; hands the handle back unchanged if
+    /// other clones are still live.
+    pub fn into_inner(self) -> Result<S, Self> {
+        Arc::try_unwrap(self.inner)
+            .map(|lock| lock.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .map_err(|inner| Self { inner })
+    }
+}
+
+impl<S: ChunkStore> ChunkStore for SharedChunkStore<S> {
+    fn contains(&self, hash: &Hash) -> bool {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).contains(hash)
+    }
+
+    fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).get(hash)
+    }
+
+    fn put(&mut self, hash: Hash, data: Vec<u8>) -> bool {
+        self.inner.write().unwrap_or_else(|e| e.into_inner()).put(hash, data)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
 /// Where a chunk's bytes live inside a source tree: a file path relative to the
 /// share root plus the byte range. Built by [`index_dir`](crate::index_dir) and
 /// consumed by [`SourceChunkStore`].
@@ -751,6 +806,27 @@ mod tests {
 
         let shard = dir.path().join(&h.to_hex()[..2]);
         assert!(shard.join(h.to_hex()).is_file(), "chunk lands in its prefix shard");
+    }
+
+    #[test]
+    fn shared_store_reads_writes_through_one_backing_store() {
+        let mut writer = SharedChunkStore::new(MemoryChunkStore::new());
+        let reader = writer.clone();
+        let (h, d) = chunk(b"shared");
+
+        assert!(writer.put(h, d.clone()));
+        // The clone sees the write immediately — same backing store.
+        assert!(reader.contains(&h));
+        assert_eq!(reader.get(&h), Some(d));
+        assert_eq!(reader.len(), 1);
+
+        // The inner store can only be recovered once every clone is gone.
+        let writer = match writer.into_inner() {
+            Err(handle) => handle,
+            Ok(_) => panic!("into_inner must fail while a clone is live"),
+        };
+        drop(reader);
+        assert_eq!(writer.into_inner().ok().expect("sole owner now").len(), 1);
     }
 
     #[test]

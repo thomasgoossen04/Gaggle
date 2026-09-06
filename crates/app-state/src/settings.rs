@@ -69,6 +69,17 @@ pub struct Settings {
     /// turn off to only ever download.
     #[serde(default = "default_seed_after_download")]
     pub seed_after_download: bool,
+    /// Seed the chunks that have already landed while a download is still
+    /// running: stand up a serving node for the partial `DiskChunkStore` so
+    /// this peer uploads the part of the share it holds instead of only
+    /// taking. The node is promoted to a normal completed seed (or dropped, if
+    /// [`seed_after_download`](Self::seed_after_download) is off) when the
+    /// download finishes. On by default; turn off to download without
+    /// contributing upload until the transfer completes. Only applies to
+    /// public and whole-share (`Scope::All`) private downloads — a
+    /// file-scoped invite waits for completion.
+    #[serde(default = "default_seed_while_downloading")]
+    pub seed_while_downloading: bool,
     /// Remember the share/transfer list across restarts: on the next launch,
     /// every seeded folder is re-indexed and re-served, and every
     /// subscription is re-issued (resuming from whatever partial chunks
@@ -170,6 +181,7 @@ impl Default for Settings {
             auto_resync_secs: None,
             remote_accelerators: Vec::new(),
             seed_after_download: default_seed_after_download(),
+            seed_while_downloading: default_seed_while_downloading(),
             persist_shares: default_persist_shares(),
             public_relay: None,
             rendezvous_url: None,
@@ -190,6 +202,11 @@ fn default_persist_shares() -> bool {
 
 /// A finished download keeps seeding by default.
 fn default_seed_after_download() -> bool {
+    true
+}
+
+/// A running download seeds the chunks it already has by default.
+fn default_seed_while_downloading() -> bool {
     true
 }
 
@@ -246,6 +263,10 @@ mod tests {
         assert!(
             loaded.seed_after_download,
             "seed-after-download defaults on for a pre-existing config"
+        );
+        assert!(
+            loaded.seed_while_downloading,
+            "seed-while-downloading defaults on for a pre-existing config"
         );
     }
 

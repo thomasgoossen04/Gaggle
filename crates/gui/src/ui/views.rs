@@ -1347,6 +1347,27 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                                 .child("KEEP SEEDING AFTER A DOWNLOAD FINISHES"),
                         )
                         .child(checkmark(if s.seed_after_download { Tri::On } else { Tri::Off })),
+                )
+                .child(
+                    div()
+                        .id("toggle-seed-while-downloading")
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.toggle_seed_while_downloading(cx)
+                        }))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(theme::MONO)
+                                .text_color(t.muted)
+                                .child("SEED ALREADY-DOWNLOADED CHUNKS WHILE DOWNLOADING"),
+                        )
+                        .child(
+                            checkmark(if s.seed_while_downloading { Tri::On } else { Tri::Off }),
+                        ),
                 ),
         )
         .child(

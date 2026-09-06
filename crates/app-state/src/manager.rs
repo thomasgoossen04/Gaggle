@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 use control_plane::{AdminClient, PeerInfo, RendezvousClient, TrackerClient};
 use gaggle_core::{
     AgentId, AgentKeypair, ChunkList, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
-    ScanProgress, SignedCapability, SourceChunkStore, SyncOutcome, index_dir_with_progress,
-    snapshot_dir, sync_share, write_share,
+    ScanProgress, SharedChunkStore, SignedCapability, SourceChunkStore, SyncOutcome,
+    index_dir_with_progress, snapshot_dir, sync_share, write_share,
 };
 use net::accel::{nas_pull_with_progress, nas_serve, relay_add_share};
 use net::{
@@ -168,6 +168,9 @@ enum Command {
     /// sources, authenticating, fetching metadata) — feeds `TransferRow::detail`.
     DownloadStage { id: TransferId, message: String },
     DownloadDone { id: TransferId, outcome: Box<DownloadOutcome> },
+    /// A still-running download has stood up a serving node over its partial
+    /// on-disk store — this peer is now uploading the chunks it already holds.
+    PartialSeedReady { id: TransferId, node: Arc<Node>, addrs: Vec<Multiaddr> },
     /// A completed download's files have been indexed and a serving node is up
     /// — this peer is now seeding them back to the swarm.
     CompletedSeedReady { id: TransferId, node: Arc<Node>, addrs: Vec<Multiaddr> },
@@ -572,6 +575,12 @@ struct DownloadJob {
     chunk_dir: PathBuf,
     /// For the rolling speed estimate.
     last_sample: Option<(Instant, u64)>,
+    /// Serving node stood up over the partial download store, so this peer
+    /// uploads what it has while still fetching. `None` until
+    /// [`Command::PartialSeedReady`] arrives (or when partial seeding is off /
+    /// not applicable). Dropped — which stops it — on pause / failure /
+    /// completion / removal.
+    partial_seed: Option<Arc<Node>>,
 }
 
 /// Keeps an in-process accelerator alive; drop stops it. Carries any number of
@@ -783,9 +792,14 @@ impl Manager {
         // NAT rendezvous: check whether some subscriber is waiting to punch
         // through to one of our served shares, and answer if so.
         if let Some(url) = self.state.settings.rendezvous_url.clone() {
-            let seed_nodes = self.seeds.values().map(|s| Arc::clone(&s.node)).chain(
-                self.subs.values().filter_map(|s| s.seed.as_ref().map(|c| Arc::clone(&c.node))),
-            );
+            let seed_nodes = self
+                .seeds
+                .values()
+                .map(|s| Arc::clone(&s.node))
+                .chain(
+                    self.subs.values().filter_map(|s| s.seed.as_ref().map(|c| Arc::clone(&c.node))),
+                )
+                .chain(self.downloads.values().filter_map(|j| j.partial_seed.clone()));
             for node in seed_nodes {
                 let url = url.clone();
                 tokio::spawn(async move { answer_rendezvous_requests(&node, &url).await });
@@ -819,6 +833,17 @@ impl Manager {
                     (s.manifest_id, s.name.clone(), s.share_seed.is_some(), Arc::clone(&s.node))
                 })
                 .collect();
+            // Running downloads seeding the chunks they already hold.
+            for job in self.downloads.values() {
+                if let Some(node) = &job.partial_seed {
+                    nodes.push((
+                        job.request.manifest_id,
+                        job.request.name.clone(),
+                        job.request.credential.is_some(),
+                        Arc::clone(node),
+                    ));
+                }
+            }
             // Completed downloads this node is now also seeding.
             for sub in self.subs.values() {
                 if let Some(seed) = &sub.seed {
@@ -883,10 +908,12 @@ impl Manager {
         let mut nodes: Vec<Arc<Node>> =
             self.seeds.values().map(|s| Arc::clone(&s.node)).collect();
         // Completed downloads this node is now also seeding count toward its
-        // upload throughput just like an origin seed.
+        // upload throughput just like an origin seed — and so do running
+        // downloads seeding the chunks they already hold.
         nodes.extend(
             self.subs.values().filter_map(|s| s.seed.as_ref().map(|c| Arc::clone(&c.node))),
         );
+        nodes.extend(self.downloads.values().filter_map(|j| j.partial_seed.clone()));
         let relay = self.accel.as_ref().and_then(|a| a.relay.clone());
         if let Some(accel) = &self.accel {
             nodes.extend(accel.nas_nodes.iter().map(|(_, n)| Arc::clone(n)));
@@ -1199,6 +1226,8 @@ impl Manager {
                 if let Some(job) = self.downloads.get_mut(&id) {
                     job.last_sample = None;
                 }
+                // A stalled download should stop advertising the chunks it had.
+                self.stop_partial_seed(id);
                 self.resync_samples.remove(&id);
                 self.eta.remove(&id);
                 if let Some(row) = self.state.transfers.get_mut(&id) {
@@ -1258,6 +1287,12 @@ impl Manager {
             Command::DownloadDone { id, outcome } => {
                 self.eta.remove(&id);
                 let request = self.downloads.remove(&id).map(|job| {
+                    // Retire the seed-while-downloading node before its backing
+                    // chunk files are cleared; the completed-seed path below
+                    // stands up a fresh one over the materialized output tree.
+                    if let Some(node) = &job.partial_seed {
+                        self.withdraw_from_tracker(outcome.manifest.id(), node.peer_id());
+                    }
                     clear_partial(job.chunk_dir);
                     job.request
                 });
@@ -1283,6 +1318,11 @@ impl Manager {
                     row.speed_bps = 0;
                     row.eta_secs = None;
                     row.output_dir = Some(outcome.output_dir);
+                    // The partial seed (if any) is being retired; the
+                    // completed-seed path re-sets these once its node is up.
+                    row.seeding = false;
+                    row.share_addrs.clear();
+                    row.share_addr = None;
                     for (peer, chunks) in &outcome.sources {
                         match row.sources.iter_mut().find(|s| s.peer == *peer) {
                             Some(s) => s.chunks = s.chunks.max(*chunks),
@@ -1307,6 +1347,29 @@ impl Manager {
                     self.start_completed_seed(id);
                 }
                 self.persist_shares();
+            }
+            Command::PartialSeedReady { id, node, addrs } => {
+                // The download is still running: attach the serving node to its
+                // job so it lives exactly as long as the download does (pause /
+                // failure / completion / removal all drop it). If the job is
+                // already gone, dropping `node` here stops it.
+                match self.downloads.get_mut(&id) {
+                    Some(job) => {
+                        job.partial_seed = Some(node);
+                        if let Some(row) = self.state.transfers.get_mut(&id) {
+                            row.seeding = true;
+                            row.share_addrs = addrs.clone();
+                            row.share_addr = addrs.into_iter().next();
+                        }
+                        // Announce to the seeder tracker on the next tick
+                        // rather than waiting out a full interval.
+                        self.last_tracker_announce = Instant::now()
+                            .checked_sub(TRACKER_ANNOUNCE_INTERVAL)
+                            .unwrap_or_else(Instant::now);
+                        self.publish();
+                    }
+                    None => drop(node),
+                }
             }
             Command::CompletedSeedReady { id, node, addrs } => {
                 // If the transfer is gone (removed while the index ran) or was
@@ -2346,20 +2409,23 @@ impl Manager {
         let req = request.clone();
         let dir = chunk_dir.clone();
         let rendezvous_url = self.state.settings.rendezvous_url.clone();
+        let seed_partial = self.state.settings.seed_while_downloading;
+        let public_relay = self.state.settings.public_relay.clone();
 
         let task = tokio::spawn(async move {
             let out = out_root.join(name);
-            if let Err(e) =
-                run_download(node.as_ref(), id, req, dir, out, tx.clone(), rendezvous_url).await
-            {
+            let opts = DownloadOpts { rendezvous_url, seed_partial, public_relay };
+            if let Err(e) = run_download(node.as_ref(), id, req, dir, out, tx.clone(), opts).await {
                 let _ = tx.send(Command::WorkerFailed { id, error: format!("{e:#}") }).await;
             }
         });
         // A resume / retry reuses this path — start the time-left estimate from
         // a clean window rather than carrying stale pre-pause readings.
         self.eta.remove(&id);
-        self.downloads
-            .insert(id, DownloadJob { task, request, chunk_dir, last_sample: None });
+        self.downloads.insert(
+            id,
+            DownloadJob { task, request, chunk_dir, last_sample: None, partial_seed: None },
+        );
     }
 
     /// Best-effort `DELETE /tracker/{manifest_id}/{peer_id}` so a share this
@@ -2372,6 +2438,25 @@ impl Manager {
             let client = TrackerClient::new(&url);
             let _ = client.withdraw(&manifest_id.to_hex(), &peer_id.to_string()).await;
         });
+    }
+
+    /// Stop the seed-while-downloading node for `id`, if one is running:
+    /// withdraw it from the seeder tracker, drop it (which aborts its swarm
+    /// task) and clear the row's seeding flag. Safe to call when there is none.
+    fn stop_partial_seed(&mut self, id: TransferId) {
+        let taken = self
+            .downloads
+            .get_mut(&id)
+            .and_then(|job| job.partial_seed.take().map(|node| (job.request.manifest_id, node)));
+        if let Some((manifest_id, node)) = taken {
+            self.withdraw_from_tracker(manifest_id, node.peer_id());
+            drop(node);
+            if let Some(row) = self.state.transfers.get_mut(&id) {
+                row.seeding = false;
+                row.share_addrs.clear();
+                row.share_addr = None;
+            }
+        }
     }
 
     fn pause(&mut self, id: TransferId) {
@@ -2394,6 +2479,11 @@ impl Manager {
             self.publish();
             return;
         }
+        if !self.downloads.contains_key(&id) {
+            return;
+        }
+        // Stop uploading the chunks it had; a resume re-establishes the seed.
+        self.stop_partial_seed(id);
         let Some(job) = self.downloads.get_mut(&id) else { return };
         job.task.abort();
         job.last_sample = None;
@@ -2477,6 +2567,9 @@ impl Manager {
         self.eta.remove(&id);
         if let Some(job) = self.downloads.remove(&id) {
             job.task.abort();
+            if let Some(node) = &job.partial_seed {
+                self.withdraw_from_tracker(job.request.manifest_id, node.peer_id());
+            }
             clear_partial(job.chunk_dir);
         } else if let Some(mid) = self
             .state
@@ -3025,6 +3118,17 @@ async fn with_stall_watchdog<T>(
     }
 }
 
+/// Knobs for [`run_download`] that outlive the plain source list.
+struct DownloadOpts {
+    /// Seeder-tracker / NAT-rendezvous base URL, if configured.
+    rendezvous_url: Option<String>,
+    /// Stand up a serving node over the partial store while the download runs.
+    seed_partial: bool,
+    /// A public relay's `…/p2p/<id>` address for the partial seed to reserve a
+    /// circuit on (so it is reachable behind a NAT).
+    public_relay: Option<String>,
+}
+
 async fn run_download(
     node: &Node,
     id: TransferId,
@@ -3032,11 +3136,12 @@ async fn run_download(
     chunk_dir: PathBuf,
     output_dir: PathBuf,
     tx: mpsc::Sender<Command>,
-    rendezvous_url: Option<String>,
+    opts: DownloadOpts,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!req.sources.is_empty(), "no sources given for the subscription");
     let activity = Arc::new(Mutex::new(Instant::now()));
     let work_activity = activity.clone();
+    let DownloadOpts { rendezvous_url, seed_partial, public_relay } = opts;
 
     let work = async move {
         let mut req = req;
@@ -3078,10 +3183,46 @@ async fn run_download(
         }
 
         let dir = chunk_dir.clone();
-        let mut disk = tokio::task::spawn_blocking(move || DiskChunkStore::open(&dir)).await??;
+        let disk = tokio::task::spawn_blocking(move || DiskChunkStore::open(&dir)).await??;
         let base_bytes = disk.size_on_disk().unwrap_or(0);
+        // One store, two handles: the download writes landed chunks through
+        // `disk`; a serving `Catalog` built from a clone reads the chunks that
+        // have already arrived — so this peer uploads the part of the share it
+        // holds while still fetching the rest.
+        let mut disk = SharedChunkStore::new(disk);
 
         report_stage(&tx, &work_activity, id, "fetching share metadata…");
+
+        // Seed-while-downloading: stand up a serving node over the partial
+        // store. Skipped for a file-scoped invite — its narrowed catalog only
+        // exists once the granted files have actually been written.
+        let scoped =
+            matches!(req.credential.as_ref().map(|c| &c.capability.scope), Some(Scope::Files(_)));
+        if seed_partial && !scoped {
+            let setup = start_partial_seed(
+                node,
+                &peers,
+                req.manifest_id,
+                req.credential.as_ref().map(|c| c.capability.share),
+                disk.clone(),
+                public_relay.as_deref(),
+            );
+            // Bounded so a slow metadata fetch / relay reservation only costs a
+            // late start to seeding, never the download itself.
+            match tokio::time::timeout(Duration::from_secs(15), setup).await {
+                Ok(Ok(Some((seed, addrs)))) => {
+                    let _ = tx.send(Command::PartialSeedReady { id, node: seed, addrs }).await;
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    id,
+                    error = %format!("{e:#}"),
+                    "seed-while-downloading: not started"
+                ),
+                Err(_) => tracing::warn!(id, "seed-while-downloading: setup timed out"),
+            }
+        }
+
         let progress_tx = tx.clone();
         let progress_activity = work_activity.clone();
         // Pin the id the invite/link promised: a source discovered for one share
@@ -3130,6 +3271,55 @@ async fn run_download(
     };
 
     with_stall_watchdog(activity, work).await
+}
+
+/// Best-effort: learn `manifest_id`'s metadata from a connected source and
+/// stand up a [`Node`] serving `store` — the still-filling on-disk store of an
+/// in-progress download — so this peer uploads the chunks it already holds.
+/// `share` gates it to invite holders when set (whole-share invites only; a
+/// file-scoped one is handled by the caller). Returns the serving node and its
+/// dialable addresses, or `Ok(None)` when no address could be surfaced.
+async fn start_partial_seed(
+    downloader: &Node,
+    peers: &[PeerId],
+    manifest_id: Hash,
+    share: Option<SharePublicKey>,
+    store: SharedChunkStore<DiskChunkStore>,
+    public_relay: Option<&str>,
+) -> anyhow::Result<Option<(Arc<Node>, Vec<Multiaddr>)>> {
+    let mut meta = None;
+    let mut last_err = None;
+    for &peer in peers {
+        match downloader.fetch_share_meta(peer, Some(manifest_id)).await {
+            Ok(m) => {
+                meta = Some(m);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let (manifest, chunk_lists) = meta.ok_or_else(|| {
+        last_err.unwrap_or_else(|| anyhow::anyhow!("no source returned the share metadata"))
+    })?;
+
+    let node = Node::spawn_serving(Catalog::new(manifest, chunk_lists, store)).await?;
+    if let Some(share) = share {
+        node.restrict_to_invite_holders(share).await?;
+    }
+    let mut addrs = match node.reachable_addrs().await {
+        Ok(a) if !a.is_empty() => a,
+        _ => return Ok(None),
+    };
+    if let Some(relay_addr) = public_relay {
+        match reserve_relay(&node, relay_addr).await {
+            Ok(circuit) => addrs.push(circuit),
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "seed-while-downloading: relay reservation failed — LAN/VPN addresses only"
+            ),
+        }
+    }
+    Ok(Some((Arc::new(node), addrs)))
 }
 
 async fn run_resync(

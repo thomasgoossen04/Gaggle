@@ -208,6 +208,61 @@ async fn a_finished_download_seeds_and_can_be_paused() {
     wait_for(&leech, 20, |s| s.get(leech_id).is_some_and(|r| r.seeding)).await;
 }
 
+/// Seed-while-downloading: a running download stands up its own serving node
+/// over the partial on-disk store, so the row reports `seeding` with its own
+/// dialable address *before* the transfer is anywhere near complete. When the
+/// download finishes that node is retired and the normal completed seed takes
+/// over (still `seeding`), and the output is byte-exact throughout.
+#[tokio::test]
+async fn a_running_download_seeds_the_chunks_it_already_has() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let (origin_addr, manifest_id, seed_bytes) =
+        (seed.share_addr.clone().unwrap(), seed.manifest_id, seed.total_bytes);
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![origin_addr.clone()],
+        credential: None,
+    });
+
+    // Mid-flight: the partial store is already being served from a node of its
+    // own (a distinct address from the origin's), with real progress on the
+    // clock but the transfer not yet complete.
+    let mid = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| {
+            r.seeding
+                && r.status != TransferStatus::Complete
+                && r.done_bytes > 0
+                && r.done_bytes < r.total_bytes
+                && r.share_addrs.iter().all(|a| *a != origin_addr)
+                && !r.share_addrs.is_empty()
+        })
+    })
+    .await;
+    assert!(!mid.downloads().next().unwrap().share_addrs.is_empty());
+
+    // The leech finishes and keeps seeding through the completed-seed node.
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete && r.seeding)
+    })
+    .await;
+    let leech_row = done.downloads().next().unwrap();
+    assert_eq!(leech_row.done_bytes, leech_row.total_bytes);
+    assert_eq!(leech_row.total_bytes, seed_bytes);
+    assert!(leech_row.share_addr.is_some());
+    dir_matches(folder.path(), &leech_row.output_dir.clone().unwrap());
+}
+
 #[tokio::test]
 async fn adding_a_share_passes_through_a_scanning_phase() {
     let folder = sample_folder();

@@ -93,9 +93,10 @@ can browse.
   at an accelerator (**Settings → Rendezvous URL**) every seed announces itself to that
   accelerator's live *seeder tracker*, so a download also swarms across any NAS replica
   or extra origin the link never mentioned.
-- **Finished downloads seed back.** Once a transfer completes it keeps serving the files
-  to the swarm automatically (per-row pause, or a global off switch), so every downloader
-  becomes a source.
+- **Downloads seed while they download.** A running transfer stands up its own serving
+  node over the chunks that have already landed, so a leech uploads the part of the
+  share it holds instead of only taking — and once it completes it keeps serving the
+  whole thing. Both have per-row pause and a global off switch.
 - **NAT traversal built in, relay-free when possible.** mDNS finds same-LAN peers
   instantly; UPnP asks the router for a public port with no server involved at all; and
   when both peers are behind NAT with no accelerator, an accelerator's control-plane can
@@ -212,10 +213,12 @@ cargo run -p accelerator -- run --role relay   # headless accelerator daemon
    speed, source count and a steady **time-left estimate**; pause/resume any time, and
    expand a row (▸) to see the per-source chunk breakdown while it's swarming from
    multiple peers.
-4. When it finishes it keeps **seeding** the files back to the swarm automatically, so
-   you help everyone else who's downloading. The completed row shows a `seeding` chip and
-   a **Pause seeding** / **Start seeding** button; turn it off for every download under
-   **Settings → Startup → "Keep seeding after a download finishes"**.
+4. A transfer starts **seeding** the chunks it already has while it's still downloading
+   — the row shows a `seeding` chip mid-flight — and keeps serving the whole share once
+   it finishes, so you help everyone else who's downloading. Each row has a **Pause
+   seeding** / **Start seeding** button; two toggles under **Settings → Startup** turn it
+   off globally — *"Seed already-downloaded chunks while downloading"* and *"Keep seeding
+   after a download finishes"*.
 
 ### Keep a synced copy up to date
 
