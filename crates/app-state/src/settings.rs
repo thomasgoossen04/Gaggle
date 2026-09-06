@@ -114,6 +114,11 @@ pub struct PersistedAccelerator {
     /// `gaggleshare1…` tokens this accelerator carries.
     #[serde(default)]
     pub shares: Vec<String>,
+    /// NAS role: manifest-id hexes of shares that are carried (replica kept on
+    /// disk, updates still polled) but paused — not currently served. Empty for
+    /// a relay. Old configs without the key load as "nothing paused".
+    #[serde(default)]
+    pub paused_shares: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -18,7 +18,8 @@
 //!   one file per chunk, sharded by hash prefix. The cache/NAS accelerator's
 //!   full replica: survives restarts, resumes partial fills.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -285,12 +286,24 @@ pub struct CacheStats {
     pub bytes_served: u64,
 }
 
+/// zstd level used when [`DiskChunkStore`] writes a compressed chunk. Level 3
+/// is zstd's own default — a good ratio/speed balance for a replica that is
+/// written once and read many times.
+pub const DISK_ZSTD_LEVEL: i32 = 3;
+
 /// A durable content-addressed chunk store on the filesystem.
 ///
-/// One file per chunk, named by lowercase-hex hash, sharded into 256 directories
-/// by the first hash byte so no single directory holds the whole store. This is
-/// the cache/NAS accelerator's replica backing: it survives a
-/// restart, and because [`put`](ChunkStore::put) skips chunks already on disk a
+/// One file per chunk, sharded into 256 directories by the first hash byte so no
+/// single directory holds the whole store. A chunk is stored either raw (file
+/// named by lowercase-hex hash) or zstd-compressed (same name + `.zst`); the
+/// store is self-describing per chunk, so a store written raw and reopened
+/// compressed (or vice versa) keeps reading every chunk and only *new* chunks
+/// take the current form — no migration. Compression is opt-in
+/// ([`open_with_opts`](Self::open_with_opts)) and only kept for a chunk when it
+/// actually shrinks it, so already-compressed game assets stay raw.
+///
+/// This is the cache/NAS accelerator's replica backing: it survives a restart,
+/// and because [`put`](ChunkStore::put) skips chunks already on disk a
 /// half-finished replication just resumes.
 ///
 /// The [`ChunkStore`] impl is infallible by contract, so a read/write I/O error
@@ -300,18 +313,28 @@ pub struct CacheStats {
 #[derive(Debug)]
 pub struct DiskChunkStore {
     root: PathBuf,
-    index: HashSet<Hash>,
+    /// hash → is this chunk stored zstd-compressed (a `.zst` file)?
+    index: HashMap<Hash, bool>,
+    /// Whether *new* chunks are written compressed (when that shrinks them).
+    compress: bool,
     tmp_counter: AtomicU64,
     io_errors: AtomicU64,
 }
 
 impl DiskChunkStore {
-    /// Open (creating if needed) a store rooted at `dir`, indexing whatever
-    /// chunks are already there.
+    /// Open (creating if needed) a store rooted at `dir` that writes chunks
+    /// raw, indexing whatever chunks (raw or `.zst`) are already there.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_opts(dir, false)
+    }
+
+    /// [`open`](Self::open), but `compress` controls whether newly written
+    /// chunks are zstd-compressed when that makes them smaller. Existing chunks
+    /// are read back in whatever form they were stored regardless.
+    pub fn open_with_opts(dir: impl AsRef<Path>, compress: bool) -> io::Result<Self> {
         let root = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        let mut index = HashSet::new();
+        let mut index = HashMap::new();
         for shard in std::fs::read_dir(&root)? {
             let shard = shard?;
             if !shard.file_type()?.is_dir() {
@@ -319,16 +342,20 @@ impl DiskChunkStore {
             }
             for entry in std::fs::read_dir(shard.path())? {
                 let name = entry?.file_name();
-                if let Some(hex) = name.to_str()
-                    && let Ok(hash) = Hash::from_hex(hex)
-                {
-                    index.insert(hash);
+                let Some(name) = name.to_str() else { continue };
+                let (stem, compressed) = match name.strip_suffix(".zst") {
+                    Some(s) => (s, true),
+                    None => (name, false),
+                };
+                if let Ok(hash) = Hash::from_hex(stem) {
+                    index.insert(hash, compressed);
                 }
             }
         }
         Ok(Self {
             root,
             index,
+            compress,
             tmp_counter: AtomicU64::new(0),
             io_errors: AtomicU64::new(0),
         })
@@ -339,11 +366,13 @@ impl DiskChunkStore {
         self.io_errors.load(Ordering::Relaxed)
     }
 
-    /// Total bytes of chunk files on disk (a directory walk; not cached).
+    /// Total bytes of chunk files on disk (a directory walk; not cached). With
+    /// compression on this is the *compressed* footprint — the point of the
+    /// feature.
     pub fn size_on_disk(&self) -> io::Result<u64> {
         let mut total = 0;
-        for &hash in &self.index {
-            total += std::fs::metadata(self.path_for(&hash))?.len();
+        for (hash, &compressed) in &self.index {
+            total += std::fs::metadata(self.path_for_form(hash, compressed))?.len();
         }
         Ok(total)
     }
@@ -353,34 +382,55 @@ impl DiskChunkStore {
         self.root.join(&hex[..2]).join(hex)
     }
 
+    /// The on-disk path for a chunk in a given form (`.zst` suffix when
+    /// compressed).
+    fn path_for_form(&self, hash: &Hash, compressed: bool) -> PathBuf {
+        let p = self.path_for(hash);
+        if compressed { p.with_extension("zst") } else { p }
+    }
+
     /// Read a chunk, distinguishing "absent" (`Ok(None)`) from an I/O error.
     pub fn try_get(&self, hash: &Hash) -> io::Result<Option<Vec<u8>>> {
-        if !self.index.contains(hash) {
+        let Some(&compressed) = self.index.get(hash) else {
             return Ok(None);
-        }
-        match std::fs::read(self.path_for(hash)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        };
+        let bytes = match std::fs::read(self.path_for_form(hash, compressed)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if compressed {
+            zstd::decode_all(&bytes[..]).map(Some)
+        } else {
+            Ok(Some(bytes))
         }
     }
 
     /// Write a chunk (atomically: temp file + rename). `Ok(false)` means it was
-    /// already present.
+    /// already present. Compressed with zstd when the store was opened with
+    /// compression on *and* that shrinks the chunk.
     pub fn try_put(&mut self, hash: Hash, data: &[u8]) -> io::Result<bool> {
         debug_assert_eq!(Hash::of(data), hash, "try_put() called with a mismatched hash");
-        if self.index.contains(&hash) {
+        if self.index.contains_key(&hash) {
             return Ok(false);
         }
-        let final_path = self.path_for(&hash);
+        let (payload, compressed): (Cow<[u8]>, bool) = if self.compress {
+            match zstd::encode_all(data, DISK_ZSTD_LEVEL) {
+                Ok(z) if z.len() < data.len() => (Cow::Owned(z), true),
+                _ => (Cow::Borrowed(data), false),
+            }
+        } else {
+            (Cow::Borrowed(data), false)
+        };
+        let final_path = self.path_for_form(&hash, compressed);
         let shard = final_path.parent().expect("path_for always has a shard parent");
         std::fs::create_dir_all(shard)?;
         let n = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
         let tmp = shard.join(format!(".{}.{n}.tmp", hash.to_hex()));
-        std::fs::write(&tmp, data)?;
+        std::fs::write(&tmp, &payload)?;
         match std::fs::rename(&tmp, &final_path) {
             Ok(()) => {
-                self.index.insert(hash);
+                self.index.insert(hash, compressed);
                 Ok(true)
             }
             Err(e) => {
@@ -393,7 +443,7 @@ impl DiskChunkStore {
 
 impl ChunkStore for DiskChunkStore {
     fn contains(&self, hash: &Hash) -> bool {
-        self.index.contains(hash)
+        self.index.contains_key(hash)
     }
 
     fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
@@ -418,6 +468,13 @@ impl ChunkStore for DiskChunkStore {
 
     fn len(&self) -> usize {
         self.index.len()
+    }
+}
+
+impl DiskChunkStore {
+    /// How many stored chunks are held zstd-compressed on disk.
+    pub fn compressed_chunks(&self) -> usize {
+        self.index.values().filter(|&&c| c).count()
     }
 }
 
@@ -703,6 +760,61 @@ mod tests {
         let (h, d) = chunk(b"x");
         assert!(store.try_put(h, &d).unwrap());
         assert!(!store.try_put(h, &d).unwrap());
+    }
+
+    #[test]
+    fn disk_store_compresses_when_it_shrinks_the_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        // Highly compressible payload, well above the store's raw size.
+        let (h_squish, d_squish) = chunk(&[0u8; 64 * 1024]);
+        // Random payload zstd can't shrink.
+        let mut noise = vec![0u8; 4096];
+        getrandom::getrandom(&mut noise).unwrap();
+        let (h_noise, d_noise) = chunk(&noise);
+
+        {
+            let mut store = DiskChunkStore::open_with_opts(dir.path(), true).unwrap();
+            assert!(store.try_put(h_squish, &d_squish).unwrap());
+            assert!(store.try_put(h_noise, &d_noise).unwrap());
+            assert_eq!(store.compressed_chunks(), 1, "only the squishable chunk is stored .zst");
+            assert!(store.size_on_disk().unwrap() < (d_squish.len() + d_noise.len()) as u64);
+            // Reads decompress transparently.
+            assert_eq!(store.get(&h_squish), Some(d_squish.clone()));
+            assert_eq!(store.get(&h_noise), Some(d_noise.clone()));
+        }
+
+        // The .zst lands in its prefix shard; the noise chunk stays raw.
+        let squish_shard = dir.path().join(&h_squish.to_hex()[..2]);
+        assert!(squish_shard.join(format!("{}.zst", h_squish.to_hex())).is_file());
+        let noise_shard = dir.path().join(&h_noise.to_hex()[..2]);
+        assert!(noise_shard.join(h_noise.to_hex()).is_file());
+    }
+
+    #[test]
+    fn disk_store_reopen_reads_mixed_forms_and_keeps_going() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h_raw, d_raw) = chunk(b"written before compression was turned on");
+        let (h_zst, d_zst) = chunk(&[7u8; 32 * 1024]);
+
+        {
+            let mut store = DiskChunkStore::open(dir.path()).unwrap(); // raw
+            store.try_put(h_raw, &d_raw).unwrap();
+        }
+        {
+            // Reopen with compression on: the old raw chunk still reads, the
+            // new one is stored compressed.
+            let mut store = DiskChunkStore::open_with_opts(dir.path(), true).unwrap();
+            assert_eq!(store.len(), 1);
+            assert_eq!(store.get(&h_raw), Some(d_raw.clone()));
+            store.try_put(h_zst, &d_zst).unwrap();
+        }
+
+        let reopened = DiskChunkStore::open_with_opts(dir.path(), true).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(reopened.compressed_chunks(), 1);
+        assert_eq!(reopened.get(&h_raw), Some(d_raw));
+        assert_eq!(reopened.get(&h_zst), Some(d_zst));
+        assert_eq!(reopened.io_errors(), 0);
     }
 
     // --- SourceChunkStore ----------------------------------------------------

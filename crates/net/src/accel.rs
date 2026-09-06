@@ -96,12 +96,14 @@ fn replica_swarm_config(link: &ShareLink) -> SwarmConfig {
 /// calling in, since the punch only opens a hole in *this* node's own NAT
 /// mapping; ordinary callers can just use [`nas_add_share`] /
 /// [`nas_add_share_with_progress`] instead). Chunks already on disk from a
-/// previous run are topped up, not re-fetched. Reports [`SwarmProgress`] once
-/// per chunk via `on_progress`.
+/// previous run are topped up, not re-fetched. `compress` opens the replica
+/// with zstd on-disk compression (see [`DiskChunkStore::open_with_opts`]).
+/// Reports [`SwarmProgress`] once per chunk via `on_progress`.
 pub async fn nas_pull_with_progress<P>(
     downloader: &Node,
     dir_root: &Path,
     link: &ShareLink,
+    compress: bool,
     on_progress: P,
 ) -> anyhow::Result<(Manifest, BTreeMap<String, ChunkList>, DiskChunkStore, usize)>
 where
@@ -116,7 +118,7 @@ where
 
     let dir = dir_root.join(link.manifest_id.to_hex());
     let open_dir = dir.clone();
-    let mut disk = tokio::task::spawn_blocking(move || DiskChunkStore::open(&open_dir))
+    let mut disk = tokio::task::spawn_blocking(move || DiskChunkStore::open_with_opts(&open_dir, compress))
         .await?
         .with_context(|| format!("opening {}", dir.display()))?;
 
@@ -164,14 +166,16 @@ pub async fn nas_serve(
 
 /// Replicate the linked share into `dir_root/<manifest-id>` on disk and start a
 /// [`Node`] serving it (its own persistent `identity`, so the replica keeps a
-/// stable peer id). Returns the serving node, the share's metadata and the
-/// chunk count now on disk.
+/// stable peer id). `compress` opts the on-disk replica into zstd compression.
+/// Returns the serving node, the share's metadata and the chunk count now on
+/// disk.
 pub async fn nas_add_share(
     dir_root: &Path,
     identity: Keypair,
     link: &ShareLink,
+    compress: bool,
 ) -> anyhow::Result<(Node, ShareMeta, usize)> {
-    nas_add_share_with_progress(dir_root, identity, link, |_| {}).await
+    nas_add_share_with_progress(dir_root, identity, link, compress, |_| {}).await
 }
 
 /// [`nas_add_share`] that also reports [`SwarmProgress`] once per chunk as it
@@ -180,13 +184,14 @@ pub async fn nas_add_share_with_progress<P>(
     dir_root: &Path,
     identity: Keypair,
     link: &ShareLink,
+    compress: bool,
     on_progress: P,
 ) -> anyhow::Result<(Node, ShareMeta, usize)>
 where
     P: FnMut(SwarmProgress),
 {
     let scratch = Node::spawn().await?;
-    let pulled = nas_pull_with_progress(&scratch, dir_root, link, on_progress).await;
+    let pulled = nas_pull_with_progress(&scratch, dir_root, link, compress, on_progress).await;
     scratch.shutdown().await;
     let (manifest, chunk_lists, disk, chunks) = pulled?;
     nas_serve(manifest, chunk_lists, disk, chunks, identity, link).await

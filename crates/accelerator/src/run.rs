@@ -16,6 +16,8 @@ pub struct Overrides {
     pub role: Option<Role>,
     pub cache_mib: Option<u64>,
     pub replica_dir: Option<String>,
+    /// `Some(false)` from `--no-compress-replica`; `None` leaves `config.toml`.
+    pub compress_replica: Option<bool>,
     pub admin_listen: Option<String>,
     /// `Some("")` clears `AcceleratorConfig::rendezvous_listen` back to
     /// `None` (merged onto `admin_listen`); `Some(addr)` sets it; `None`
@@ -37,6 +39,9 @@ pub async fn run(home: Home, overrides: Overrides) -> anyhow::Result<()> {
     }
     if overrides.replica_dir.is_some() {
         config.replica_dir = overrides.replica_dir;
+    }
+    if let Some(v) = overrides.compress_replica {
+        config.compress_replica = v;
     }
     if let Some(v) = overrides.admin_listen {
         config.admin_listen = v;

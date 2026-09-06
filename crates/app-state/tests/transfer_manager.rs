@@ -746,6 +746,7 @@ async fn nas_accelerator_replicates_a_share() {
     node.start_accelerator(AcceleratorRequest::Nas {
         dir: replica_dir.path().to_path_buf(),
         shares: vec![link],
+        paused: vec![],
     });
 
     let up = wait_for(&node, 60, |s| {
@@ -760,6 +761,76 @@ async fn nas_accelerator_replicates_a_share() {
 
     node.stop_accelerator();
     wait_for(&node, 10, |s| s.accelerator.is_none()).await;
+}
+
+#[tokio::test]
+async fn nas_share_pauses_resumes_and_remove_deletes_the_replica() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 40, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let mid = seed.manifest_id.to_hex();
+    let link = ShareLink::new(seed.name.clone(), seed.manifest_id, vec![seed.share_addr.clone().unwrap()]);
+
+    let replica_dir = TempDir::new().unwrap();
+    let node = App::new(None).await.unwrap();
+    node.start_accelerator(AcceleratorRequest::Nas {
+        dir: replica_dir.path().to_path_buf(),
+        shares: vec![link],
+        paused: vec![],
+    });
+
+    let up = wait_for(&node, 120, |s| {
+        s.accelerator.as_ref().is_some_and(|a| {
+            a.shares.iter().any(|r| r.replica_chunks.unwrap_or(0) > 0 && r.seeding)
+        })
+    })
+    .await;
+    let row = up.accelerator.unwrap().shares.into_iter().next().unwrap();
+    let on_disk = row.replica_path.clone().unwrap();
+    assert!(on_disk.is_dir(), "replica dir exists while serving");
+
+    // disk_bytes is filled in by the manager's periodic walk (~10 s).
+    wait_for(&node, 40, |s| {
+        s.accelerator
+            .as_ref()
+            .and_then(|a| a.shares.first())
+            .is_some_and(|r| r.disk_bytes.unwrap_or(0) > 0)
+    })
+    .await;
+
+    // Pause: stop serving, keep the bytes.
+    node.accel_set_seeding(mid.clone(), false);
+    wait_for(&node, 20, |s| {
+        s.accelerator
+            .as_ref()
+            .and_then(|a| a.shares.first())
+            .is_some_and(|r| !r.seeding && r.listen_addr.is_none())
+    })
+    .await;
+    assert!(on_disk.is_dir(), "pause keeps the replica on disk");
+
+    // Resume: serve again (a cheap top-up — the replica is already complete).
+    node.accel_set_seeding(mid.clone(), true);
+    wait_for(&node, 120, |s| {
+        s.accelerator
+            .as_ref()
+            .and_then(|a| a.shares.first())
+            .is_some_and(|r| r.seeding && r.error.is_none() && r.replicating.is_none())
+    })
+    .await;
+
+    // Remove: replica is deleted from disk.
+    node.accel_remove_share(mid.clone());
+    wait_for(&node, 20, |s| {
+        s.accelerator.as_ref().is_some_and(|a| a.shares.is_empty())
+    })
+    .await;
+    wait_for(&node, 15, |_| !on_disk.exists()).await;
 }
 
 /// A second folder with distinct content, so two shares have distinct manifests.
@@ -1078,6 +1149,7 @@ async fn a_download_swarms_across_tracker_discovered_replicas() {
     nas.start_accelerator(AcceleratorRequest::Nas {
         dir: replica_dir.path().to_path_buf(),
         shares: vec![link],
+        paused: vec![],
     });
     wait_for(&nas, 60, |s| {
         s.accelerator.as_ref().is_some_and(|a| a.replica_chunks.unwrap_or(0) > 0)

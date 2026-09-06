@@ -10,6 +10,10 @@ postcard.workspace = true
 thiserror.workspace = true
 blake3 = "1.8"
 fastcdc = "5"
+# Optional on-disk compression for the NAS-replica `DiskChunkStore` (one file
+# per chunk, `.zst` when it shrinks the chunk). Kept crate-local like `net`'s
+# own `lz4_flex` wire compression rather than promoted to workspace deps.
+zstd = "0.13"
 ed25519-dalek = "2"
 getrandom = "0.2"
 base64 = "0.22"

@@ -4,8 +4,8 @@
 use std::time::{Duration, SystemTime};
 
 use app_state::{
-    AccelShareRow, AcceleratorState, LogLevel, RemoteAccelState, SourceStats, SpeedSample, Theme,
-    TransferRow, TransferStatus,
+    AccelShareRow, AcceleratorRole, AcceleratorState, LogLevel, RemoteAccelState, SourceStats,
+    SpeedSample, Theme, TransferRow, TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -688,16 +688,19 @@ fn accelerator_form(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         .into_any_element()
 }
 
-/// One "share carried by an accelerator" row, with a Remove button.
+/// One "share carried by an accelerator" row: a seed pause/resume toggle (local
+/// NAS only), its on-disk footprint + path, and a Remove button that confirms
+/// first (removing a NAS share deletes its replica from disk).
 fn accel_share_row(
     prefix: &str,
     s: &AccelShareRow,
-    on_remove: impl Fn(&mut Gaggle, &ClickEvent, &mut gpui::Window, &mut Context<Gaggle>) + 'static,
+    is_local_nas: bool,
+    remote_label: Option<String>,
     cx: &mut Context<Gaggle>,
 ) -> impl IntoElement {
     let t = theme::active();
     let key = format!("{prefix}-{}", s.manifest_id);
-    let meta = if let Some(e) = &s.error {
+    let mut meta = if let Some(e) = &s.error {
         format!("!! {e}")
     } else if let Some(p) = &s.replicating {
         if p.chunks_total == 0 {
@@ -716,36 +719,85 @@ fn accel_share_row(
     } else {
         format!("{} files · {}", s.files, human_bytes(s.total_bytes))
     };
+    if let Some(b) = s.disk_bytes {
+        meta.push_str(&format!(" · {} on disk", human_bytes(b)));
+    }
+
+    let on_disk = is_local_nas || s.replica_chunks.is_some() || s.disk_bytes.is_some();
+    let mid = s.manifest_id.clone();
+    let name = s.name.clone();
+    let seeding = s.seeding;
+
+    let mut info = div().flex().flex_col().min_w_0().child(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if is_local_nas && !seeding { t.muted } else { t.fg })
+                    .child(s.name.clone()),
+            )
+            .when(s.private, |el| el.child(chip("private", t.info)))
+            .when(is_local_nas && !seeding, |el| el.child(chip("paused", t.muted))),
+    );
+    info = info.child(
+        div()
+            .text_xs()
+            .font_family(theme::MONO)
+            .text_color(if s.error.is_some() { t.bad } else { t.muted })
+            .child(meta),
+    );
+    if let Some(path) = &s.replica_path {
+        info = info.child(
+            div()
+                .text_xs()
+                .font_family(theme::MONO)
+                .text_color(t.muted)
+                .child(path.display().to_string()),
+        );
+    }
+
+    let mut actions = div().flex().items_center().gap_2().flex_shrink_0();
+    if is_local_nas {
+        let toggle_mid = mid.clone();
+        actions = actions.child(
+            div()
+                .id((SharedString::from(format!("{key}-seed")), 0))
+                .flex()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .child(checkmark(if seeding { Tri::On } else { Tri::Off }))
+                .child(div().text_xs().text_color(t.muted).child("Seed"))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.accel_set_seeding(toggle_mid.clone(), !seeding, cx)
+                })),
+        );
+    }
+    actions = actions.child(danger_btn((SharedString::from(key), 1), "Remove").on_click(
+        cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.ask_remove_accel_share(
+                mid.clone(),
+                name.clone(),
+                on_disk,
+                remote_label.clone(),
+                window,
+                cx,
+            )
+        }),
+    ));
+
     div()
         .flex()
         .items_center()
         .justify_between()
         .gap_2()
         .py(px(2.0))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(s.name.clone()))
-                        .when(s.private, |el| el.child(chip("private", t.info))),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .font_family(theme::MONO)
-                        .text_color(if s.error.is_some() { t.bad } else { t.muted })
-                        .child(meta),
-                ),
-        )
-        .child(
-            danger_btn((SharedString::from(key), 0), "Remove")
-                .on_click(cx.listener(on_remove)),
-        )
+        .child(info)
+        .child(actions)
 }
 
 fn accelerator_status(app: &Gaggle, acc: &AcceleratorState, cx: &mut Context<Gaggle>) -> AnyElement {
@@ -789,14 +841,9 @@ fn accelerator_status(app: &Gaggle, acc: &AcceleratorState, cx: &mut Context<Gag
     if acc.shares.is_empty() {
         c = c.child(hint("no shares — add one below, or run as a plain relay"));
     }
+    let is_nas = acc.role == AcceleratorRole::Nas;
     for s in &acc.shares {
-        let mid = s.manifest_id.clone();
-        c = c.child(accel_share_row(
-            "acc-share",
-            s,
-            move |this, _, _, cx| this.accel_remove_share(mid.clone(), cx),
-            cx,
-        ));
+        c = c.child(accel_share_row("acc-share", s, is_nas, None, cx));
     }
     c = c
         .child(field("Add share link", &app.accel_add))
@@ -895,12 +942,11 @@ fn remote_row(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> A
     }
 
     for s in &r.shares {
-        let label = label.clone();
-        let mid = s.manifest_id.clone();
         panel = panel.child(accel_share_row(
             &format!("rmt-{label}"),
             s,
-            move |this, _, _, cx| this.remote_remove_share(label.clone(), mid.clone(), cx),
+            false,
+            Some(label.clone()),
             cx,
         ));
     }
@@ -1170,6 +1216,19 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
                 cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_go(false, cx)),
             ));
             "Any partial download data is discarded.".into()
+        }
+        ConfirmKind::AccelShare { on_disk, .. } => {
+            actions = actions.child(danger_btn("cf-rm", "Remove").on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_go(false, cx)),
+            ));
+            if *on_disk {
+                "Deletes this share's replica from the NAS disk. This can't be undone — \
+                 re-adding the share would re-download it. To stop uploading without \
+                 losing the data, use the Seed toggle instead."
+                    .into()
+            } else {
+                "Stops this accelerator from caching the share.".into()
+            }
         }
     };
 

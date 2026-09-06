@@ -114,6 +114,10 @@ pub struct ShareStatus {
     /// NAS role: chunks of this share on the durable replica.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_chunks: Option<u64>,
+    /// NAS role: bytes the replica occupies on disk (the *compressed* footprint
+    /// when compression is on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
     /// NAS role: this share's own serving address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
@@ -142,7 +146,13 @@ pub struct ReplicationProgress {
 /// A mutation the router hands to the daemon's supervisor.
 pub enum AdminCommand {
     AddShare { token: String, ack: oneshot::Sender<Result<(), String>> },
-    RemoveShare { manifest_id: String, ack: oneshot::Sender<Result<(), String>> },
+    RemoveShare {
+        manifest_id: String,
+        /// Keep the NAS replica's on-disk chunks (admin API `?keep_data=1`).
+        /// Default is to delete them.
+        keep_data: bool,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Everything the [`router`] needs. Cheap to clone.
@@ -248,11 +258,15 @@ async fn add_share_handler(
 async fn remove_share_handler(
     State(state): State<AdminState>,
     Path(manifest_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
+    let keep_data = params.get("keep_data").is_some_and(|v| {
+        v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true")
+    });
     let (ack, rx) = oneshot::channel();
     if state
         .commands
-        .send(AdminCommand::RemoveShare { manifest_id, ack })
+        .send(AdminCommand::RemoveShare { manifest_id, keep_data, ack })
         .await
         .is_err()
     {
@@ -397,29 +411,38 @@ impl AdminClient {
     }
 
     pub async fn status(&mut self) -> anyhow::Result<DaemonStatus> {
-        self.send("GET", "/admin/status", None).await
+        self.send("GET", "/admin/status", "", None).await
     }
 
     pub async fn list_shares(&mut self) -> anyhow::Result<Vec<ShareStatus>> {
-        self.send("GET", "/admin/shares", None).await
+        self.send("GET", "/admin/shares", "", None).await
     }
 
     pub async fn add_share(&mut self, link: &str) -> anyhow::Result<()> {
         let body = serde_json::to_vec(&serde_json::json!({ "link": link }))?;
-        self.send_unit("POST", "/admin/shares", Some(body)).await
+        self.send_unit("POST", "/admin/shares", "", Some(body)).await
     }
 
+    /// Stop accelerating a share and delete its NAS replica from disk.
     pub async fn remove_share(&mut self, manifest_id: &str) -> anyhow::Result<()> {
-        self.send_unit("DELETE", &format!("/admin/shares/{manifest_id}"), None).await
+        self.send_unit("DELETE", &format!("/admin/shares/{manifest_id}"), "", None).await
+    }
+
+    /// Like [`remove_share`](Self::remove_share) but keep the on-disk replica so
+    /// a later re-add resumes instead of re-fetching.
+    pub async fn remove_share_keep_data(&mut self, manifest_id: &str) -> anyhow::Result<()> {
+        self.send_unit("DELETE", &format!("/admin/shares/{manifest_id}"), "?keep_data=1", None)
+            .await
     }
 
     async fn send_unit(
         &mut self,
         method: &str,
         path: &str,
+        query: &str,
         body: Option<Vec<u8>>,
     ) -> anyhow::Result<()> {
-        let _: serde::de::IgnoredAny = self.send(method, path, body).await?;
+        let _: serde::de::IgnoredAny = self.send(method, path, query, body).await?;
         Ok(())
     }
 
@@ -427,6 +450,7 @@ impl AdminClient {
         &mut self,
         method: &str,
         path: &str,
+        query: &str,
         body: Option<Vec<u8>>,
     ) -> anyhow::Result<T> {
         let body = body.unwrap_or_default();
@@ -434,11 +458,13 @@ impl AdminClient {
         let mut nonce = [0u8; 12];
         getrandom::getrandom(&mut nonce).expect("system RNG unavailable");
         let nonce = b64(&nonce);
+        // Signed over the bare path only — the daemon verifies against
+        // `uri.path()`, which excludes the query string.
         let sig = self.operator.sign(&canonical(method, path, &ts, &nonce, &body));
         let agent_hex = self.operator.public().to_hex();
         let sig_b64 = b64(&sig.to_bytes());
 
-        let url = format!("{}{path}", self.base);
+        let url = format!("{}{path}{query}", self.base);
         let headers = [
             (H_AGENT, agent_hex.as_str()),
             (H_TIMESTAMP, ts.as_str()),

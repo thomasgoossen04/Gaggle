@@ -75,6 +75,9 @@ struct RunArgs {
     /// NAS replica root directory.
     #[arg(long = "dir")]
     replica_dir: Option<String>,
+    /// NAS role: store the replica raw instead of zstd-compressed on disk.
+    #[arg(long)]
+    no_compress_replica: bool,
     /// host:port for the admin API.
     #[arg(long)]
     admin_listen: Option<String>,
@@ -110,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
                     role: args.role,
                     cache_mib: args.cache_mib,
                     replica_dir: args.replica_dir,
+                    compress_replica: if args.no_compress_replica { Some(false) } else { None },
                     admin_listen: args.admin_listen,
                     rendezvous_listen: args.rendezvous_listen,
                     listen: args.listen,
@@ -174,7 +178,16 @@ async fn main() -> anyhow::Result<()> {
                         println!("no configured share with manifest id {want}");
                     } else {
                         config.save(&path)?;
-                        println!("removed {want}");
+                        // Reclaim the on-disk replica too (NAS role). Best-effort:
+                        // a relay has none, and a missing dir is fine.
+                        let replica = config.resolved_replica_dir(&home).join(want);
+                        match std::fs::remove_dir_all(&replica) {
+                            Ok(()) => println!("removed {want} and its replica at {}", replica.display()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                println!("removed {want}")
+                            }
+                            Err(e) => println!("removed {want} (could not delete {}: {e})", replica.display()),
+                        }
                     }
                 }
             }

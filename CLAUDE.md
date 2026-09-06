@@ -20,7 +20,10 @@ directory is git-ignored — read it, don't rely on it being present for others)
 Milestone 1 (the `gaggle-core` data model — chunking, Merkle trees, manifest, dedup)
 is implemented and tested. `gaggle-core` ships four `ChunkStore`s: `MemoryChunkStore`
 (a plain map), `LruChunkCache` (byte-budgeted, LRU eviction — the relay's hot cache),
-`DiskChunkStore` (durable, one sharded file per chunk — the NAS replica), and
+`DiskChunkStore` (durable, one sharded file per chunk — the NAS replica;
+`open_with_opts(dir, compress)` stores each chunk zstd-compressed when that
+shrinks it, as `<hex>.zst`, so a store is self-describing per chunk and raw +
+compressed chunks coexist with no migration), and
 `SourceChunkStore` (streaming seed — no bytes retained: it reads each requested chunk
 from the original files on disk, verifies it, and holds it in a bounded `LruChunkCache`).
 `snapshot::index_dir` is `snapshot_dir` without the `store.put`: it returns the same
@@ -111,7 +114,8 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   bad-signature invites) and `GET /invites/{code}`.
 - **`accelerator` binary** is a config-file + admin-API daemon (see "Remote,
   multi-share accelerators" below): `accelerator run [--role relay|nas]
-  [--cache-mib N] [--dir <path>] [--admin-listen host:port] [--listen <maddr>]`,
+  [--cache-mib N] [--dir <path>] [--no-compress-replica] [--admin-listen host:port]
+  [--listen <maddr>]`,
   plus `accelerator identity` / `authorize <hex>` / `share {add|rm|ls}`. State
   lives under `--home` / `$GAGGLE_ACCEL_HOME` / the per-OS data dir (`dirs::data_dir()`
   — `~/.local/share` Linux, `~/Library/Application Support` macOS, `%APPDATA%` Windows)
@@ -159,8 +163,17 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   runs an in-process `RelayNode` or NAS replica set carrying a *list* of `ShareLink`s
   (see "Remote, multi-share accelerators" below), surfaced as `AppState::accelerator`
   (role, peer id, listen addr, live `CacheStats` / replica chunk count, per-share rows).
-  `App::benchmark()` measures sequential write throughput to the download volume plus
-  free space (`statvfs` on unix) and suggests a role.
+  Each `AccelShareRow` also carries `disk_bytes` (replica footprint, refreshed by a
+  ~10 s off-thread walk in `Manager::tick`), `replica_path` (local NAS only), and
+  `seeding`. `App::accel_set_seeding(id, on)` pauses/resumes one NAS share —
+  pause shuts its serving `Node` down but keeps the replica dir + token + update
+  polling (persisted as `PersistedAccelerator::paused_shares` / restored via
+  `AcceleratorRequest::Nas::paused`); resume re-runs the add path (a cheap top-up).
+  `App::accel_remove_share(id)` now **deletes** a NAS share's on-disk replica dir
+  (the GUI confirms first); the in-process NAS always stores the replica
+  zstd-compressed (`manager::COMPRESS_REPLICA`). `App::benchmark()` measures
+  sequential write throughput to the download volume plus free space (`statvfs` on
+  unix) and suggests a role.
 **Remote, multi-share accelerators** — accelerators are no longer bound to one
 share, and can be driven remotely:
 
@@ -177,27 +190,39 @@ share, and can be driven remotely:
   sibling identities (NAS uses one per share). `gaggle_core::{AgentKeypair,
   AgentId}` is a general Ed25519 signer (sibling of the per-share `identity` module).
 - **`control-plane::admin`** — `router(AdminState)` serves `GET /admin/status`,
-  `GET|POST /admin/shares`, `DELETE /admin/shares/{id}`. Every request is signed
+  `GET|POST /admin/shares`, `DELETE /admin/shares/{id}` (add `?keep_data=1` to
+  keep a NAS replica's bytes for a resume; the default and `AdminClient::remove_share`
+  delete them — `remove_share_keep_data` opts out; the flag rides only the URL,
+  not the signed canonical path). Every request is signed
   by the operator's `AgentKeypair` (canonical `METHOD\nPATH\nTS\nNONCE\nblake3(body)`,
   headers `x-gaggle-agent|timestamp|nonce|signature`, ±60 s skew, checked against
   `AdminState.authorized`); every response is signed by the daemon key
   (`x-gaggle-daemon[-signature]`) so `AdminClient` TOFU-pins it. Mutations go out
-  an `mpsc<AdminCommand>`; status comes in a `watch<DaemonStatus>` — no `net` dep.
+  an `mpsc<AdminCommand>` (`RemoveShare { manifest_id, keep_data }`); status comes
+  in a `watch<DaemonStatus>` — no `net` dep. `ShareStatus.disk_bytes` reports the
+  replica's on-disk footprint.
   `DaemonStatus.bytes_served_total: Option<u64>` (additive, `skip_serializing_if`)
   carries the daemon's cumulative served bytes so a client can diff successive polls
   into an outbound-throughput graph.
 - **`accelerator` daemon** — `config.rs` (`AcceleratorConfig` toml: role, listen,
-  admin_listen, cache_mib, replica_dir, `authorized_keys`, `shares`),
+  admin_listen, cache_mib, replica_dir, `compress_replica` (default true; `accelerator
+  run --no-compress-replica` opts out — NAS stores the replica zstd-compressed on
+  disk), `authorized_keys`, `shares`),
   `supervisor.rs` (`Supervisor` owns a multi-share `RelayNode` **or** a
   `HashMap<Hash, Node>` of per-share replicas; applies `AdminCommand`s and
-  rewrites `config.toml`; `refresh_served()` reads the relay's `cache_stats().bytes_served`
-  or the sum of each NAS node's `serve_stats()` into `last_served` before every
+  rewrites `config.toml`; `RemoveShare` deletes the replica dir unless `keep_data`;
+  `refresh_served()` reads the relay's `cache_stats().bytes_served`
+  or the sum of each NAS node's `serve_stats()` into `last_served` (and each NAS
+  replica's on-disk size into `disk_bytes`) before every
   `publish()`, incl. on the 30 s tracker-announce tick), `run.rs` (identity + config +
   supervisor + admin server). Prints its peer id + public key on every start.
+  Offline `accelerator share rm <manifest-id>` also deletes the replica dir.
 - **`app-state`** — `App` keeps a persistent operator `AgentKeypair` at
   `operator.key` (`App::operator_public_key()`). `AcceleratorRequest::{Relay,Nas}`
-  take `shares: Vec<ShareLink>`; `AcceleratorState.shares: Vec<AccelShareRow>`;
-  `App::accel_add_share` / `accel_remove_share` mutate a *running* local
+  take `shares: Vec<ShareLink>` (Nas also `paused: Vec<String>`);
+  `AcceleratorState.shares: Vec<AccelShareRow>`;
+  `App::accel_add_share` / `accel_remove_share` (deletes a NAS replica dir) /
+  `accel_set_seeding` mutate a *running* local
   accelerator. `Settings.remote_accelerators: Vec<RemoteAccelerator>` (label +
   admin URL + pinned `daemon_key`); `App::{add,remove}_remote_accelerator` /
   `remote_{add,remove}_share`; the manager polls each every ~10 s via `AdminClient`
@@ -286,7 +311,9 @@ pause keeps partial + resume finishes, settings survive a restart, removing a se
 later subscribers fail, **rescan→check_updates→resync applies only the delta** (added
 file arrives, removed file is deleted, `version` bumps), **a private share refuses a
 strangers then admits a minted invite**, **benchmark reports throughput + free space**,
-**a NAS accelerator replicates a share**, **a seed streams a folder several times its
+**a NAS accelerator replicates a share**, **a NAS share pauses (replica kept on
+disk) / resumes / and Remove deletes the replica dir**, **a seed streams a folder
+several times its
 `seed_cache_bytes` budget from disk and still serves every chunk**, **a real loopback
 transfer leaves the seeder with a non-zero-`up_bps` `stats.local` history and both ends
 with a growing sample count**. `app-state` unit
@@ -304,7 +331,8 @@ remote reporting unreachable + persisting. `crates/net/tests/accelerator.rs` add
 one-relay-two-shares, mixed public/private on one relay, `remove_share`, and
 persistent-identity tests. `crates/control-plane/tests/admin.rs` round-trips a
 signed request through the admin router (authorised ok; bad key / stale ts → 401;
-add-share reaches the supervisor channel). `crates/control-plane/tests/rendezvous.rs`
+add-share reaches the supervisor channel; `DELETE /admin/shares/{id}` reaches it
+with `keep_data=false`, `?keep_data=1` with `true`). `crates/control-plane/tests/rendezvous.rs`
 round-trips a subscriber/origin pair through a live rendezvous server, including two
 subscribers waiting on the same origin at once. `a_share_reachable_only_through_nat_rendezvous_still_completes`
 in `app-state/tests/transfer_manager.rs` subscribes with only a deliberately-bogus,
@@ -326,7 +354,10 @@ test exists to cover. `crates/core/tests/snapshot.rs` adds a
 `sync_share` delta-apply test and an `index_dir` test (locations cover every chunk; a
 `SourceChunkStore` over them rebuilds the tree byte-for-byte). `store.rs` unit-tests
 `SourceChunkStore` read-through + caching, its no-op `put`, and its refusal to serve a
-source file that changed after the scan.
+source file that changed after the scan; and `DiskChunkStore` zstd compression —
+a compressible chunk is stored `.zst` (footprint shrinks) while an incompressible
+one falls back to raw, and a raw store reopened with compression on keeps reading
+old chunks while writing new ones compressed.
 
 ## Commands
 
@@ -523,7 +554,9 @@ reads. Module layout and how the pieces chain:
 - **`store`** — `ChunkStore` trait + four impls: `MemoryChunkStore` (plain map,
   `DedupStats`), `LruChunkCache` (byte-budgeted, LRU eviction, `CacheStats` — relay
   hot cache), `DiskChunkStore` (durable, sharded one-file-per-chunk, `try_get` /
-  `try_put` for explicit `io::Result` — NAS replica), and `SourceChunkStore` (a
+  `try_put` for explicit `io::Result` — NAS replica; `open_with_opts(_, true)`
+  stores each chunk zstd-compressed as `<hex>.zst` when it shrinks, self-describing
+  per chunk so raw + compressed mix freely), and `SourceChunkStore` (a
   `root` + a `Hash -> ChunkLocation` index + a bounded `LruChunkCache`; `get` reads
   the range from the source file, re-hashes it — a since-changed file yields `None` —
   and caches it; `put` is a no-op — the streaming seed). Dedup is just content

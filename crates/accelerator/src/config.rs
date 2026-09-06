@@ -91,6 +91,11 @@ pub struct AcceleratorConfig {
     pub cache_mib: u64,
     /// NAS role: replica root. Relative paths resolve under the home dir.
     pub replica_dir: Option<String>,
+    /// NAS role: store replica chunks zstd-compressed on disk (only kept for a
+    /// chunk when it actually shrinks it). On by default; `accelerator run
+    /// --no-compress-replica` turns it off.
+    #[serde(default = "default_true")]
+    pub compress_replica: bool,
     /// Hex `AgentId`s permitted to call the admin API.
     pub authorized_keys: Vec<String>,
     /// `gaggleshare1…` tokens to accelerate on boot and keep in sync.
@@ -106,10 +111,15 @@ impl Default for AcceleratorConfig {
             rendezvous_listen: None,
             cache_mib: 256,
             replica_dir: None,
+            compress_replica: true,
             authorized_keys: Vec::new(),
             shares: Vec::new(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl AcceleratorConfig {

@@ -209,16 +209,22 @@ since the invite is pinned to a specific manifest.
 From the GUI's **Accelerator** tab: **Benchmark** measures your disk throughput and free
 space and suggests a role, then **Start relay** (bandwidth-heavy hot-chunk cache) or
 **Start NAS** (storage-heavy full replica) with one or more share links pasted in. The
-card that appears lists every share it's carrying, with per-share add/remove and live
-cache/replica stats.
+card that appears lists every share it's carrying — each row shows its size on disk and
+(NAS) the replica path, has a **Seed** checkbox to pause/resume uploading it without
+losing the local copy, and a **Remove** button. Removing a NAS share **deletes its
+replica from disk** (you're asked to confirm first); use the Seed toggle instead if you
+only want to stop uploading. A NAS replica is stored compressed on disk (zstd) to save
+space.
 
 Headless, for something that should run unattended on its own machine:
 
 ```bash
 cargo run -p accelerator -- run --role relay --cache-mib 4096
+cargo run -p accelerator -- run --role nas --no-compress-replica   # NAS, replica stored raw
 cargo run -p accelerator -- identity                # print its public key
 cargo run -p accelerator -- authorize <operator-key-hex>   # let yourself manage it remotely
 cargo run -p accelerator -- share add gaggleshare1…  # queue a share to carry, offline
+cargo run -p accelerator -- share rm <manifest-id>   # stop carrying it (deletes the NAS replica)
 ```
 
 For a box that should stay current on its own with no manual redeploys, run it through

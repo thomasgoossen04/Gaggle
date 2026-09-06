@@ -134,6 +134,7 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
     let operator = AgentKeypair::from_seed([1u8; 32]);
     let mut h = spawn(vec![operator.public()]).await;
     let status_tx = h.status_tx.clone();
+    let (keep_data_tx, mut keep_data_rx) = mpsc::unbounded_channel::<bool>();
 
     // Stand in for the daemon supervisor: ack the AddShare and update status.
     tokio::spawn(async move {
@@ -150,6 +151,7 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
                         private: false,
                         cached_chunks: Some(0),
                         replica_chunks: None,
+                        disk_bytes: None,
                         listen_addr: None,
                         replicating: None,
                         error: None,
@@ -157,7 +159,8 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
                     let _ = status_tx.send(s);
                     let _ = ack.send(Ok(()));
                 }
-                AdminCommand::RemoveShare { ack, .. } => {
+                AdminCommand::RemoveShare { keep_data, ack, .. } => {
+                    let _ = keep_data_tx.send(keep_data);
                     let _ = ack.send(Ok(()));
                 }
             }
@@ -170,4 +173,10 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
     let shares = client.list_shares().await.unwrap();
     assert_eq!(shares.len(), 1);
     assert_eq!(shares[0].name, "gaggleshare1demo");
+
+    // A plain remove purges the on-disk replica; the opt-out keeps it.
+    client.remove_share("deadbeef").await.unwrap();
+    assert_eq!(keep_data_rx.recv().await, Some(false));
+    client.remove_share_keep_data("deadbeef").await.unwrap();
+    assert_eq!(keep_data_rx.recv().await, Some(true));
 }

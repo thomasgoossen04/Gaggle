@@ -178,6 +178,15 @@ pub struct AccelShareRow {
     pub private: bool,
     /// NAS role: chunks of this share on the durable replica.
     pub replica_chunks: Option<u64>,
+    /// NAS role: bytes the replica occupies on disk — the *compressed* footprint
+    /// when the accelerator stores it compressed.
+    pub disk_bytes: Option<u64>,
+    /// NAS role, local accelerator only: where the replica lives on disk.
+    pub replica_path: Option<PathBuf>,
+    /// NAS role: whether this share is currently served (uploaded). `false` =
+    /// paused by the operator — the replica bytes stay on disk and background
+    /// update checks keep running, but nothing is uploaded until re-enabled.
+    pub seeding: bool,
     /// NAS role: this share's own serving address.
     pub listen_addr: Option<String>,
     /// NAS role: set while the initial replication is still under way.

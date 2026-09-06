@@ -98,6 +98,10 @@ pub enum ConfirmKind {
     Share,
     /// A download — discard it, optionally deleting `output_dir`.
     Transfer { output_dir: Option<PathBuf> },
+    /// A share carried by an accelerator. Removing a NAS share (`on_disk`)
+    /// deletes its replica from disk; `remote` names the daemon when it is a
+    /// remote accelerator's share.
+    AccelShare { manifest_id: String, on_disk: bool, remote: Option<String> },
 }
 
 pub struct Gaggle {
@@ -399,6 +403,27 @@ impl Gaggle {
         cx.notify();
     }
 
+    /// Arm the Remove confirmation for a share carried by an accelerator.
+    /// `on_disk` warns that a NAS replica will be deleted; `remote` names the
+    /// daemon for a remote accelerator's share.
+    pub(crate) fn ask_remove_accel_share(
+        &mut self,
+        manifest_id: String,
+        name: String,
+        on_disk: bool,
+        remote: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm = Some(Confirm {
+            id: 0,
+            name,
+            kind: ConfirmKind::AccelShare { manifest_id, on_disk, remote },
+        });
+        self.confirm_focus.focus(window);
+        cx.notify();
+    }
+
     pub(crate) fn confirm_cancel(&mut self, cx: &mut Context<Self>) {
         self.confirm = None;
         cx.notify();
@@ -407,10 +432,13 @@ impl Gaggle {
     /// Act on the armed confirmation. `delete_files` only applies to a download.
     pub(crate) fn confirm_go(&mut self, delete_files: bool, cx: &mut Context<Self>) {
         if let Some(c) = self.confirm.take() {
-            if delete_files {
-                self.app.remove_and_delete(c.id);
-            } else {
-                self.app.remove(c.id);
+            match &c.kind {
+                ConfirmKind::AccelShare { manifest_id, remote, .. } => match remote {
+                    Some(label) => self.app.remote_remove_share(label.clone(), manifest_id.clone()),
+                    None => self.app.accel_remove_share(manifest_id.clone()),
+                },
+                _ if delete_files => self.app.remove_and_delete(c.id),
+                _ => self.app.remove(c.id),
             }
             self.set_notice(format!("Removed “{}”", c.name), cx);
         }
@@ -696,7 +724,11 @@ impl Gaggle {
         } else if shares.is_empty() || bad > 0 {
             self.set_notice("NAS mode needs at least one valid share link", cx);
         } else {
-            self.app.start_accelerator(AcceleratorRequest::Nas { dir: dir.into(), shares });
+            self.app.start_accelerator(AcceleratorRequest::Nas {
+                dir: dir.into(),
+                shares,
+                paused: vec![],
+            });
             self.set_notice("Starting NAS replica…", cx);
         }
     }
@@ -715,9 +747,10 @@ impl Gaggle {
         self.set_notice("Adding share to the accelerator…", cx);
     }
 
-    pub(crate) fn accel_remove_share(&mut self, manifest_id: String, cx: &mut Context<Self>) {
-        self.app.accel_remove_share(manifest_id);
-        cx.notify();
+    /// Pause / resume serving one NAS-accelerator share.
+    pub(crate) fn accel_set_seeding(&mut self, manifest_id: String, on: bool, cx: &mut Context<Self>) {
+        self.app.accel_set_seeding(manifest_id, on);
+        self.set_notice(if on { "Resuming share…" } else { "Paused — replica kept on disk" }, cx);
     }
 
     pub(crate) fn copy_operator_key(&mut self, cx: &mut Context<Self>) {
@@ -754,15 +787,6 @@ impl Gaggle {
         self.set_notice("Sending share to the remote accelerator…", cx);
     }
 
-    pub(crate) fn remote_remove_share(
-        &mut self,
-        label: String,
-        manifest_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.app.remote_remove_share(label, manifest_id);
-        cx.notify();
-    }
 
     pub(crate) fn toggle_theme_menu(&mut self, cx: &mut Context<Self>) {
         self.theme_menu_open = !self.theme_menu_open;

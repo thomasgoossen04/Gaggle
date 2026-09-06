@@ -72,7 +72,7 @@ impl ShareRecord {
 
 enum Backend {
     Relay { relay: RelayNode, meta_node: Node, listen_addrs: Vec<String> },
-    Nas { dir_root: PathBuf },
+    Nas { dir_root: PathBuf, compress: bool },
 }
 
 /// A background NAS replication reporting back to the main loop.
@@ -104,6 +104,9 @@ pub struct Supervisor {
     /// [`refresh_served`](Self::refresh_served) before every [`publish`](Self::publish)
     /// (the actual counters live on the `net` nodes and are read async).
     last_served: u64,
+    /// NAS role: per-share on-disk replica size, refreshed alongside
+    /// `last_served`.
+    disk_bytes: HashMap<Hash, u64>,
 }
 
 impl Supervisor {
@@ -140,7 +143,7 @@ impl Supervisor {
                 let dir_root = config.resolved_replica_dir(&home);
                 std::fs::create_dir_all(&dir_root)
                     .with_context(|| format!("creating {}", dir_root.display()))?;
-                Backend::Nas { dir_root }
+                Backend::Nas { dir_root, compress: config.compress_replica }
             }
         };
 
@@ -158,6 +161,7 @@ impl Supervisor {
             events_rx,
             tracker,
             last_served: 0,
+            disk_bytes: HashMap::new(),
         };
 
         let tokens = sup.config.shares.clone();
@@ -181,9 +185,11 @@ impl Supervisor {
                     let Some(cmd) = cmd else { break };
                     match cmd {
                         AdminCommand::AddShare { token, ack } => self.add_share(token, ack).await,
-                        AdminCommand::RemoveShare { manifest_id, ack } => {
-                            let result =
-                                self.remove_share(&manifest_id).await.map_err(|e| format!("{e:#}"));
+                        AdminCommand::RemoveShare { manifest_id, keep_data, ack } => {
+                            let result = self
+                                .remove_share(&manifest_id, keep_data)
+                                .await
+                                .map_err(|e| format!("{e:#}"));
                             let _ = ack.send(result);
                         }
                     }
@@ -272,8 +278,9 @@ impl Supervisor {
                     let _ = ack.send(Err(format!("{e:#}")));
                 }
             },
-            Backend::Nas { dir_root } => {
+            Backend::Nas { dir_root, compress } => {
                 let dir_root = dir_root.clone();
+                let compress = *compress;
                 let seed = match share_identity_seed(&self.identity, link.manifest_id) {
                     Ok(s) => s,
                     Err(e) => {
@@ -291,7 +298,7 @@ impl Supervisor {
                         .checked_sub(PROGRESS_THROTTLE)
                         .unwrap_or_else(Instant::now);
                     let progress_tx = events_tx.clone();
-                    let result = nas_add_share_with_progress(&dir_root, identity, &link, |p: SwarmProgress| {
+                    let result = nas_add_share_with_progress(&dir_root, identity, &link, compress, |p: SwarmProgress| {
                         let done = p.chunks_done >= p.chunks_total;
                         if done || last_sent.elapsed() >= PROGRESS_THROTTLE {
                             last_sent = Instant::now();
@@ -370,9 +377,11 @@ impl Supervisor {
     }
 
     /// Stop accelerating a share (aborting an in-flight replication, or
-    /// shutting down its serving node) — the on-disk replica bytes are kept,
-    /// so re-adding the same share resumes rather than starting over.
-    async fn remove_share(&mut self, manifest_id: &str) -> anyhow::Result<()> {
+    /// shutting down its serving node). Unless `keep_data` is set, a NAS
+    /// replica's on-disk chunk directory is deleted too — `keep_data` (the
+    /// admin API's `?keep_data=1`) preserves it so a later re-add resumes
+    /// rather than starting over.
+    async fn remove_share(&mut self, manifest_id: &str, keep_data: bool) -> anyhow::Result<()> {
         let id = Hash::from_hex(manifest_id.trim())
             .map_err(|_| anyhow::anyhow!("not a manifest id: {manifest_id:?}"))?;
         let record = self.shares.remove(&id).context("no such accelerated share")?;
@@ -393,6 +402,18 @@ impl Supervisor {
             }
             ShareRecord::Failed { .. } => {}
         }
+
+        if !keep_data
+            && let Backend::Nas { dir_root, .. } = &self.backend
+        {
+            let replica = dir_root.join(id.to_hex());
+            match tokio::fs::remove_dir_all(&replica).await {
+                Ok(()) => tracing::info!(share = %id, path = %replica.display(), "deleted on-disk replica"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(share = %id, path = %replica.display(), error = %e, "could not delete replica"),
+            }
+        }
+
         tracing::info!(share = %id, "stopped accelerating share");
         self.persist();
         Ok(())
@@ -401,7 +422,8 @@ impl Supervisor {
     /// Read the cumulative served-bytes counters off the running `net` nodes
     /// (a relay's own forwarded-bytes total, or the sum across every NAS
     /// share's serving node) into `self.last_served`, so the next sync
-    /// [`publish`](Self::publish) can report it in [`DaemonStatus`].
+    /// [`publish`](Self::publish) can report it in [`DaemonStatus`]. Also
+    /// refreshes each NAS replica's on-disk size for the same status.
     async fn refresh_served(&mut self) {
         self.last_served = match &self.backend {
             Backend::Relay { relay, .. } => {
@@ -419,6 +441,23 @@ impl Supervisor {
                 total
             }
         };
+        if let Backend::Nas { dir_root, .. } = &self.backend {
+            let ids: Vec<Hash> = self
+                .shares
+                .iter()
+                .filter(|(_, r)| matches!(r, ShareRecord::Ready { .. }))
+                .map(|(id, _)| *id)
+                .collect();
+            let dir_root = dir_root.clone();
+            let sizes = tokio::task::spawn_blocking(move || {
+                ids.into_iter()
+                    .map(|id| (id, dir_size(&dir_root.join(id.to_hex())).unwrap_or(0)))
+                    .collect::<HashMap<Hash, u64>>()
+            })
+            .await
+            .unwrap_or_default();
+            self.disk_bytes = sizes;
+        }
     }
 
     fn persist(&mut self) {
@@ -448,6 +487,7 @@ impl Supervisor {
                     private: false,
                     cached_chunks: None,
                     replica_chunks: None,
+                    disk_bytes: self.disk_bytes.get(id).copied(),
                     listen_addr: None,
                     replicating: progress.clone(),
                     error: None,
@@ -461,6 +501,7 @@ impl Supervisor {
                     private: meta.private,
                     cached_chunks: None,
                     replica_chunks: replica_chunks.map(|n| n as u64),
+                    disk_bytes: self.disk_bytes.get(&meta.manifest_id).copied(),
                     listen_addr: listen_addr.clone(),
                     replicating: None,
                     error: None,
@@ -474,6 +515,7 @@ impl Supervisor {
                     private: false,
                     cached_chunks: None,
                     replica_chunks: None,
+                    disk_bytes: None,
                     listen_addr: None,
                     replicating: None,
                     error: Some(error.clone()),
@@ -492,6 +534,33 @@ impl Supervisor {
         };
         let _ = self.status_tx.send(status);
     }
+}
+
+/// Sum the sizes of every file directly inside `dir`'s shard subdirectories —
+/// the [`DiskChunkStore`](gaggle_core::DiskChunkStore) layout (256 prefix
+/// shards, one file per chunk). Missing dir → `Ok(0)`.
+fn dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let shards = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for shard in shards {
+        let shard = shard?;
+        if !shard.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(shard.path())? {
+            let entry = entry?;
+            if let Ok(meta) = entry.metadata()
+                && meta.is_file()
+            {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// A `PeerInfo` for the seeder tracker from a peer id and its dialable
