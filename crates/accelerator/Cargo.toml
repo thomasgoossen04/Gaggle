@@ -15,3 +15,9 @@ serde.workspace = true
 dirs.workspace = true
 clap = { version = "4.6", features = ["derive"] }
 toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

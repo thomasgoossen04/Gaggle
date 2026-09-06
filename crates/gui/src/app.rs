@@ -111,6 +111,8 @@ pub enum ConfirmKind {
     /// deletes its replica from disk; `remote` names the daemon when it is a
     /// remote accelerator's share.
     AccelShare { manifest_id: String, on_disk: bool, remote: Option<String> },
+    /// Restart a remote accelerator daemon so it comes back on a newer build.
+    RestartRemote { label: String },
 }
 
 pub struct Gaggle {
@@ -170,6 +172,13 @@ pub struct Gaggle {
     pub(crate) stats_source: StatsSource,
     /// Stats tab: the source dropdown is open.
     pub(crate) stats_source_menu_open: bool,
+    /// When an open dropdown was last dismissed by a click *outside* it (its
+    /// `on_mouse_down_out`). If that click landed on the dropdown's own trigger,
+    /// the trigger's `on_click` fires a beat later in the same gesture and would
+    /// otherwise re-open what the outside-click just closed — so a `toggle_*`
+    /// within this short window is swallowed instead of flipped. See
+    /// [`Self::menu_click_swallowed`].
+    pub(crate) menu_dismissed_at: Option<Instant>,
     /// Stats tab: per-graph temporal smoothing state — the last-drawn curve for
     /// each graph, eased toward every fresh resample so the line glides rather
     /// than re-morphing on each 200 ms redraw. Interior-mutable because it is
@@ -212,6 +221,20 @@ pub struct Gaggle {
     /// them, since they'd all be bound to the same underlying state.
     /// Kept in sync with `state.remote_accelerators` by [`Self::sync_remote_inputs`].
     pub(crate) remote_add_inputs: HashMap<String, Entity<InputState>>,
+    /// Replica-folder + storage-cap edit fields for a remote NAS daemon, keyed
+    /// by label. Pre-filled with the daemon's current values on the first poll
+    /// that carries them (`seeded`). Also synced by [`Self::sync_remote_inputs`].
+    pub(crate) remote_storage_inputs: HashMap<String, RemoteStorageInputs>,
+}
+
+/// The two input entities behind a remote NAS daemon's storage edit form.
+pub struct RemoteStorageInputs {
+    pub dir: Entity<InputState>,
+    /// Storage cap in GiB, as typed text. Blank = no cap.
+    pub cap_gib: Entity<InputState>,
+    /// `true` once pre-filled from a status poll, so a later poll doesn't
+    /// clobber what the operator is typing.
+    pub seeded: bool,
 }
 
 impl Gaggle {
@@ -256,6 +279,7 @@ impl Gaggle {
             .iter()
             .map(|r| (r.label.clone(), text(cx, window, String::new())))
             .collect();
+        let remote_storage_inputs = HashMap::new();
 
         // Poll the manager (and, while the Logs tab is open, the log buffer)
         // and re-render on change. Both checks are cheap no-ops when nothing
@@ -323,6 +347,7 @@ impl Gaggle {
             stats_window: Duration::from_secs(300),
             stats_source: StatsSource::Local,
             stats_source_menu_open: false,
+            menu_dismissed_at: None,
             stats_ease: RefCell::new(HashMap::new()),
             theme_mode: Some(initial_mode),
             dragging: false,
@@ -342,6 +367,7 @@ impl Gaggle {
             remote_label,
             remote_url,
             remote_add_inputs,
+            remote_storage_inputs,
         }
     }
 
@@ -351,12 +377,35 @@ impl Gaggle {
     /// `&mut Window` (creating an `InputState` requires one), so it's called
     /// from [`Render::render`] rather than from the (window-less) view layer.
     fn sync_remote_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.remote_add_inputs
-            .retain(|label, _| self.state.remote_accelerators.iter().any(|r| &r.label == label));
-        for r in &self.state.remote_accelerators {
-            if !self.remote_add_inputs.contains_key(&r.label) {
-                let input = cx.new(|cx| InputState::new(window, cx).default_value(String::new()));
-                self.remote_add_inputs.insert(r.label.clone(), input);
+        let known = |label: &String| self.state.remote_accelerators.iter().any(|r| &r.label == label);
+        self.remote_add_inputs.retain(|label, _| known(label));
+        self.remote_storage_inputs.retain(|label, _| known(label));
+        // Collect first — the `set_value` calls below need `&mut cx` while we'd
+        // otherwise still be borrowing `self.state`.
+        let want: Vec<(String, Option<String>, Option<u64>)> = self
+            .state
+            .remote_accelerators
+            .iter()
+            .map(|r| (r.label.clone(), r.replica_dir.clone(), r.storage_cap_bytes))
+            .collect();
+        for (label, replica_dir, cap) in want {
+            self.remote_add_inputs.entry(label.clone()).or_insert_with(|| {
+                cx.new(|cx| InputState::new(window, cx).default_value(String::new()))
+            });
+            let entry = self.remote_storage_inputs.entry(label).or_insert_with(|| {
+                RemoteStorageInputs {
+                    dir: cx.new(|cx| InputState::new(window, cx).default_value(String::new())),
+                    cap_gib: cx.new(|cx| InputState::new(window, cx).default_value(String::new())),
+                    seeded: false,
+                }
+            });
+            if !entry.seeded && let Some(dir) = replica_dir {
+                let cap_text = cap
+                    .map(|b| format!("{:.0}", b as f64 / (1u64 << 30) as f64))
+                    .unwrap_or_default();
+                entry.dir.update(cx, |st, cx| st.set_value(dir, window, cx));
+                entry.cap_gib.update(cx, |st, cx| st.set_value(cap_text, window, cx));
+                entry.seeded = true;
             }
         }
     }
@@ -454,6 +503,22 @@ impl Gaggle {
         cx.notify();
     }
 
+    /// Arm the Restart confirmation for a remote accelerator daemon.
+    pub(crate) fn ask_restart_remote(
+        &mut self,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm = Some(Confirm {
+            id: 0,
+            name: label.clone(),
+            kind: ConfirmKind::RestartRemote { label },
+        });
+        self.confirm_focus.focus(window);
+        cx.notify();
+    }
+
     pub(crate) fn confirm_cancel(&mut self, cx: &mut Context<Self>) {
         self.confirm = None;
         cx.notify();
@@ -467,6 +532,12 @@ impl Gaggle {
                     Some(label) => self.app.remote_remove_share(label.clone(), manifest_id.clone()),
                     None => self.app.accel_remove_share(manifest_id.clone()),
                 },
+                ConfirmKind::RestartRemote { label } => {
+                    self.app.restart_remote_accelerator(label.clone());
+                    self.set_notice(format!("Restarting “{}”…", c.name), cx);
+                    cx.notify();
+                    return;
+                }
                 _ if delete_files => self.app.remove_and_delete(c.id),
                 _ => self.app.remove(c.id),
             }
@@ -956,14 +1027,69 @@ impl Gaggle {
         self.set_notice("Sending share to the remote accelerator…", cx);
     }
 
+    /// Apply the replica-folder + storage-cap edit form for one remote NAS
+    /// daemon. A blank folder keeps the current one; a blank cap clears it
+    /// (`Some(0)` — the admin API's "unlimited" sentinel).
+    pub(crate) fn remote_set_storage(&mut self, label: String, cx: &mut Context<Self>) {
+        let Some(inputs) = self.remote_storage_inputs.get(&label) else { return };
+        let dir = inputs.dir.read(cx).value().trim().to_string();
+        let cap_text = inputs.cap_gib.read(cx).value().trim().to_string();
+
+        let replica_dir = (!dir.is_empty()).then_some(dir);
+        let storage_cap_bytes = match cap_text.parse::<f64>() {
+            Ok(gib) if gib > 0.0 => Some((gib * (1u64 << 30) as f64) as u64),
+            _ => Some(0), // blank / zero / unparseable → clear the cap
+        };
+        if replica_dir.is_none() && storage_cap_bytes == Some(0) && cap_text.is_empty() {
+            self.set_notice("Nothing to apply — enter a folder or a cap", cx);
+            return;
+        }
+        self.app.remote_set_storage(label, replica_dir, storage_cap_bytes);
+        self.set_notice("Applying storage settings to the remote…", cx);
+    }
+
+    /// An open dropdown's `on_mouse_down_out` closed it. Records *when* so that a
+    /// `toggle_*` firing a beat later — the trigger's own `on_click`, when the
+    /// outside click landed on the trigger — is recognised as the tail of the
+    /// same gesture and swallowed rather than re-opening the menu.
+    pub(crate) fn note_menu_dismissed(&mut self, cx: &mut Context<Self>) {
+        self.theme_menu_open = false;
+        self.launcher_menu_open = false;
+        self.stats_source_menu_open = false;
+        self.menu_dismissed_at = Some(Instant::now());
+        cx.notify();
+    }
+
+    /// Close any open dropdown when the scrollable body scrolls. The menus are
+    /// `deferred` so they paint above everything — including the header the
+    /// trigger scrolls under — which looks broken; native selects close on
+    /// scroll too. No `menu_dismissed_at` stamp: a scroll is not a trigger
+    /// click, so there is nothing to swallow afterwards.
+    pub(crate) fn close_menus_on_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.theme_menu_open || self.launcher_menu_open || self.stats_source_menu_open {
+            self.theme_menu_open = false;
+            self.launcher_menu_open = false;
+            self.stats_source_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    /// True if a dropdown was dismissed by an outside click within the last
+    /// beat — so this `toggle_*` is that same click reaching the trigger and
+    /// must not re-open. Consumes the marker either way.
+    fn menu_click_swallowed(&mut self) -> bool {
+        self.menu_dismissed_at
+            .take()
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(250))
+    }
 
     pub(crate) fn toggle_theme_menu(&mut self, cx: &mut Context<Self>) {
-        self.theme_menu_open = !self.theme_menu_open;
+        self.theme_menu_open = !self.menu_click_swallowed() && !self.theme_menu_open;
         cx.notify();
     }
 
     pub(crate) fn toggle_launcher_menu(&mut self, cx: &mut Context<Self>) {
-        self.launcher_menu_open = !self.launcher_menu_open;
+        self.launcher_menu_open = !self.menu_click_swallowed() && !self.launcher_menu_open;
         cx.notify();
     }
 
@@ -997,7 +1123,7 @@ impl Gaggle {
     }
 
     pub(crate) fn toggle_stats_source_menu(&mut self, cx: &mut Context<Self>) {
-        self.stats_source_menu_open = !self.stats_source_menu_open;
+        self.stats_source_menu_open = !self.menu_click_swallowed() && !self.stats_source_menu_open;
         cx.notify();
     }
 
@@ -1060,7 +1186,11 @@ impl Render for Gaggle {
                     .min_h_0()
                     .p_4()
                     .when(logs_tab, |d| d.flex().flex_col().overflow_hidden())
-                    .when(!logs_tab, |d| d.overflow_y_scroll())
+                    .when(!logs_tab, |d| {
+                        d.overflow_y_scroll().on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                            this.close_menus_on_scroll(cx)
+                        }))
+                    })
                     .child(ui::views::body(self.tab, self, cx))
             })
             .child(ui::chrome::status_bar(self))

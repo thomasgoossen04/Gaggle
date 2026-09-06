@@ -698,6 +698,10 @@ pub fn accelerator(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     let t = theme::active();
     let mut col = div().flex().flex_col().gap_3();
 
+    // Remote accelerators first — the primary use of this tab is driving a
+    // NAS / VPS daemon, not opting this machine in.
+    col = col.child(remote_accelerators(app, cx));
+
     // Operator key card.
     col = col.child(
         card()
@@ -755,9 +759,6 @@ pub fn accelerator(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         Some(acc) => col.child(accelerator_status(app, acc, cx)),
         None => col.child(accelerator_form(app, cx)),
     };
-
-    // Remote accelerators.
-    col = col.child(remote_accelerators(app, cx));
 
     col.into_any_element()
 }
@@ -983,6 +984,21 @@ fn accelerator_status(app: &Gaggle, acc: &AcceleratorState, cx: &mut Context<Gag
             ),
         ));
     }
+    if let Some(dir) = &acc.replica_dir {
+        c = c.child(kv("Replica folder", dir.display().to_string()));
+    }
+    if acc.replica_free_bytes.is_some() || acc.replica_used_bytes.is_some() {
+        let used = acc.replica_used_bytes.unwrap_or(0);
+        let cap_text = acc
+            .storage_cap_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "unlimited".into());
+        let free = acc.replica_free_bytes.map(human_bytes).unwrap_or_else(|| "—".into());
+        c = c.child(kv(
+            "Replica storage",
+            format!("{} used / {} cap  ·  {} free on disk", human_bytes(used), cap_text, free),
+        ));
+    }
 
     c = c.child(section_title("Shares"));
     if acc.shares.is_empty() {
@@ -1064,12 +1080,32 @@ fn remote_row(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> A
                         .child(div().font_weight(FontWeight::SEMIBOLD).child(r.label.clone()))
                         .when_some(r.role, |el, role| el.child(chip(role.label(), t.muted))),
                 )
-                .child(danger_btn((SharedString::from(format!("rm-remote-{label}")), 0), "Forget").on_click(
-                    cx.listener({
-                        let label = label.clone();
-                        move |this, _: &ClickEvent, _, cx| this.remove_remote(label.clone(), cx)
-                    }),
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            btn((SharedString::from(format!("restart-remote-{label}")), 0), "Restart")
+                                .on_click(cx.listener({
+                                    let label = label.clone();
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        this.ask_restart_remote(label.clone(), window, cx)
+                                    }
+                                })),
+                        )
+                        .child(
+                            danger_btn(
+                                (SharedString::from(format!("rm-remote-{label}")), 1),
+                                "Forget",
+                            )
+                            .on_click(cx.listener({
+                                let label = label.clone();
+                                move |this, _: &ClickEvent, _, cx| this.remove_remote(label.clone(), cx)
+                            })),
+                        ),
+                ),
         )
         .child(
             div()
@@ -1086,6 +1122,11 @@ fn remote_row(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> A
         panel = panel.child(
             div().text_xs().font_family(theme::MONO).text_color(t.bad).child(format!("!! {err}")),
         );
+    }
+
+    // NAS storage: current folder / space, and an edit form.
+    if r.role == Some(AcceleratorRole::Nas) {
+        panel = panel.child(remote_storage_block(app, r, cx));
     }
 
     for s in &r.shares {
@@ -1111,6 +1152,86 @@ fn remote_row(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> A
         .into_any_element()
 }
 
+/// The NAS-storage panel inside a remote accelerator row: where replica chunks
+/// are stored, how much space is left / used against the cap, and an editable
+/// folder + cap form. Changing the folder moves the daemon's existing replicas.
+fn remote_storage_block(app: &Gaggle, r: &RemoteAccelState, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    let label = r.label.clone();
+    let used = r.replica_used_bytes.unwrap_or(0);
+    let over_cap = r.storage_cap_bytes.is_some_and(|cap| used > cap);
+    let cap_text = r
+        .storage_cap_bytes
+        .map(human_bytes)
+        .unwrap_or_else(|| "unlimited".into());
+
+    let mut block = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .mt_1()
+        .pt_2()
+        .border_t_1()
+        .border_color(t.line)
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(t.muted)
+                .child("REPLICA STORAGE"),
+        )
+        .child(kv(
+            "Folder",
+            r.replica_dir.clone().unwrap_or_else(|| "—".into()),
+        ))
+        .child(kv(
+            "Free space",
+            r.replica_free_bytes.map(human_bytes).unwrap_or_else(|| "—".into()),
+        ))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_xs()
+                .font_family(theme::MONO)
+                .child(div().text_color(t.muted).child("Used / cap"))
+                .child(
+                    div()
+                        .text_color(if over_cap { t.bad } else { t.fg })
+                        .child(format!("{} / {}", human_bytes(used), cap_text)),
+                ),
+        );
+    if over_cap {
+        block = block.child(hint("replicas exceed the cap — new shares will be refused"));
+    }
+
+    if let Some(inputs) = app.remote_storage_inputs.get(&label) {
+        block = block
+            .child(field("Replica folder", &inputs.dir))
+            .child(field("Storage cap (GiB, blank = none)", &inputs.cap_gib))
+            .child(
+                btn((SharedString::from(format!("rmt-storage-{label}")), 0), "Apply storage settings")
+                    .on_click(cx.listener({
+                        let label = label.clone();
+                        move |this, _: &ClickEvent, _, cx| this.remote_set_storage(label.clone(), cx)
+                    })),
+            );
+    }
+
+    block.into_any_element()
+}
+
+/// A light / dark / auto glyph for a theme, shown beside its name in the
+/// selector. `System` gets the half-filled "auto" mark; every fixed palette
+/// gets a sun or a moon after [`Theme::is_dark`].
+fn theme_icon(theme: Theme) -> &'static str {
+    match theme.is_dark() {
+        None => "◐",
+        Some(true) => "☾",
+        Some(false) => "☀",
+    }
+}
+
 /// The theme selector: a trigger button with a small overlay menu.
 fn theme_dropdown(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     let t = theme::active();
@@ -1132,6 +1253,7 @@ fn theme_dropdown(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         .text_color(t.accent)
         .cursor_pointer()
         .hover(|s| s.border_color(t.accent))
+        .child(div().text_color(t.muted).child(theme_icon(cur)))
         .child(cur.label().to_uppercase())
         .child(div().text_color(t.muted).child(if open { "▲" } else { "▼" }))
         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_theme_menu(cx)));
@@ -1143,15 +1265,19 @@ fn theme_dropdown(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             .top_full()
             .right_0()
             .mt_1()
-            .min_w(px(140.0))
+            .min_w(px(170.0))
             .flex()
             .flex_col()
             .bg(t.panel)
             .border_1()
             .border_color(t.accent_dim)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.note_menu_dismissed(cx)))
             .children(Theme::ALL.map(|opt| {
                 div()
                     .id(("theme-opt", opt as usize))
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_3()
                     .py_1()
                     .text_xs()
@@ -1160,6 +1286,13 @@ fn theme_dropdown(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                     .text_color(if opt == cur { t.accent } else { t.fg })
                     .cursor_pointer()
                     .hover(|s| s.bg(t.panel_hi).text_color(t.accent))
+                    .child(
+                        div()
+                            .w(px(12.0))
+                            .flex_none()
+                            .text_color(if opt == cur { t.accent } else { t.muted })
+                            .child(theme_icon(opt)),
+                    )
                     .child(opt.label().to_uppercase())
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.set_theme(opt, window, cx)
@@ -1209,6 +1342,7 @@ fn launcher_channel_dropdown(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyEleme
             .bg(t.panel)
             .border_1()
             .border_color(t.accent_dim)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.note_menu_dismissed(cx)))
             .children(LauncherChannel::ALL.map(|opt| {
                 div()
                     .id(("channel-opt", opt as usize))
@@ -1382,7 +1516,7 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 ))
                 .child(field("Download MiB/s", &app.set_dl))
                 .child(field("Upload MiB/s", &app.set_ul))
-                .child(field("Cache store GiB", &app.set_store))
+                .child(field("Storage cap GiB", &app.set_store))
                 .child(field("Seed RAM MiB", &app.set_seed_cache))
                 .child(field("Auto-check min", &app.set_resync))
                 .child(
@@ -1467,7 +1601,10 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 .child(kv("Folder", s.download_dir.display().to_string()))
                 .child(kv("Download cap", cap(s.download_cap_bps)))
                 .child(kv("Upload cap", cap(s.upload_cap_bps)))
-                .child(kv("Cache storage cap", cap(s.storage_cap_bytes)))
+                .child(kv(
+                    "Storage cap",
+                    s.storage_cap_bytes.map(human_bytes).unwrap_or_else(|| "unlimited".into()),
+                ))
                 .child(kv("Seed RAM buffer", human_bytes(s.seed_cache_bytes)))
                 .child(kv(
                     "Auto update-check",
@@ -1534,6 +1671,7 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
         btn("cf-cancel", "Cancel")
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_cancel(cx))),
     );
+    let mut title = format!("Remove “{}”?", c.name);
     let body: String = match &c.kind {
         ConfirmKind::Share => {
             actions = actions.child(danger_btn("cf-rm", "Remove").on_click(
@@ -1570,6 +1708,17 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
                 "Stops this accelerator from caching the share.".into()
             }
         }
+        ConfirmKind::RestartRemote { label } => {
+            title = format!("Restart “{label}”?");
+            actions = actions.child(danger_btn("cf-restart", "Restart").on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_go(false, cx)),
+            ));
+            "Tells the daemon to exit so its service manager restarts it — the way it \
+             picks up a newer build. Its shares stop serving for a few seconds while it \
+             comes back. A daemon that isn't run under a service manager will stay \
+             stopped."
+                .into()
+        }
     };
 
     // A *definite* width (not a min/max range): a flex column with only a
@@ -1586,7 +1735,7 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
         .bg(t.panel)
         .border_1()
         .border_color(t.accent)
-        .child(section_title(&format!("Remove “{}”?", c.name)))
+        .child(section_title(&title))
         .child(
             div()
                 .w_full()
@@ -1815,6 +1964,7 @@ fn stats_source_dropdown(app: &Gaggle, remotes: &[String], cx: &mut Context<Gagg
             .bg(t.panel)
             .border_1()
             .border_color(t.accent_dim)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.note_menu_dismissed(cx)))
             .children(opts.into_iter().enumerate().map(|(i, (label, src))| {
                 let selected = label.eq_ignore_ascii_case(&cur);
                 div()

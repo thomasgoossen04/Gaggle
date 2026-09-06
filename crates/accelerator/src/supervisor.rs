@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{AcceleratorConfig, Home, Role};
+use crate::config::{AcceleratorConfig, Home, Role, free_space};
 
 /// How often a replicating share's progress may update `DaemonStatus` — a
 /// share with many small chunks must not flood the status watch channel.
@@ -147,6 +147,9 @@ pub struct Supervisor {
     /// NAS role: per-share on-disk replica size, refreshed alongside
     /// `last_served`.
     disk_bytes: HashMap<Hash, u64>,
+    /// NAS role: free space on the replica volume, refreshed alongside
+    /// `disk_bytes`.
+    replica_free: Option<u64>,
 }
 
 impl Supervisor {
@@ -202,10 +205,21 @@ impl Supervisor {
             tracker,
             last_served: 0,
             disk_bytes: HashMap::new(),
+            replica_free: None,
         };
 
-        let tokens = sup.config.shares.clone();
-        let paused = sup.config.paused_shares.clone();
+        sup.reload_shares().await;
+        sup.refresh_served().await;
+        sup.publish();
+        Ok((sup, status_rx))
+    }
+
+    /// (Re-)populate `self.shares` from `config.shares` / `config.paused_shares`
+    /// — the boot path, and the resume path after [`set_storage`](Self::set_storage)
+    /// moves the replica folder. Caller ensures `self.shares` is empty first.
+    async fn reload_shares(&mut self) {
+        let tokens = self.config.shares.clone();
+        let paused = self.config.paused_shares.clone();
         for token in tokens {
             let link = ShareLink::parse(&token).ok();
             let is_paused = link
@@ -214,18 +228,15 @@ impl Supervisor {
             if is_paused && let Some(l) = link {
                 // Don't serve (or, for NAS, re-replicate) a paused share on
                 // boot — just record it so status shows it and it can resume.
-                sup.shares.insert(
+                self.shares.insert(
                     l.manifest_id,
                     ShareRecord::Paused { token, name_hint: l.name.clone(), meta: None },
                 );
                 continue;
             }
             let (ack, _rx) = oneshot::channel();
-            sup.add_share(token, ack).await;
+            self.add_share(token, ack).await;
         }
-        sup.refresh_served().await;
-        sup.publish();
-        Ok((sup, status_rx))
     }
 
     /// Drive the supervisor: apply admin mutations and background replication
@@ -254,6 +265,26 @@ impl Supervisor {
                                 .await
                                 .map_err(|e| format!("{e:#}"));
                             let _ = ack.send(result);
+                        }
+                        AdminCommand::SetStorage { replica_dir, storage_cap_bytes, ack } => {
+                            let result = self
+                                .set_storage(replica_dir, storage_cap_bytes)
+                                .await
+                                .map_err(|e| format!("{e:#}"));
+                            let _ = ack.send(result);
+                        }
+                        AdminCommand::Restart { ack } => {
+                            let _ = ack.send(Ok(()));
+                            tracing::info!(
+                                "admin restart requested — exiting so the service manager \
+                                 restarts the daemon (on a newer binary if one is available)"
+                            );
+                            // Give the signed 202 time to flush before the
+                            // process goes away.
+                            tokio::spawn(async {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                std::process::exit(0);
+                            });
                         }
                     }
                     self.refresh_served().await;
@@ -461,6 +492,12 @@ impl Supervisor {
             Backend::Nas { dir_root, compress } => {
                 let dir_root = dir_root.clone();
                 let compress = *compress;
+                // Storage-cap guard: refuse a share that would push the replica
+                // store past `max_storage_bytes` before any chunk is written.
+                let max_bytes = self.config.max_storage_bytes.map(|cap| {
+                    let used: u64 = self.disk_bytes.values().sum();
+                    cap.saturating_sub(used)
+                });
                 let seed = match share_identity_seed(&self.identity, link.manifest_id) {
                     Ok(s) => s,
                     Err(e) => {
@@ -479,7 +516,7 @@ impl Supervisor {
                         .checked_sub(PROGRESS_THROTTLE)
                         .unwrap_or_else(Instant::now);
                     let progress_tx = events_tx.clone();
-                    let result = nas_add_share_with_progress(&dir_root, identity, &link, compress, |p: SwarmProgress| {
+                    let result = nas_add_share_with_progress(&dir_root, identity, &link, compress, max_bytes, |p: SwarmProgress| {
                         let done = p.chunks_done >= p.chunks_total;
                         if done || last_sent.elapsed() >= PROGRESS_THROTTLE {
                             last_sent = Instant::now();
@@ -705,6 +742,91 @@ impl Supervisor {
         }
     }
 
+    /// NAS role: change where replica chunks are stored and/or the storage cap.
+    ///
+    /// `storage_cap_bytes`: `Some(0)` clears the cap, `Some(n)` sets it, `None`
+    /// leaves it. `replica_dir`: `Some(path)` moves every existing replica to
+    /// the new folder — serving stops for the (blocking) move and every share
+    /// is re-added afterwards (a cheap top-up over the moved chunks). `None`
+    /// leaves the folder.
+    async fn set_storage(
+        &mut self,
+        replica_dir: Option<String>,
+        storage_cap_bytes: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let Backend::Nas { dir_root, .. } = &self.backend else {
+            anyhow::bail!("storage settings only apply to a NAS daemon");
+        };
+        let old_root = dir_root.clone();
+
+        match storage_cap_bytes {
+            Some(0) => self.config.max_storage_bytes = None,
+            Some(n) => self.config.max_storage_bytes = Some(n),
+            None => {}
+        }
+
+        let new_root = replica_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let p = PathBuf::from(s);
+                if p.is_absolute() { p } else { self.home.dir().join(p) }
+            });
+
+        if let Some(new_root) = new_root.filter(|p| *p != old_root) {
+            tokio::fs::create_dir_all(&new_root)
+                .await
+                .with_context(|| format!("creating {}", new_root.display()))?;
+
+            tracing::info!(
+                from = %old_root.display(), to = %new_root.display(),
+                "moving NAS replicas to a new folder"
+            );
+            self.teardown_all().await;
+
+            let (from, to) = (old_root.clone(), new_root.clone());
+            tokio::task::spawn_blocking(move || move_replicas(&from, &to))
+                .await?
+                .with_context(|| format!("moving replicas to {}", new_root.display()))?;
+
+            if let Backend::Nas { dir_root, .. } = &mut self.backend {
+                *dir_root = new_root.clone();
+            }
+            self.config.replica_dir = Some(new_root.to_string_lossy().into_owned());
+            // Persist the folder now; `reload_shares` rewrites `shares` /
+            // `paused_shares` from what it re-adds (unchanged token set).
+            if let Err(e) = self.config.save(&self.home.config_path()) {
+                tracing::warn!(error = %format!("{e:#}"), "could not rewrite config.toml");
+            }
+            self.reload_shares().await;
+        } else {
+            // Cap-only change.
+            self.persist();
+        }
+
+        self.refresh_served().await;
+        self.publish();
+        self.announce_to_tracker().await;
+        Ok(())
+    }
+
+    /// Stop every running serving node / abort every in-flight replication and
+    /// empty `self.shares` — the tokens live on in `config.shares` so
+    /// [`reload_shares`](Self::reload_shares) can bring them back.
+    async fn teardown_all(&mut self) {
+        for (id, record) in std::mem::take(&mut self.shares) {
+            match record {
+                ShareRecord::Replicating { abort, .. } => abort.abort(),
+                ShareRecord::Ready { node: Some(node), .. } => {
+                    self.tracker.withdraw(&id.to_hex(), &node.peer_id().to_string());
+                    node.shutdown().await;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Read the cumulative served-bytes counters off the running `net` nodes
     /// (a relay's own forwarded-bytes total, or the sum across every NAS
     /// share's serving node) into `self.last_served`, so the next sync
@@ -737,14 +859,17 @@ impl Supervisor {
                 .map(|(id, _)| *id)
                 .collect();
             let dir_root = dir_root.clone();
-            let sizes = tokio::task::spawn_blocking(move || {
-                ids.into_iter()
+            let (sizes, free) = tokio::task::spawn_blocking(move || {
+                let sizes = ids
+                    .into_iter()
                     .map(|id| (id, dir_size(&dir_root.join(id.to_hex())).unwrap_or(0)))
-                    .collect::<HashMap<Hash, u64>>()
+                    .collect::<HashMap<Hash, u64>>();
+                (sizes, free_space(&dir_root))
             })
             .await
             .unwrap_or_default();
             self.disk_bytes = sizes;
+            self.replica_free = Some(free);
         }
     }
 
@@ -837,6 +962,15 @@ impl Supervisor {
             .collect();
         shares.sort_by(|a, b| a.name.cmp(&b.name));
 
+        let (replica_dir, replica_free_bytes, replica_used_bytes) = match &self.backend {
+            Backend::Nas { dir_root, .. } => (
+                Some(dir_root.to_string_lossy().into_owned()),
+                self.replica_free,
+                Some(self.disk_bytes.values().sum()),
+            ),
+            Backend::Relay { .. } => (None, None, None),
+        };
+
         let status = DaemonStatus {
             agent_id: self.daemon.public().to_hex(),
             peer_id: self.identity.public().to_peer_id().to_string(),
@@ -844,9 +978,60 @@ impl Supervisor {
             listen_addrs,
             shares,
             bytes_served_total: Some(self.last_served),
+            replica_dir,
+            replica_free_bytes,
+            replica_used_bytes,
+            storage_cap_bytes: self.config.max_storage_bytes,
         };
         let _ = self.status_tx.send(status);
     }
+}
+
+/// Move every `<manifest-id>` replica directory from `old_root` into
+/// `new_root`. A plain `rename` when the two are on one filesystem; a
+/// recursive copy + delete when it fails (a different disk, the "another
+/// disk" case this exists for). The now-empty `old_root` is removed
+/// best-effort. Missing `old_root` → `Ok(())`.
+fn move_replicas(old_root: &std::path::Path, new_root: &std::path::Path) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(old_root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("reading the old replica folder"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let from = entry.path();
+        let to = new_root.join(entry.file_name());
+        if to.exists() {
+            std::fs::remove_dir_all(&to).ok();
+        }
+        if std::fs::rename(&from, &to).is_err() {
+            copy_dir_all(&from, &to)
+                .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+            std::fs::remove_dir_all(&from)
+                .with_context(|| format!("removing {} after copy", from.display()))?;
+        }
+    }
+    std::fs::remove_dir(old_root).ok();
+    Ok(())
+}
+
+/// Recursively copy `from` into `to` (both directories).
+fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &dst)?;
+        } else {
+            std::fs::copy(entry.path(), &dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// Sum the sizes of every file directly inside `dir`'s shard subdirectories —
@@ -963,4 +1148,39 @@ fn share_identity_seed(identity: &Keypair, manifest_id: Hash) -> anyhow::Result<
     buf.extend_from_slice(&daemon_seed);
     buf.extend_from_slice(manifest_id.as_bytes());
     Ok(*Hash::of(&buf).as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_replicas_relocates_every_shard_and_clears_the_old_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("new");
+        // Two "replica dirs", each with the DiskChunkStore shard layout.
+        for (share, shard, name) in [("aa11", "00", "chunk0"), ("aa11", "ff", "chunk1"), ("bb22", "3c", "chunk2")] {
+            let d = old.join(share).join(shard);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(name), name.as_bytes()).unwrap();
+        }
+        // A stray non-dir entry at the root is skipped, not moved.
+        std::fs::write(old.join("README"), b"x").unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+
+        move_replicas(&old, &new).unwrap();
+
+        assert_eq!(std::fs::read(new.join("aa11/00/chunk0")).unwrap(), b"chunk0");
+        assert_eq!(std::fs::read(new.join("aa11/ff/chunk1")).unwrap(), b"chunk1");
+        assert_eq!(std::fs::read(new.join("bb22/3c/chunk2")).unwrap(), b"chunk2");
+        assert!(!old.join("aa11").exists(), "moved replica dir is gone from the old root");
+        assert!(!old.join("bb22").exists());
+    }
+
+    #[test]
+    fn move_replicas_is_a_noop_when_the_old_root_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        move_replicas(&tmp.path().join("missing"), &tmp.path().join("new")).unwrap();
+    }
 }

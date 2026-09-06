@@ -5,24 +5,73 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Which colour scheme the GUI should use.
+/// Which colour scheme the GUI should use. `System` follows the OS appearance;
+/// every other variant is a fixed palette, each based on a popular published
+/// scheme and inherently light or dark (see [`Theme::is_dark`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Theme {
     #[default]
     System,
-    Light,
+    /// The house dark palette — "Super Earth field terminal", amber on steel.
     Dark,
+    /// The house light palette — the same character on printed-briefing white.
+    Light,
+    Dracula,
+    Nord,
+    Gruvbox,
+    TokyoNight,
+    Catppuccin,
+    SolarizedDark,
+    SolarizedLight,
+    RosePineDawn,
 }
 
 impl Theme {
-    pub const ALL: [Theme; 3] = [Theme::System, Theme::Light, Theme::Dark];
+    pub const ALL: [Theme; 11] = [
+        Theme::System,
+        Theme::Dark,
+        Theme::Light,
+        Theme::Dracula,
+        Theme::Nord,
+        Theme::Gruvbox,
+        Theme::TokyoNight,
+        Theme::Catppuccin,
+        Theme::SolarizedDark,
+        Theme::SolarizedLight,
+        Theme::RosePineDawn,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Theme::System => "System",
-            Theme::Light => "Light",
             Theme::Dark => "Dark",
+            Theme::Light => "Light",
+            Theme::Dracula => "Dracula",
+            Theme::Nord => "Nord",
+            Theme::Gruvbox => "Gruvbox",
+            Theme::TokyoNight => "Tokyo Night",
+            Theme::Catppuccin => "Catppuccin",
+            Theme::SolarizedDark => "Solarized Dark",
+            Theme::SolarizedLight => "Solarized Light",
+            Theme::RosePineDawn => "Rosé Pine Dawn",
+        }
+    }
+
+    /// Whether this palette is dark (`Some(true)`) or light (`Some(false)`).
+    /// `System` has no fixed answer — it depends on the live OS appearance — so
+    /// it returns `None`, which the GUI renders with its own "auto" icon.
+    pub fn is_dark(self) -> Option<bool> {
+        match self {
+            Theme::System => None,
+            Theme::Dark
+            | Theme::Dracula
+            | Theme::Nord
+            | Theme::Gruvbox
+            | Theme::TokyoNight
+            | Theme::Catppuccin
+            | Theme::SolarizedDark => Some(true),
+            Theme::Light | Theme::SolarizedLight | Theme::RosePineDawn => Some(false),
         }
     }
 }
@@ -36,7 +85,11 @@ pub struct Settings {
     /// Download / upload bandwidth ceilings in bytes per second (`None` = no cap).
     pub download_cap_bps: Option<u64>,
     pub upload_cap_bps: Option<u64>,
-    /// Storage ceiling for cache-accelerator mode, in bytes (`None` = no cap).
+    /// Storage ceiling for a local accelerator's on-disk chunk store, in bytes
+    /// (`None` = no cap). Enforced for the NAS role: a share whose size would
+    /// push the replica store over this is refused rather than started. A
+    /// remote daemon has its own cap, set from the Accelerator tab via
+    /// [`App::remote_set_storage`](crate::App::remote_set_storage).
     pub storage_cap_bytes: Option<u64>,
     /// RAM ceiling, in bytes, for the hot-chunk cache each *seeded* local share
     /// keeps. A seed streams chunks from its source folder on demand and holds

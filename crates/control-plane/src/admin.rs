@@ -105,6 +105,21 @@ pub struct DaemonStatus {
     /// so an older daemon that never sets it round-trips unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_served_total: Option<u64>,
+    /// NAS role: the resolved absolute path the replica chunk store lives at.
+    /// An operator can move it with `POST /admin/storage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_dir: Option<String>,
+    /// NAS role: free space on the replica volume, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_free_bytes: Option<u64>,
+    /// NAS role: bytes every replica currently occupies on disk (sum of each
+    /// share's `disk_bytes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_used_bytes: Option<u64>,
+    /// NAS role: the configured storage ceiling, bytes. `None` = unlimited. A
+    /// share whose size would push `replica_used_bytes` over this is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_cap_bytes: Option<u64>,
 }
 
 /// One share a daemon accelerates.
@@ -175,6 +190,19 @@ pub enum AdminCommand {
         seeding: bool,
         ack: oneshot::Sender<Result<(), String>>,
     },
+    /// NAS role: change where replica chunks are stored and/or the storage
+    /// cap. `replica_dir` `Some(path)` moves the existing replicas to `path`
+    /// (serving pauses for the move); `None` leaves it. `storage_cap_bytes`
+    /// `Some(0)` clears the cap, `Some(n)` sets it, `None` leaves it.
+    SetStorage {
+        replica_dir: Option<String>,
+        storage_cap_bytes: Option<u64>,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    /// Exit the daemon process (code 0) so a service manager restarts it —
+    /// the way to pick up a newer binary when the daemon runs under
+    /// `gaggle-accelerator-launcher` + systemd `Restart=always`.
+    Restart { ack: oneshot::Sender<Result<(), String>> },
 }
 
 /// Everything the [`router`] needs. Cheap to clone.
@@ -224,6 +252,8 @@ pub fn router(state: AdminState) -> Router {
             "/admin/shares/{manifest_id}",
             delete(remove_share_handler).post(set_seeding_handler),
         )
+        .route("/admin/storage", axum::routing::post(set_storage_handler))
+        .route("/admin/restart", axum::routing::post(restart_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_and_sign))
         .with_state(state)
 }
@@ -325,6 +355,62 @@ async fn set_seeding_handler(
         .await
         .is_err()
     {
+        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down").into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "daemon dropped the request").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetStorageBody {
+    /// New replica root. Absent = leave it. The daemon moves existing replicas.
+    #[serde(default)]
+    replica_dir: Option<String>,
+    /// `0` clears the cap, any other value sets it, absent leaves it.
+    #[serde(default)]
+    storage_cap_bytes: Option<u64>,
+}
+
+async fn set_storage_handler(
+    State(state): State<AdminState>,
+    body: Result<axum::Json<SetStorageBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(axum::Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected { \"replica_dir\"?: \"…\", \"storage_cap_bytes\"?: N }",
+        )
+            .into_response();
+    };
+    if body.replica_dir.is_none() && body.storage_cap_bytes.is_none() {
+        return (StatusCode::BAD_REQUEST, "nothing to change").into_response();
+    }
+    let (ack, rx) = oneshot::channel();
+    if state
+        .commands
+        .send(AdminCommand::SetStorage {
+            replica_dir: body.replica_dir,
+            storage_cap_bytes: body.storage_cap_bytes,
+            ack,
+        })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down").into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "daemon dropped the request").into_response(),
+    }
+}
+
+async fn restart_handler(State(state): State<AdminState>) -> Response {
+    let (ack, rx) = oneshot::channel();
+    if state.commands.send(AdminCommand::Restart { ack }).await.is_err() {
         return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down").into_response();
     }
     match rx.await {
@@ -505,6 +591,34 @@ impl AdminClient {
     pub async fn set_share_seeding(&mut self, manifest_id: &str, seeding: bool) -> anyhow::Result<()> {
         let body = serde_json::to_vec(&serde_json::json!({ "seeding": seeding }))?;
         self.send_unit("POST", &format!("/admin/shares/{manifest_id}"), "", Some(body)).await
+    }
+
+    /// NAS role: change the replica storage folder and/or the storage cap.
+    /// `replica_dir` `Some` moves existing replicas to the new path (serving
+    /// pauses for the move). `storage_cap_bytes` `Some(0)` clears the cap,
+    /// `Some(n)` sets it, `None` leaves it unchanged.
+    pub async fn set_storage(
+        &mut self,
+        replica_dir: Option<&str>,
+        storage_cap_bytes: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let mut obj = serde_json::Map::new();
+        if let Some(d) = replica_dir {
+            obj.insert("replica_dir".into(), serde_json::Value::String(d.to_string()));
+        }
+        if let Some(n) = storage_cap_bytes {
+            obj.insert("storage_cap_bytes".into(), serde_json::Value::from(n));
+        }
+        let body = serde_json::to_vec(&serde_json::Value::Object(obj))?;
+        self.send_unit("POST", "/admin/storage", "", Some(body)).await
+    }
+
+    /// Ask the daemon to exit so its service manager restarts it on a newer
+    /// binary. The connection may drop before a response is read — that is a
+    /// successful restart, not an error, so a follow-up poll failing is
+    /// expected.
+    pub async fn restart(&mut self) -> anyhow::Result<()> {
+        self.send_unit("POST", "/admin/restart", "", None).await
     }
 
     async fn send_unit(

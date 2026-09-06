@@ -15,6 +15,7 @@ fn sample_status(agent: &AgentId) -> DaemonStatus {
         listen_addrs: vec!["/ip4/127.0.0.1/udp/4001/quic-v1".into()],
         shares: Vec::new(),
         bytes_served_total: Some(0),
+        ..Default::default()
     }
 }
 
@@ -210,6 +211,22 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
                     });
                     let _ = ack.send(Ok(()));
                 }
+                AdminCommand::SetStorage { replica_dir, storage_cap_bytes, ack } => {
+                    status_tx.send_modify(|s| {
+                        if let Some(d) = replica_dir {
+                            s.replica_dir = Some(d);
+                        }
+                        match storage_cap_bytes {
+                            Some(0) => s.storage_cap_bytes = None,
+                            Some(n) => s.storage_cap_bytes = Some(n),
+                            None => {}
+                        }
+                    });
+                    let _ = ack.send(Ok(()));
+                }
+                AdminCommand::Restart { ack } => {
+                    let _ = ack.send(Ok(()));
+                }
             }
         }
     });
@@ -227,6 +244,17 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
     assert!(!client.list_shares().await.unwrap()[0].seeding, "paused");
     client.set_share_seeding("deadbeef", true).await.unwrap();
     assert!(client.list_shares().await.unwrap()[0].seeding, "resumed");
+
+    // Storage folder + cap round-trip through POST /admin/storage.
+    client.set_storage(Some("/mnt/disk2/gaggle"), Some(50 << 30)).await.unwrap();
+    let st = client.status().await.unwrap();
+    assert_eq!(st.replica_dir.as_deref(), Some("/mnt/disk2/gaggle"));
+    assert_eq!(st.storage_cap_bytes, Some(50 << 30));
+    client.set_storage(None, Some(0)).await.unwrap();
+    assert_eq!(client.status().await.unwrap().storage_cap_bytes, None, "cap cleared");
+
+    // Restart is accepted (the mock just acks — the real daemon exits).
+    client.restart().await.unwrap();
 
     // A plain remove purges the on-disk replica; the opt-out keeps it.
     client.remove_share("deadbeef").await.unwrap();

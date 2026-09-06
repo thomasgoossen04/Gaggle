@@ -35,6 +35,7 @@ fn sample_status(agent: &AgentId) -> DaemonStatus {
         listen_addrs: vec![],
         shares: Vec::new(),
         bytes_served_total: None,
+        ..Default::default()
     }
 }
 

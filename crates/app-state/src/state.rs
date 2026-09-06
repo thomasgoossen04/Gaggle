@@ -229,6 +229,15 @@ pub struct AcceleratorState {
     pub cache: Option<CacheStats>,
     /// NAS role: chunks currently on the durable replica.
     pub replica_chunks: Option<usize>,
+    /// NAS role: the folder replica chunks are stored in.
+    pub replica_dir: Option<PathBuf>,
+    /// NAS role: free space on the replica volume, bytes.
+    pub replica_free_bytes: Option<u64>,
+    /// NAS role: bytes every replica occupies on disk (sum across shares).
+    pub replica_used_bytes: Option<u64>,
+    /// NAS role: the configured storage ceiling, bytes (`None` = unlimited).
+    /// Shares whose size would exceed it are refused.
+    pub storage_cap_bytes: Option<u64>,
     /// Every share this accelerator is carrying.
     pub shares: Vec<AccelShareRow>,
 }
@@ -246,6 +255,15 @@ pub struct RemoteAccelState {
     pub daemon_key: Option<String>,
     pub role: Option<AcceleratorRole>,
     pub shares: Vec<AccelShareRow>,
+    /// NAS role: the folder the daemon stores replica chunks in — editable
+    /// from the GUI ([`App::remote_set_storage`](crate::App::remote_set_storage)).
+    pub replica_dir: Option<String>,
+    /// NAS role: free space on the replica volume, bytes.
+    pub replica_free_bytes: Option<u64>,
+    /// NAS role: bytes every replica occupies on disk (sum across shares).
+    pub replica_used_bytes: Option<u64>,
+    /// NAS role: the configured storage ceiling, bytes (`None` = unlimited).
+    pub storage_cap_bytes: Option<u64>,
     /// Populated when the last poll failed.
     pub error: Option<String>,
 }

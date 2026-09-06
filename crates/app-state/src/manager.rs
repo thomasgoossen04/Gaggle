@@ -138,6 +138,12 @@ enum Command {
     RemoteAddShare { label: String, token: String },
     RemoteRemoveShare { label: String, manifest_id: String },
     RemoteSetShareSeeding { label: String, manifest_id: String, on: bool },
+    RemoteSetStorage {
+        label: String,
+        replica_dir: Option<String>,
+        storage_cap_bytes: Option<u64>,
+    },
+    RestartRemoteAccelerator(String),
     UpdateSettings(Box<Settings>),
     Shutdown,
 
@@ -189,8 +195,9 @@ enum Command {
     AccelShareAdded { node: Option<Box<Node>>, row: Box<AccelShareRow>, token: String },
     /// A NAS share added to an already-running local accelerator made progress.
     AccelShareProgress { manifest_id: String, progress: ReplicaProgress },
-    /// Off-thread walk of each local NAS replica dir: (manifest-id hex, bytes).
-    AccelDiskUsage(Vec<(String, u64)>),
+    /// Off-thread walk of each local NAS replica dir: per-share (manifest-id
+    /// hex, bytes) plus free space on the replica volume.
+    AccelDiskUsage { sizes: Vec<(String, u64)>, free_bytes: Option<u64> },
     RemoteStatusRefresh {
         label: String,
         state: Box<RemoteAccelState>,
@@ -275,6 +282,10 @@ impl App {
                 daemon_key: r.daemon_key.clone(),
                 role: None,
                 shares: Vec::new(),
+                replica_dir: None,
+                replica_free_bytes: None,
+                replica_used_bytes: None,
+                storage_cap_bytes: None,
                 error: None,
             });
         }
@@ -519,6 +530,29 @@ impl App {
         });
     }
 
+    /// Change a remote NAS daemon's replica storage folder and/or its storage
+    /// cap. `replica_dir` `Some` moves the daemon's existing replicas to the
+    /// new folder (serving pauses for the move). `storage_cap_bytes` `Some(0)`
+    /// clears the cap, `Some(n)` sets it, `None` leaves it unchanged.
+    pub fn remote_set_storage(
+        &self,
+        label: impl Into<String>,
+        replica_dir: Option<String>,
+        storage_cap_bytes: Option<u64>,
+    ) {
+        self.send(Command::RemoteSetStorage {
+            label: label.into(),
+            replica_dir,
+            storage_cap_bytes,
+        });
+    }
+
+    /// Ask a remote accelerator daemon to restart itself so its service
+    /// manager brings it back on the latest build.
+    pub fn restart_remote_accelerator(&self, label: impl Into<String>) {
+        self.send(Command::RestartRemoteAccelerator(label.into()));
+    }
+
     pub fn update_settings(&self, settings: Settings) {
         self.send(Command::UpdateSettings(Box::new(settings)));
     }
@@ -761,14 +795,16 @@ impl Manager {
             let ids: Vec<String> = h.rows.iter().map(|r| r.manifest_id.clone()).collect();
             let tx = self.self_tx.clone();
             tokio::spawn(async move {
-                let sizes = tokio::task::spawn_blocking(move || {
-                    ids.into_iter()
-                        .map(|id| (id.clone(), replica_dir_size(&dir_root.join(&id))))
-                        .collect::<Vec<_>>()
+                let (sizes, free_bytes) = tokio::task::spawn_blocking(move || {
+                    let sizes = ids
+                        .iter()
+                        .map(|id| (id.clone(), replica_dir_size(&dir_root.join(id))))
+                        .collect::<Vec<_>>();
+                    (sizes, free_space(&dir_root).ok())
                 })
                 .await
                 .unwrap_or_default();
-                let _ = tx.send(Command::AccelDiskUsage(sizes)).await;
+                let _ = tx.send(Command::AccelDiskUsage { sizes, free_bytes }).await;
             });
         }
         // Background update poll for subscriptions.
@@ -985,6 +1021,10 @@ impl Manager {
                                 daemon_key: client.pinned().map(|k| k.to_hex()),
                                 role,
                                 shares: s.shares.iter().map(share_status_row).collect(),
+                                replica_dir: s.replica_dir.clone(),
+                                replica_free_bytes: s.replica_free_bytes,
+                                replica_used_bytes: s.replica_used_bytes,
+                                storage_cap_bytes: s.storage_cap_bytes,
                                 error: None,
                             },
                             served,
@@ -999,6 +1039,10 @@ impl Manager {
                             daemon_key: pinned.map(|k| k.to_hex()),
                             role: None,
                             shares: Vec::new(),
+                            replica_dir: None,
+                            replica_free_bytes: None,
+                            replica_used_bytes: None,
+                            storage_cap_bytes: None,
                             error: Some(format!("{e:#}")),
                         },
                         None,
@@ -1013,6 +1057,10 @@ impl Manager {
                         daemon_key: pinned.map(|k| k.to_hex()),
                         role: None,
                         shares: Vec::new(),
+                        replica_dir: None,
+                        replica_free_bytes: None,
+                        replica_used_bytes: None,
+                        storage_cap_bytes: None,
                         error: Some(format!("{e:#}")),
                     },
                     None,
@@ -1075,6 +1123,10 @@ impl Manager {
             Command::RemoteSetShareSeeding { label, manifest_id, on } => {
                 self.remote_set_seeding(label, manifest_id, on)
             }
+            Command::RemoteSetStorage { label, replica_dir, storage_cap_bytes } => {
+                self.remote_set_storage(label, replica_dir, storage_cap_bytes)
+            }
+            Command::RestartRemoteAccelerator(label) => self.restart_remote(label),
             Command::RemoteStatusRefresh { label, state, served_total } => {
                 if let Some(k) = &state.daemon_key
                     && let Ok(id) = AgentId::from_hex(k)
@@ -1534,7 +1586,7 @@ impl Manager {
                     self.publish();
                 }
             }
-            Command::AccelDiskUsage(sizes) => {
+            Command::AccelDiskUsage { sizes, free_bytes } => {
                 if let Some(h) = &mut self.accel {
                     let mut changed = false;
                     for (id, bytes) in sizes {
@@ -1545,10 +1597,21 @@ impl Manager {
                             changed = true;
                         }
                     }
-                    if changed {
-                        if let Some(a) = &mut self.state.accelerator {
+                    let used: u64 = h.rows.iter().filter_map(|r| r.disk_bytes).sum();
+                    if let Some(a) = &mut self.state.accelerator {
+                        if a.replica_free_bytes != free_bytes {
+                            a.replica_free_bytes = free_bytes;
+                            changed = true;
+                        }
+                        if a.replica_used_bytes != Some(used) {
+                            a.replica_used_bytes = Some(used);
+                            changed = true;
+                        }
+                        if changed {
                             a.shares = h.rows.clone();
                         }
+                    }
+                    if changed {
                         self.publish();
                     }
                 }
@@ -1608,6 +1671,11 @@ impl Manager {
         let dir_root = h.nas_dir.clone();
         let operator_seed = self.operator.to_seed();
         let rendezvous_url = self.state.settings.rendezvous_url.clone();
+        // Storage-cap guard: budget left = cap − what the replicas already use.
+        let max_bytes = self.state.settings.storage_cap_bytes.map(|cap| {
+            let used: u64 = h.rows.iter().filter_map(|r| r.disk_bytes).sum();
+            cap.saturating_sub(used)
+        });
         let tx = self.self_tx.clone();
         let existing = h.rows.clone();
         let token_owned = token.trim().to_string();
@@ -1650,6 +1718,7 @@ impl Manager {
                             &link,
                             rendezvous_url.as_deref(),
                             COMPRESS_REPLICA,
+                            max_bytes,
                             on_progress,
                         )
                         .await
@@ -1875,6 +1944,10 @@ impl Manager {
                 daemon_key: None,
                 role: None,
                 shares: Vec::new(),
+                replica_dir: None,
+                replica_free_bytes: None,
+                replica_used_bytes: None,
+                storage_cap_bytes: None,
                 error: None,
             });
         }
@@ -1955,6 +2028,79 @@ impl Manager {
             if let Err(e) = result {
                 tracing::warn!(%label, error = %format!("{e:#}"), "remote set-seeding failed");
             }
+            let _ = tx.send(Command::RepollRemote(label)).await;
+        });
+    }
+
+    /// Change a remote NAS daemon's replica folder and/or storage cap, then
+    /// re-poll its status.
+    fn remote_set_storage(
+        &mut self,
+        label: String,
+        replica_dir: Option<String>,
+        storage_cap_bytes: Option<u64>,
+    ) {
+        let Some(pinned) = self.remotes.get(&label).copied() else { return };
+        let Some(base) = self
+            .state
+            .settings
+            .remote_accelerators
+            .iter()
+            .find(|r| r.label == label)
+            .map(|r| r.admin_url.clone())
+        else {
+            return;
+        };
+        let operator = AgentKeypair::from_seed(self.operator.to_seed());
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let result = match AdminClient::new(base, operator, pinned) {
+                Ok(mut client) => {
+                    client.set_storage(replica_dir.as_deref(), storage_cap_bytes).await
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = result {
+                tracing::warn!(%label, error = %format!("{e:#}"), "remote set-storage failed");
+            }
+            let _ = tx.send(Command::RepollRemote(label)).await;
+        });
+    }
+
+    /// Ask a remote daemon to restart. Mark it unreachable immediately for
+    /// feedback, fire the signed request, and re-poll after a grace period so
+    /// the row recovers once it is back.
+    fn restart_remote(&mut self, label: String) {
+        let Some(pinned) = self.remotes.get(&label).copied() else { return };
+        let Some(base) = self
+            .state
+            .settings
+            .remote_accelerators
+            .iter()
+            .find(|r| r.label == label)
+            .map(|r| r.admin_url.clone())
+        else {
+            return;
+        };
+        if let Some(r) = self.state.remote_accelerators.iter_mut().find(|r| r.label == label) {
+            r.reachable = false;
+            r.error = Some("restarting…".into());
+        }
+        self.publish();
+        let operator = AgentKeypair::from_seed(self.operator.to_seed());
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            match AdminClient::new(base, operator, pinned) {
+                Ok(mut client) => {
+                    if let Err(e) = client.restart().await {
+                        // A dropped connection as the daemon exits is a
+                        // successful restart, not a failure.
+                        tracing::debug!(%label, error = %format!("{e:#}"), "restart request returned");
+                    }
+                }
+                Err(e) => tracing::warn!(%label, error = %format!("{e:#}"), "restart client setup failed"),
+            }
+            tokio::time::sleep(Duration::from_secs(8)).await;
             let _ = tx.send(Command::RepollRemote(label)).await;
         });
     }
@@ -2308,6 +2454,7 @@ impl Manager {
         let tx = self.self_tx.clone();
         let operator_seed = self.operator.to_seed();
         let rendezvous_url = self.state.settings.rendezvous_url.clone();
+        let storage_cap = self.state.settings.storage_cap_bytes;
         let request_saved = request.clone();
         tokio::spawn(async move {
             let result = match request {
@@ -2315,7 +2462,8 @@ impl Manager {
                     start_relay_accel(cache_bytes, shares).await
                 }
                 AcceleratorRequest::Nas { dir, shares, paused } => {
-                    start_nas_accel(dir, shares, paused, operator_seed, rendezvous_url).await
+                    start_nas_accel(dir, shares, paused, operator_seed, rendezvous_url, storage_cap)
+                        .await
                 }
             };
             match result {
@@ -3011,6 +3159,7 @@ async fn nas_replicate(
     link: &ShareLink,
     rendezvous_url: Option<&str>,
     compress: bool,
+    max_bytes: Option<u64>,
     on_progress: impl FnMut(SwarmProgress),
 ) -> anyhow::Result<(Node, net::accel::ShareMeta, usize)> {
     let scratch = Node::spawn().await?;
@@ -3025,7 +3174,8 @@ async fn nas_replicate(
             }
         }
     }
-    let pulled = nas_pull_with_progress(&scratch, dir_root, &link, compress, on_progress).await;
+    let pulled =
+        nas_pull_with_progress(&scratch, dir_root, &link, compress, max_bytes, on_progress).await;
     scratch.shutdown().await;
     let (manifest, chunk_lists, disk, chunks) = pulled?;
     nas_serve(manifest, chunk_lists, disk, chunks, identity, &link).await
@@ -3563,6 +3713,10 @@ async fn start_relay_accel(
         detail: accel_detail(AcceleratorRole::Relay, &rows),
         cache,
         replica_chunks: None,
+        replica_dir: None,
+        replica_free_bytes: None,
+        replica_used_bytes: None,
+        storage_cap_bytes: None,
         shares: rows.clone(),
     };
     let handle = AccelHandle {
@@ -3583,6 +3737,7 @@ async fn start_nas_accel(
     paused: Vec<String>,
     operator_seed: [u8; 32],
     rendezvous_url: Option<String>,
+    storage_cap_bytes: Option<u64>,
 ) -> anyhow::Result<(AccelHandle, AcceleratorState)> {
     anyhow::ensure!(!shares.is_empty(), "a NAS accelerator needs at least one share");
     tokio::fs::create_dir_all(&dir).await.ok();
@@ -3591,20 +3746,26 @@ async fn start_nas_accel(
     let mut tokens = Vec::new();
     let mut nas_nodes: Vec<(Hash, Arc<Node>)> = Vec::new();
     let mut first_seed: Option<[u8; 32]> = None;
+    // Running total of committed share bytes, so the storage cap is enforced
+    // across the whole boot batch, not just per share.
+    let mut committed: u64 = 0;
     for link in &shares {
         let seed = derive_share_seed(&operator_seed, link.manifest_id);
         let is_paused = paused.iter().any(|p| p == &link.manifest_id.to_hex());
+        let max_bytes = storage_cap_bytes.map(|c| c.saturating_sub(committed));
         match nas_replicate(
             &dir,
             net::keypair_from_seed(seed),
             link,
             rendezvous_url.as_deref(),
             COMPRESS_REPLICA,
+            max_bytes,
             |_| {},
         )
         .await
         {
             Ok((node, m, chunks)) => {
+                committed += m.total_bytes;
                 first_seed.get_or_insert(seed);
                 let replica_path = Some(dir.join(m.manifest_id.to_hex()));
                 if is_paused {
@@ -3640,6 +3801,7 @@ async fn start_nas_accel(
         None => Vec::new(),
     };
     let replica_chunks = rows.iter().filter_map(|r| r.replica_chunks).sum::<u64>() as usize;
+    let replica_used_bytes = rows.iter().filter_map(|r| r.disk_bytes).sum::<u64>();
     let state = AcceleratorState {
         role: AcceleratorRole::Nas,
         peer_id,
@@ -3647,6 +3809,10 @@ async fn start_nas_accel(
         detail: accel_detail(AcceleratorRole::Nas, &rows),
         cache: None,
         replica_chunks: Some(replica_chunks),
+        replica_dir: Some(dir.clone()),
+        replica_free_bytes: free_space(&dir).ok(),
+        replica_used_bytes: Some(replica_used_bytes),
+        storage_cap_bytes,
         shares: rows.clone(),
     };
     let handle = AccelHandle {

@@ -99,11 +99,19 @@ fn replica_swarm_config(link: &ShareLink) -> SwarmConfig {
 /// previous run are topped up, not re-fetched. `compress` opens the replica
 /// with zstd on-disk compression (see [`DiskChunkStore::open_with_opts`]).
 /// Reports [`SwarmProgress`] once per chunk via `on_progress`.
+///
+/// `max_bytes` is an optional storage-budget guard: when `Some(n)`, the share's
+/// metadata is fetched first and the pull is refused (before any chunk file is
+/// written) if the share is larger than `n`. Callers pass the replica's
+/// remaining disk budget so a NAS never starts a replication it cannot finish
+/// within its cap. A scoped invite is measured against its full manifest size,
+/// so the guard is conservative for that case.
 pub async fn nas_pull_with_progress<P>(
     downloader: &Node,
     dir_root: &Path,
     link: &ShareLink,
     compress: bool,
+    max_bytes: Option<u64>,
     on_progress: P,
 ) -> anyhow::Result<(Manifest, BTreeMap<String, ChunkList>, DiskChunkStore, usize)>
 where
@@ -114,6 +122,28 @@ where
     let peers = downloader.connect_all(&link.sources).await?;
     if let Some(cred) = link.credential() {
         downloader.authenticate_all(&peers, cred).await?;
+    }
+
+    if let Some(budget) = max_bytes {
+        let mut last_err = None;
+        let mut size = None;
+        for &peer in &peers {
+            match downloader.fetch_share_meta(peer, Some(link.manifest_id)).await {
+                Ok((manifest, _)) => {
+                    size = Some(manifest.total_size());
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let size = size.ok_or_else(|| {
+            last_err.unwrap_or_else(|| anyhow::anyhow!("no source returned the share metadata"))
+        })?;
+        anyhow::ensure!(
+            size <= budget,
+            "share is {size} bytes but only {budget} bytes of the replica storage \
+             budget are free — raise or clear the storage cap to replicate it"
+        );
     }
 
     let dir = dir_root.join(link.manifest_id.to_hex());
@@ -174,8 +204,9 @@ pub async fn nas_add_share(
     identity: Keypair,
     link: &ShareLink,
     compress: bool,
+    max_bytes: Option<u64>,
 ) -> anyhow::Result<(Node, ShareMeta, usize)> {
-    nas_add_share_with_progress(dir_root, identity, link, compress, |_| {}).await
+    nas_add_share_with_progress(dir_root, identity, link, compress, max_bytes, |_| {}).await
 }
 
 /// [`nas_add_share`] that also reports [`SwarmProgress`] once per chunk as it
@@ -185,13 +216,15 @@ pub async fn nas_add_share_with_progress<P>(
     identity: Keypair,
     link: &ShareLink,
     compress: bool,
+    max_bytes: Option<u64>,
     on_progress: P,
 ) -> anyhow::Result<(Node, ShareMeta, usize)>
 where
     P: FnMut(SwarmProgress),
 {
     let scratch = Node::spawn().await?;
-    let pulled = nas_pull_with_progress(&scratch, dir_root, link, compress, on_progress).await;
+    let pulled =
+        nas_pull_with_progress(&scratch, dir_root, link, compress, max_bytes, on_progress).await;
     scratch.shutdown().await;
     let (manifest, chunk_lists, disk, chunks) = pulled?;
     nas_serve(manifest, chunk_lists, disk, chunks, identity, link).await

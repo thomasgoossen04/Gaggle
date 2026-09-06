@@ -117,6 +117,12 @@ pub struct AcceleratorConfig {
     /// --no-compress-replica` turns it off.
     #[serde(default = "default_true")]
     pub compress_replica: bool,
+    /// NAS role: ceiling on total replica bytes on disk. A share whose size
+    /// would push the replica store over this is refused rather than started.
+    /// `None` (the default) = unlimited. Set from the GUI via
+    /// `POST /admin/storage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_storage_bytes: Option<u64>,
     /// Hex `AgentId`s permitted to call the admin API.
     pub authorized_keys: Vec<String>,
     /// `gaggleshare1…` tokens to accelerate on boot and keep in sync.
@@ -140,6 +146,7 @@ impl Default for AcceleratorConfig {
             cache_mib: 256,
             replica_dir: None,
             compress_replica: true,
+            max_storage_bytes: None,
             authorized_keys: Vec::new(),
             shares: Vec::new(),
             paused_shares: Vec::new(),
@@ -225,5 +232,46 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         std::fs::write(path, bytes)
+    }
+}
+
+/// Free space on the filesystem holding `path`, bytes. Unix-only for now
+/// (`statvfs`); other targets report `0` (the daemon just omits the readout).
+pub fn free_space(path: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return 0 };
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+            return 0;
+        }
+        stat.f_bavail as u64 * stat.f_frsize as u64
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_storage_bytes_round_trips_and_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // A config written before this key existed still loads.
+        std::fs::write(&path, "role = \"nas\"\nlisten = \"\"\nadmin_listen = \"127.0.0.1:8749\"\n")
+            .unwrap();
+        let legacy = AcceleratorConfig::load(&path).unwrap();
+        assert_eq!(legacy.max_storage_bytes, None);
+
+        let cfg = AcceleratorConfig { max_storage_bytes: Some(50 << 30), ..legacy };
+        cfg.save(&path).unwrap();
+        assert_eq!(AcceleratorConfig::load(&path).unwrap().max_storage_bytes, Some(50 << 30));
     }
 }

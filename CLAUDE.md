@@ -259,7 +259,10 @@ share, and can be driven remotely:
   and private shares. `Request::GetManifest(Option<Hash>)` selects a share on a
   multi-share source; `Node::download_share_selecting` / `SwarmConfig::manifest_id`
   are the downloader side (a plain download still sends `None`). `net::accel::{relay_add_share,
-  nas_add_share}` are the per-share start helpers shared by the daemon and `app-state`.
+  nas_add_share}` are the per-share start helpers shared by the daemon and `app-state`;
+  the `nas_*` ones take a `max_bytes: Option<u64>` storage-budget guard — when set they
+  fetch the manifest first and error (before opening the `DiskChunkStore`) if the share
+  exceeds it.
 - **Persistent identity** — `net::load_or_create_identity(path)` +
   `Node::spawn_*_with_identity` / `RelayNode::spawn_with_opts` keep a stable
   `PeerId` across restarts. `net::{keypair_from_seed, identity_seed}` derive
@@ -281,14 +284,26 @@ share, and can be driven remotely:
   (`x-gaggle-daemon[-signature]`) so `AdminClient` TOFU-pins it. Mutations go out
   an `mpsc<AdminCommand>` (`RemoveShare { manifest_id, keep_data }`); status comes
   in a `watch<DaemonStatus>` — no `net` dep (`AdminCommand::{AddShare, RemoveShare,
-  SetSeeding}`). `ShareStatus.disk_bytes` reports the replica's on-disk footprint.
+  SetSeeding, SetStorage, Restart}`). `ShareStatus.disk_bytes` reports the replica's on-disk footprint.
   `DaemonStatus.bytes_served_total: Option<u64>` (additive, `skip_serializing_if`)
   carries the daemon's cumulative served bytes so a client can diff successive polls
-  into an outbound-throughput graph.
+  into an outbound-throughput graph. **`POST /admin/storage`**
+  (`AdminClient::set_storage`, body `{replica_dir?, storage_cap_bytes?}` — NAS
+  only) moves the replica folder (`SetStorage` pauses serving, `move_replicas`
+  renames or copies+deletes each `<manifest-id>` dir across disks, then re-adds
+  every share) and/or sets the storage cap (`storage_cap_bytes: 0` = clear it).
+  **`POST /admin/restart`** (`AdminClient::restart`) has the daemon `process::exit(0)`
+  ~500 ms after acking, so its service manager (`gaggle-accelerator-launcher` +
+  systemd `Restart=always`) brings it back on a newer binary. `DaemonStatus` also
+  carries NAS `replica_dir` / `replica_free_bytes` (statvfs) / `replica_used_bytes`
+  / `storage_cap_bytes` (all `Option`, `skip_serializing_if`).
 - **`accelerator` daemon** — `config.rs` (`AcceleratorConfig` toml: role, listen,
   admin_listen, cache_mib, replica_dir, `compress_replica` (default true; `accelerator
   run --no-compress-replica` opts out — NAS stores the replica zstd-compressed on
-  disk), `authorized_keys`, `shares`, `paused_shares` (manifest-id hex of shares
+  disk), `max_storage_bytes` (`Option`, NAS storage cap — a share whose size would
+  push the replica store over it is refused before any chunk lands; `config::free_space`
+  is the statvfs helper feeding `DaemonStatus.replica_free_bytes`),
+  `authorized_keys`, `shares`, `paused_shares` (manifest-id hex of shares
   kept in config + on disk but not served until resumed), `rendezvous_url` +
   `public_relay` (see below)),
   `supervisor.rs` (`Supervisor` owns a multi-share `RelayNode` **or** a
@@ -360,12 +375,19 @@ share, and can be driven remotely:
 - **`ShareLink`** moved from `app-state` to **`net`** (`net::ShareLink`, re-exported
   by `app-state`); `into_request()` is now `From<ShareLink> for SubscribeRequest`
   in `app-state`.
-- **`gui`** Accelerator tab: an operator-key card (copy → `accelerator authorize
-  <key>`), the local form now taking one link per line + a running-status card
+- **`gui`** Accelerator tab: the **"Remote accelerators" section is rendered first**
+  (it's the tab's main use), then the operator-key card (copy → `accelerator authorize
+  <key>`), benchmark, and the local form / running-status card
   listing every carried share with a right-aligned action cluster — a
   SEEDING/PAUSED toggle (local NAS *and* every remote share) + Remove — and an
-  "Add share" field, and a "Remote accelerators" section (reachable dot, role,
-  per-share rows, "Add remote" form + per-remote "Add share"). `accel_share_row`
+  "Add share" field. Each remote row has a **Restart** button (`ask_restart_remote`
+  → `ConfirmKind::RestartRemote` → `App::restart_remote_accelerator`) beside Forget,
+  and — for a NAS remote — a **"REPLICA STORAGE"** block: current folder / free
+  space / used-vs-cap (red when over), plus editable "Replica folder" + "Storage
+  cap (GiB)" fields (`Gaggle::remote_storage_inputs`, pre-filled from the daemon's
+  status) with "Apply storage settings" → `App::remote_set_storage`. The local
+  running-status card shows the same folder / free / used-cap readouts (read-only —
+  the local replica folder is set in the start form). `accel_share_row`
   keeps its info column `flex_1 min_w_0` (truncating) so the actions never get
   pushed off the card and clipped.
 - **NAT rendezvous ("ICE-lite")** — a relay-free path for two peers with no shared
@@ -505,14 +527,20 @@ round-trips the signed status response and reflects a later value. **`relay_acce
 starts a local relay with two `ShareLink`s and drops one live; **remote-accelerator
 tests** cover `Settings` round-tripping `remote_accelerators` and a registered
 remote reporting unreachable + persisting. `crates/net/tests/accelerator.rs` adds
-one-relay-two-shares, mixed public/private on one relay, `remove_share`, and
-persistent-identity tests. `crates/control-plane/tests/admin.rs` round-trips a
+one-relay-two-shares, mixed public/private on one relay, `remove_share`,
+persistent-identity, and `nas_pull_refuses_a_share_over_its_storage_budget` (a
+`nas_pull_with_progress` with a tiny `max_bytes` errors before creating the
+replica dir; a large one still completes) tests. `crates/accelerator/src/config.rs`
+unit-tests `max_storage_bytes` TOML round-trip + legacy-config default.
+`crates/control-plane/tests/admin.rs` round-trips a
 signed request through the admin router (authorised ok; bad key / stale ts → 401;
 add-share reaches the supervisor channel; `POST /admin/shares/{id}`
 `{"seeding":false|true}` round-trips a pause then a resume through
 `AdminClient::set_share_seeding` and flips `ShareStatus.seeding`;
 `DELETE /admin/shares/{id}` reaches it
-with `keep_data=false`, `?keep_data=1` with `true`). `crates/control-plane/tests/rendezvous.rs`
+with `keep_data=false`, `?keep_data=1` with `true`; `POST /admin/storage`
+round-trips `replica_dir` + `storage_cap_bytes` (and `0` clears the cap) into
+`DaemonStatus`, and `POST /admin/restart` is accepted). `crates/control-plane/tests/rendezvous.rs`
 round-trips a subscriber/origin pair through a live rendezvous server, including two
 subscribers waiting on the same origin at once. `a_share_reachable_only_through_nat_rendezvous_still_completes`
 in `app-state/tests/transfer_manager.rs` subscribes with only a deliberately-bogus,
@@ -684,7 +712,7 @@ Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), nine members und
 | `crates/net` → `net` | lib | libp2p swarm: QUIC transport, Kademlia DHT, relay + dcutr NAT traversal. |
 | `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, NAT rendezvous (`rendezvous::{router, RendezvousRegistry, RendezvousClient}`), the seeder tracker (`tracker::{router, TrackerRegistry, TrackerClient}` — who else is serving a share, plus `GET /tracker` = the open directory of public shares), and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). `serve_daemon` merges admin + rendezvous + tracker routers onto one listener (or splits admin from the two unauthenticated ones). |
 | `crates/app-state` → `app-state` | lib | UI-framework-agnostic application state + transfer manager. Testable headless. |
-| `crates/ui-kit` → `gaggle-ui-kit` | lib | Shared `gpui` look: the colour `theme` (`Palette`, `DARK`/`LIGHT`, `active()`) + stateless `widgets`. Depends only on `gpui` + `gpui-component`. Used by `gui` and `launcher`. |
+| `crates/ui-kit` → `gaggle-ui-kit` | lib | Shared `gpui` look: the colour `theme` (`Palette`, `active()`/`set_palette()`, the house `DARK`/`LIGHT` + published schemes like `DRACULA`/`NORD`/`SOLARIZED_DARK`/…) + stateless `widgets`. Depends only on `gpui` + `gpui-component`. Used by `gui` and `launcher`. |
 | `crates/accelerator` → `accelerator` | **bin** | Headless daemon; `--role relay\|nas` selects bandwidth-heavy vs storage-heavy behaviour. |
 | `crates/gui` → `gui` (binary `gaggle-gui`) | **bin** | `gpui` + `gpui-component` desktop frontend. |
 | `crates/launcher` → `launcher` (binary `gaggle-launcher`) | **bin** | Installer / updater / launcher: fetches `latest.json`, installs `gaggle-gui` under the per-user data dir, launches it. `gpui` window styled from `gaggle-ui-kit`; `updater.rs` is the headless engine. |
@@ -816,10 +844,20 @@ then ask the user to run it and confirm the result looks right. Don't drive `spe
 view — state snapshot, tab, per-row expansion set, the Settings/Accelerator/invite
 `InputState` entities, actions) · `ui/` (`widgets.rs` themed primitives incl. `field()`
 over `gpui_component::input::Input`, `chrome.rs` title bar + status bar, `views.rs` the
-five tabs + expandable detail panels) · `theme.rs` (swappable
-`Palette`s — `DARK`, `LIGHT`; every widget paints from `theme::active()`, a
-thread-local) · `clipboard.rs` · `util.rs`. Add a theme = one more `static Palette` +
-a branch in `theme::activate`. The window is decorationless (`WindowDecorations::Client`
+five tabs + expandable detail panels) · `theme.rs` (the
+[`app_state::Theme`]-aware `activate` wrapper — resolves a `Theme` against the OS
+appearance to a `&'static Palette` and calls `gaggle_ui_kit::theme::set_palette`)
+· `clipboard.rs` · `util.rs`. The palettes themselves live in
+`gaggle_ui_kit::theme`: the house `DARK` / `LIGHT` plus popular published schemes
+(`DRACULA`, `NORD`, `GRUVBOX`, `TOKYO_NIGHT`, `CATPPUCCIN`, `SOLARIZED_DARK`,
+`SOLARIZED_LIGHT`, `ROSE_PINE_DAWN`), each transcribed from its documented hex
+codes via a `const fn rgb(0xRRGGBB)` onto the semantic `Palette` slots. Add a
+theme = one more `static Palette` in `ui-kit` + a `Theme` variant in
+`app-state::settings` (its `ALL` list, `label`, and `is_dark` — `None` only for
+`System`) + an arm in `gui::theme::activate`. `app_state::Theme::is_dark` also
+drives the sun / moon / auto glyph the Settings theme dropdown shows per entry
+(`gui::ui::views::theme_icon`). `gaggle_ui_kit::theme::activate(dark: bool)` (the
+old `DARK`/`LIGHT`-only entry point) stays for `launcher`, which has no `Theme`. The window is decorationless (`WindowDecorations::Client`
 + `window_border()`); the header draws its own min/max/close and drag-to-move, except on
 macOS, where those are the real (still-native) traffic lights repositioned under the
 header by `WindowOptions::titlebar` — a bare `titlebar: None` there silently drops

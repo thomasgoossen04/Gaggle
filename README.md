@@ -124,6 +124,11 @@ can browse.
   reachability is configured in one step: someone who has it set clicks **Copy as link**
   to get a short `gagglenet1…` token, and you **Paste reachability link** on the other
   device.
+- **Themes.** **Settings → Appearance** has a theme picker: `System` (follows the OS
+  light/dark setting) plus fixed palettes — the house Dark and Light, and Dracula, Nord,
+  Gruvbox, Tokyo Night, Catppuccin, Solarized (dark and light) and Rosé Pine Dawn. Each
+  entry shows a sun / moon / auto glyph so you can tell a light scheme from a dark one at
+  a glance.
 - **Cross-platform desktop GUI**, a headless accelerator daemon, and a self-updating
   launcher — see "Getting started" below.
 
@@ -237,12 +242,17 @@ since the invite is pinned to a specific manifest.
 The **Accelerator** and **Logs** tabs are hidden until you turn on **Settings → Advanced
 mode**.
 
-From the GUI's **Accelerator** tab: **Benchmark** measures your disk throughput and free
+The tab leads with **Remote accelerators** — the common case is driving a headless NAS or
+VPS daemon (see below) rather than opting this machine in.
+
+To run one locally: **Benchmark** measures your disk throughput and free
 space and suggests a role, then **Start relay** (bandwidth-heavy hot-chunk cache) or
 **Start NAS** (storage-heavy full replica) with one or more share links pasted in. The
 card that appears lists every share it's carrying — each row shows its size on disk and
 (NAS) the replica path, has a **Seed** checkbox to pause/resume uploading it without
-losing the local copy, and a **Remove** button. Removing a NAS share **deletes its
+losing the local copy, and a **Remove** button. For a NAS it also shows the replica
+folder, free space on that disk, and usage against the **Settings → Storage cap** (a
+share whose size would exceed the cap is refused). Removing a NAS share **deletes its
 replica from disk** (you're asked to confirm first); use the Seed toggle instead if you
 only want to stop uploading. A NAS replica is stored compressed on disk (zstd) to save
 space.
@@ -269,6 +279,17 @@ goes over the signed HTTPS admin API. Each remote share gets the same **Seed** t
 **Remove** button as a local one: the toggle pauses/resumes serving on the daemon while
 keeping its replica and its place in the config; Remove drops it (and deletes a NAS
 replica).
+
+For a **NAS** remote the row also shows where it stores replica chunks, how much space is
+free on that disk, and how much is used against an optional cap. Point the replica at a
+different disk by typing a new **Replica folder** and hitting **Apply storage settings** —
+the daemon moves the existing replicas across (renaming, or copying when it's another
+filesystem) and resumes serving. Set a **Storage cap (GiB)** in the same form to have the
+daemon refuse any share whose size would push the replica store over it (existing replicas
+are never evicted). A **Restart** button on each remote row tells the daemon to exit so its
+service manager brings it back — the way an auto-updating (`gaggle-accelerator-launcher` +
+systemd) daemon picks up a newer build. Shares stop serving for a few seconds while it
+comes back.
 
 Any running accelerator (relay or NAS) doubles as a lightweight **NAT rendezvous** point —
 put its `http://host:port` (the same `admin_listen` address) into **Settings → Reachability

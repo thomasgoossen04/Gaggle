@@ -293,6 +293,54 @@ async fn nas_replication_resumes_a_partial_disk_store() {
 }
 
 #[tokio::test]
+async fn nas_pull_refuses_a_share_over_its_storage_budget() {
+    let share = sample_share();
+    let (origin, manifest, lists) = full_seed(&share).await;
+    let src: net::Multiaddr =
+        format!("{}/p2p/{}", bare_addr(&origin).await, origin.peer_id()).parse().unwrap();
+    let link = net::ShareLink::new("accel-share", manifest.id(), vec![src]);
+    let chunk_dir = TempDir::new().unwrap();
+    let dl = Node::spawn().await.unwrap();
+
+    // A budget far below the ~12 MiB share: refused before any chunk lands.
+    let err = net::accel::nas_pull_with_progress(
+        &dl,
+        chunk_dir.path(),
+        &link,
+        false,
+        Some(MIB as u64),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("storage cap"), "unexpected error: {err}");
+    assert!(
+        fs::read_dir(chunk_dir.path().join(link.manifest_id.to_hex())).is_err(),
+        "no replica directory should have been created"
+    );
+
+    // A generous budget: the same pull now completes.
+    let (_, _, _disk, chunks) = timeout(
+        Duration::from_secs(30),
+        net::accel::nas_pull_with_progress(
+            &dl,
+            chunk_dir.path(),
+            &link,
+            false,
+            Some(1 << 30),
+            |_| {},
+        ),
+    )
+    .await
+    .expect("capped replication timed out")
+    .unwrap();
+    assert_eq!(chunks, distinct_chunk_count(&lists), "replica is complete under a large cap");
+
+    dl.shutdown().await;
+    origin.shutdown().await;
+}
+
+#[tokio::test]
 async fn nas_lan_priority_pulls_from_the_replica_first() {
     let share = sample_share();
     let (origin, manifest, lists) = full_seed(&share).await;
