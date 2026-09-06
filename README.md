@@ -208,8 +208,10 @@ cargo run -p accelerator -- run --role relay   # headless accelerator daemon
    that accelerator's seeder tracker knows about and hit **Download** on one. No link
    needed, and the download swarms across every seed and replica the tracker lists, not
    just one address. (Private shares never appear here — they still need their invite.)
-3. Watch progress in the transfer list — pause/resume any time, and expand a row (▸) to
-   see the per-source chunk breakdown while it's swarming from multiple peers.
+3. Watch progress in the transfer list — each active row shows transferred / total, live
+   speed, source count and a steady **time-left estimate**; pause/resume any time, and
+   expand a row (▸) to see the per-source chunk breakdown while it's swarming from
+   multiple peers.
 4. When it finishes it keeps **seeding** the files back to the swarm automatically, so
    you help everyone else who's downloading. The completed row shows a `seeding` chip and
    a **Pause seeding** / **Start seeding** button; turn it off for every download under

@@ -36,7 +36,7 @@ use crate::state::{
     DiscoveredShare, MintedInvite, RemoteAccelState, ReplicaProgress, SourceStats, StatsSnapshot,
     SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
 };
-use crate::stats::{SpeedHistory, SpeedSample, rate_from_cumulative};
+use crate::stats::{EtaEstimator, SpeedHistory, SpeedSample, rate_from_cumulative};
 
 /// A discrete thing that happened, for callers that would rather react than poll.
 #[derive(Debug, Clone)]
@@ -312,6 +312,7 @@ impl App {
             downloads: HashMap::new(),
             paused_seeds: HashSet::new(),
             resync_samples: HashMap::new(),
+            eta: HashMap::new(),
             accel: None,
             remotes,
             last_resync_poll: Instant::now(),
@@ -609,6 +610,10 @@ struct Manager {
     /// re-completion) skips them. Persisted in `shares.json`.
     paused_seeds: HashSet<Hash>,
     resync_samples: HashMap<TransferId, Option<(Instant, u64)>>,
+    /// Rolling-average time-left estimator per running download / resync — feeds
+    /// [`TransferRow::eta_secs`]. Kept off the reactive `speed_bps` EMA on
+    /// purpose: a countdown needs to be steady, not responsive.
+    eta: HashMap<TransferId, EtaEstimator>,
     accel: Option<AccelHandle>,
     /// Registered remote accelerators: label → pinned daemon identity (if known).
     remotes: HashMap<String, Option<AgentId>>,
@@ -1192,10 +1197,12 @@ impl Manager {
                     job.last_sample = None;
                 }
                 self.resync_samples.remove(&id);
+                self.eta.remove(&id);
                 if let Some(row) = self.state.transfers.get_mut(&id) {
                     row.status = TransferStatus::Failed;
                     row.error = Some(error.clone());
                     row.speed_bps = 0;
+                    row.eta_secs = None;
                     row.detail = None;
                 }
                 self.recount();
@@ -1222,11 +1229,16 @@ impl Manager {
                 let done = base_bytes + p.bytes_done;
                 if let Some(job) = self.downloads.get_mut(&id) {
                     let speed = sample_speed(&mut job.last_sample, now, done);
+                    let total = base_bytes + p.bytes_total;
+                    let est = self.eta.entry(id).or_default();
+                    est.record(now, done);
+                    let eta_secs = est.eta_secs(total);
                     if let Some(row) = self.state.transfers.get_mut(&id) {
                         row.status = TransferStatus::Active;
                         row.detail = None;
-                        row.total_bytes = base_bytes + p.bytes_total;
+                        row.total_bytes = total;
                         row.done_bytes = done;
+                        row.eta_secs = eta_secs;
                         if let Some(speed) = speed {
                             row.speed_bps = if row.speed_bps == 0 {
                                 speed
@@ -1241,6 +1253,7 @@ impl Manager {
                 }
             }
             Command::DownloadDone { id, outcome } => {
+                self.eta.remove(&id);
                 let request = self.downloads.remove(&id).map(|job| {
                     clear_partial(job.chunk_dir);
                     job.request
@@ -1265,6 +1278,7 @@ impl Manager {
                     row.done_bytes = outcome.total_bytes;
                     row.version = outcome.version;
                     row.speed_bps = 0;
+                    row.eta_secs = None;
                     row.output_dir = Some(outcome.output_dir);
                     for (peer, chunks) in &outcome.sources {
                         match row.sources.iter_mut().find(|s| s.peer == *peer) {
@@ -1327,11 +1341,16 @@ impl Manager {
                 let now = Instant::now();
                 if let Some(slot) = self.resync_samples.get_mut(&id) {
                     let speed = sample_speed(slot, now, p.bytes_done);
+                    let total = p.bytes_total.max(1);
+                    let est = self.eta.entry(id).or_default();
+                    est.record(now, p.bytes_done);
+                    let eta_secs = est.eta_secs(total);
                     if let Some(row) = self.state.transfers.get_mut(&id) {
                         row.status = TransferStatus::Active;
                         row.detail = None;
-                        row.total_bytes = p.bytes_total.max(1);
+                        row.total_bytes = total;
                         row.done_bytes = p.bytes_done;
+                        row.eta_secs = eta_secs;
                         if let Some(speed) = speed {
                             row.speed_bps = if row.speed_bps == 0 {
                                 speed
@@ -1347,6 +1366,7 @@ impl Manager {
             }
             Command::ResyncDone { id, outcome } => {
                 self.resync_samples.remove(&id);
+                self.eta.remove(&id);
                 if let Some(sub) = self.subs.get_mut(&id) {
                     sub.manifest = outcome.manifest.clone();
                     sub.chunk_lists = outcome.chunk_lists.clone();
@@ -1366,6 +1386,7 @@ impl Manager {
                     row.total_bytes = outcome.total_bytes;
                     row.done_bytes = outcome.total_bytes;
                     row.speed_bps = 0;
+                    row.eta_secs = None;
                     row.update_available = None;
                     row.error = None;
                 }
@@ -2171,8 +2192,10 @@ impl Manager {
             row.status = TransferStatus::Connecting;
             row.error = None;
             row.speed_bps = 0;
+            row.eta_secs = None;
             row.sources.clear();
         }
+        self.eta.remove(&id);
         self.resync_samples.insert(id, None);
         self.publish();
 
@@ -2329,6 +2352,9 @@ impl Manager {
                 let _ = tx.send(Command::WorkerFailed { id, error: format!("{e:#}") }).await;
             }
         });
+        // A resume / retry reuses this path — start the time-left estimate from
+        // a clean window rather than carrying stale pre-pause readings.
+        self.eta.remove(&id);
         self.downloads
             .insert(id, DownloadJob { task, request, chunk_dir, last_sample: None });
     }
@@ -2368,11 +2394,13 @@ impl Manager {
         let Some(job) = self.downloads.get_mut(&id) else { return };
         job.task.abort();
         job.last_sample = None;
+        self.eta.remove(&id);
         if let Some(row) = self.state.transfers.get_mut(&id)
             && !row.status.is_terminal()
         {
             row.status = TransferStatus::Paused;
             row.speed_bps = 0;
+            row.eta_secs = None;
         }
         self.publish();
     }
@@ -2443,6 +2471,7 @@ impl Manager {
             }
         }
         self.resync_samples.remove(&id);
+        self.eta.remove(&id);
         if let Some(job) = self.downloads.remove(&id) {
             job.task.abort();
             clear_partial(job.chunk_dir);
@@ -2649,6 +2678,7 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
         update_available: None,
         seeding: false,
         detail: None,
+        eta_secs: None,
     }
 }
 

@@ -184,7 +184,13 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   `gaggleshare1…` token in `AppState::minted_invite`. `App::subscribe(SubscribeRequest)`
   pulls a remote share into a `DiskChunkStore` under the download dir (so pause = abort,
   resume = top up), then `write_share`s the tree out. Progress rides
-  `Node::download_share_multi_with_progress` (`SwarmProgress` per chunk).
+  `Node::download_share_multi_with_progress` (`SwarmProgress` per chunk). Each
+  running download/resync also feeds a `stats::EtaEstimator` (a ~60 s rolling
+  window of `(time, bytes)` marks, kept on `Manager::eta`) whose average rate
+  drives `TransferRow::eta_secs` — a deliberately steady "time left" for the GUI
+  to show as a countdown, distinct from the reactive `speed_bps` EMA. Cleared
+  whenever the row stops being an active download (done/fail/pause/remove/resync
+  start).
 - **Seed-after-download** — when `Settings::seed_after_download` is set (default true),
   a finished download does not go idle: `Command::DownloadDone` indexes the just-written
   output tree (`index_dir` + a streaming `SourceChunkStore`, same as a local seed) and
@@ -325,7 +331,15 @@ share, and can be driven remotely:
   samples onto a fixed 90-point grid anchored to a live `now` — the Stats graphs call it
   every 200 ms redraw so the line glides between readings instead of freezing then
   jumping once per sample, and the fixed point count keeps the categorical x-axis from
-  folding a wide window's repeated labels onto one position.
+  folding a wide window's repeated labels onto one position. The graphs pass a `now`
+  held `SMOOTH_DELAY` (~3 s, ≈ one reading interval) in the past and `slice_window`
+  keeps one sample from *before* the window, so the whole grid — both edges — stays
+  bracketed by real samples and slides smoothly rather than flat-holding the newest
+  reading and snapping when the next lands. On top of that, `speed_chart_card` eases
+  the *drawn* curve toward each fresh resample per redraw (`Gaggle::stats_ease`, an
+  `EasedCurve` per graph, time constant `EASE_TAU` ≈ 0.45 s; snaps on a window switch
+  or a long tab-away gap) so a reshaped resample morphs over a few frames instead of
+  re-jumping every ~2 s — the "wiggle". Readouts (NOW/PEAK) stay on the raw samples.
 - **`ShareLink`** moved from `app-state` to **`net`** (`net::ShareLink`, re-exported
   by `app-state`); `into_request()` is now `From<ShareLink> for SubscribeRequest`
   in `app-state`.
@@ -452,9 +466,11 @@ loopback transfer leaves the seeder with a non-zero-`up_bps` `stats.local` histo
 both ends with a growing sample count**. `app-state` unit
 tests cover `Settings`
 persistence, `ShareLink` round trips, name sanitizing, and `stats::{SpeedHistory,
-rate_from_cumulative, resample}` (capping, windowing, counter/clock resets; and that
+rate_from_cumulative, resample, EtaEstimator}` (capping, windowing, counter/clock resets; and that
 `resample` holds a fixed point count, stays within the sample range, and advances the
-curve when only `now` moves).
+curve when only `now` moves; and that `EtaEstimator` barely moves under a ±25 %
+per-reading rate swing, withholds an estimate until it has a few seconds of history,
+and resets its window when the byte counter rewinds).
 `crates/net/src/catalog.rs` unit-tests that `ServeStats` counts only `GetChunk` hits;
 `crates/net/tests/accelerator.rs`'s relay-cache test asserts `CacheStats::bytes_served`
 tracks both forwarded and cache-hit chunks (doubling on a second full pull);

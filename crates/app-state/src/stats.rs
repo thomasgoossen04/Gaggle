@@ -71,6 +71,53 @@ impl SpeedHistory {
     }
 }
 
+/// A slow, deliberately steady "time remaining" estimate for a running
+/// transfer. It keeps the progress readings from roughly the last minute and
+/// derives one rate from that whole span, so a brief stall or burst barely
+/// moves the number — unlike [`TransferRow::speed_bps`](crate::TransferRow),
+/// the reactive per-chunk EMA that is right for a live speed readout but far
+/// too jumpy to show as a countdown.
+#[derive(Debug, Default)]
+pub struct EtaEstimator {
+    /// `(reading time, bytes transferred so far)`, oldest first.
+    marks: VecDeque<(Instant, u64)>,
+}
+
+impl EtaEstimator {
+    /// How far back the averaging window reaches.
+    const WINDOW: Duration = Duration::from_secs(60);
+    /// Don't extrapolate from a span shorter than this — too little history.
+    const MIN_SPAN: Duration = Duration::from_secs(5);
+
+    /// Fold in a progress reading. A counter that goes backwards (a resync that
+    /// re-bases its byte count, a job restarted from scratch) resets the window.
+    pub fn record(&mut self, now: Instant, done: u64) {
+        if self.marks.back().is_some_and(|&(_, b)| done < b) {
+            self.marks.clear();
+        }
+        self.marks.push_back((now, done));
+        while self.marks.len() > 2
+            && self.marks.front().is_some_and(|&(t, _)| now.duration_since(t) > Self::WINDOW)
+        {
+            self.marks.pop_front();
+        }
+    }
+
+    /// Seconds until `total` bytes at the average rate across the retained
+    /// window, or `None` until the window spans [`MIN_SPAN`](Self::MIN_SPAN)
+    /// and is moving forward.
+    pub fn eta_secs(&self, total: u64) -> Option<u64> {
+        let &(t0, b0) = self.marks.front()?;
+        let &(t1, b1) = self.marks.back()?;
+        let span = t1.duration_since(t0);
+        if span < Self::MIN_SPAN || b1 <= b0 {
+            return None;
+        }
+        let rate = (b1 - b0) as f64 / span.as_secs_f64();
+        Some((total.saturating_sub(b1) as f64 / rate).ceil() as u64)
+    }
+}
+
 /// Turn two readings of a monotonically-growing cumulative byte counter into a
 /// bytes/sec rate over the elapsed wall-clock gap. `None` when no time has
 /// passed or the counter went backwards (a daemon restart) — the caller keeps
@@ -99,6 +146,11 @@ pub fn rate_from_cumulative(
 /// point count with a curve that advances smoothly between readings — and,
 /// because the count is fixed regardless of `window`, the categorical x-axis
 /// can't collapse repeated labels onto one position when the window widens.
+///
+/// Callers that want the right edge to *keep* gliding rather than flat-hold the
+/// newest reading (then snap when the next lands) pass a `now` held one
+/// reading-interval or so in the past, so the whole grid stays bracketed by
+/// real samples.
 pub fn resample(
     samples: &[SpeedSample],
     now: SystemTime,
@@ -226,6 +278,46 @@ mod tests {
         // Newest is at t=90s; a 25 s window keeps t=70, 80, 90.
         let got = h.within(Duration::from_secs(25));
         assert_eq!(got.iter().map(|s| s.down_bps).collect::<Vec<_>>(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn eta_is_steady_under_a_jittery_rate() {
+        let t0 = Instant::now();
+        let mut e = EtaEstimator::default();
+        // ~1 MB/s on average, but every reading over/undershoots by up to 25 %.
+        let jitter = [900_000u64, 1_200_000, 800_000, 1_150_000, 950_000, 1_050_000];
+        let mut done = 0u64;
+        let mut last = None;
+        for i in 0..40 {
+            done += jitter[i % jitter.len()];
+            e.record(t0 + Duration::from_secs(i as u64 + 1), done);
+            last = e.eta_secs(done + 60_000_000); // ~60 s of work left
+        }
+        let eta = last.expect("estimate available after 40 s of history");
+        // A per-reading ±25 % swing must not move the countdown more than a
+        // few seconds off the true ~60 s.
+        assert!((52..=70).contains(&eta), "eta {eta}");
+    }
+
+    #[test]
+    fn eta_needs_a_few_seconds_of_history() {
+        let t0 = Instant::now();
+        let mut e = EtaEstimator::default();
+        e.record(t0, 0);
+        e.record(t0 + Duration::from_secs(1), 1_000);
+        assert_eq!(e.eta_secs(1_000_000), None);
+    }
+
+    #[test]
+    fn eta_resets_when_progress_rewinds() {
+        let t0 = Instant::now();
+        let mut e = EtaEstimator::default();
+        for i in 0..10 {
+            e.record(t0 + Duration::from_secs(i), i * 1_000);
+        }
+        assert!(e.eta_secs(1_000_000).is_some());
+        e.record(t0 + Duration::from_secs(10), 200); // counter went backwards
+        assert_eq!(e.eta_secs(1_000_000), None, "window cleared, span too short again");
     }
 
     #[test]

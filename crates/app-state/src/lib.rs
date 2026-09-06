@@ -31,4 +31,4 @@ pub use state::{
     DiscoveredShare, MintedInvite, RemoteAccelState, SourceStats, StatsSnapshot, SwarmStatus,
     TransferId, TransferKind, TransferRow, TransferStatus,
 };
-pub use stats::{SpeedHistory, SpeedSample, resample};
+pub use stats::{EtaEstimator, SpeedHistory, SpeedSample, resample};

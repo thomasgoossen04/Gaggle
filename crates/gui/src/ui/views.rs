@@ -1,7 +1,9 @@
 //! The tab bodies — Shares, Transfers, Accelerator, Settings — plus their row
 //! builders and the expandable detail panels (swarm inspector, invite form).
 
-use std::time::{Duration, SystemTime};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime};
 
 use app_state::{
     AccelShareRow, AcceleratorRole, AcceleratorState, DiscoveredShare, LauncherChannel, LogLevel,
@@ -14,13 +16,13 @@ use gpui::{
 };
 use gpui_component::chart::LineChart;
 
-use crate::app::{ConfirmKind, Gaggle, StatsSource, Tab};
+use crate::app::{ConfirmKind, EasedCurve, Gaggle, StatsSource, Tab};
 use crate::theme;
 use crate::ui::widgets::{
     Tri, btn, card, checkmark, chip, danger_btn, field, field_suffixed, hint, kv, primary_btn,
     progress_bar, section_title, status_pill, suffix_btn,
 };
-use crate::util::{cap, fmt_log_time, human_bytes, human_rate};
+use crate::util::{cap, fmt_eta, fmt_log_time, human_bytes, human_rate};
 
 /// Local folders this node originates and serves.
 pub fn shares(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
@@ -501,13 +503,16 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
         .border_color(t.line)
         .child(div().h_full().w(relative(frac)).bg(fill));
 
-    let line = format!(
+    let mut line = format!(
         "{} / {}  ·  {}  ·  {} SOURCE(S)",
         human_bytes(row.done_bytes),
         human_bytes(row.total_bytes),
         human_rate(row.speed_bps),
         row.sources.len(),
     );
+    if let Some(eta) = row.eta_secs.filter(|_| row.status == TransferStatus::Active) {
+        line.push_str(&format!("  ·  {} LEFT", fmt_eta(eta)));
+    }
 
     let can_pause = matches!(
         row.status,
@@ -1641,6 +1646,7 @@ pub fn stats(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             .child(stats_source_dropdown(app, &remotes, cx)),
     );
 
+    let ease = &app.stats_ease;
     let body = match &source {
         StatsSource::Local => {
             let samples = slice_window(&app.state.stats.local, win);
@@ -1648,8 +1654,24 @@ pub fn stats(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(speed_chart_card("Download", &samples, win, |s| s.down_bps, t.accent))
-                .child(speed_chart_card("Upload", &samples, win, |s| s.up_bps, t.info))
+                .child(speed_chart_card(
+                    "Download",
+                    &samples,
+                    win,
+                    |s| s.down_bps,
+                    t.accent,
+                    ease,
+                    "local:down",
+                ))
+                .child(speed_chart_card(
+                    "Upload",
+                    &samples,
+                    win,
+                    |s| s.up_bps,
+                    t.info,
+                    ease,
+                    "local:up",
+                ))
         }
         StatsSource::Remote(label) => {
             let samples = app
@@ -1666,6 +1688,8 @@ pub fn stats(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 win,
                 |s| s.up_bps,
                 t.accent,
+                ease,
+                &format!("remote:{label}"),
             ))
         }
     };
@@ -1684,13 +1708,17 @@ pub fn stats(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         .into_any_element()
 }
 
-/// The samples within `window` of the most recent one.
+/// The samples within `window` of the most recent one, plus the last one from
+/// *before* the window so [`resample`](app_state::resample)'s left edge
+/// interpolates into view instead of flat-holding the first in-window reading —
+/// otherwise the curve's left end snaps when that reading finally scrolls out.
 fn slice_window(samples: &[SpeedSample], window: Duration) -> Vec<SpeedSample> {
     let Some(newest) = samples.last().map(|s| s.at) else {
         return Vec::new();
     };
     let cutoff = newest.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH);
-    samples.iter().filter(|s| s.at >= cutoff).copied().collect()
+    let start = samples.partition_point(|s| s.at < cutoff).saturating_sub(1);
+    samples[start..].to_vec()
 }
 
 fn stats_window_chips(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
@@ -1795,16 +1823,38 @@ fn stats_source_dropdown(app: &Gaggle, remotes: &[String], cx: &mut Context<Gagg
 /// sample.
 const SMOOTH_POINTS: usize = 90;
 
+/// The graphs render their right ("now") edge this far behind true wall-clock
+/// time. Readings land only ~every 2 s, so anchoring the curve exactly at `now`
+/// leaves its rightmost stretch flat-holding the last reading and then snapping
+/// when the next one arrives — the jump this whole resampling dance exists to
+/// hide. Holding the edge just over one reading-interval in the past means that
+/// stretch is (almost) always *between* two real samples, so it slides smoothly
+/// instead. ~3 s of display lag on a ≥60 s window is imperceptible.
+const SMOOTH_DELAY: Duration = Duration::from_secs(3);
+
+/// Time constant of the per-redraw easing in [`speed_chart_card`]. Each 200 ms
+/// frame the drawn curve moves `1 - e^(-dt/τ)` of the way to the freshly
+/// resampled target, so a step change in the underlying samples reshapes the
+/// line over ~2–3 τ rather than in one frame — this is what stops the curve
+/// visibly re-morphing ("wiggling") every couple of seconds when a new reading
+/// lands. Small enough that the line still tracks a real trend within a second.
+const EASE_TAU: f64 = 0.45;
+
 /// One titled line chart of `value(sample)` over `window`, plus now/peak
-/// readouts. The raw samples are monotone-cubic resampled against a live `now`
-/// each redraw, so the line glides between the ~2 s readings instead of
-/// freezing then jumping once per sample.
+/// readouts. The raw samples are monotone-cubic resampled against a live,
+/// slightly-retarded `now` ([`SMOOTH_DELAY`]) each redraw, then the resulting
+/// curve is eased frame-to-frame against the last one drawn (kept in `ease`,
+/// keyed by `key`, time constant [`EASE_TAU`]) so the line glides and morphs
+/// gently instead of snapping to each new resample.
+#[allow(clippy::too_many_arguments)]
 fn speed_chart_card(
     title: &str,
     samples: &[SpeedSample],
     window: Duration,
     value: impl Fn(&SpeedSample) -> u64,
     color: Hsla,
+    ease: &RefCell<HashMap<String, EasedCurve>>,
+    key: &str,
 ) -> AnyElement {
     let t = theme::active();
     let latest = samples.last().map(&value).unwrap_or(0);
@@ -1833,11 +1883,38 @@ fn speed_chart_card(
     // One grid point per whole second at most, so `fmt_ago` labels stay unique
     // (the chart's categorical x-scale maps equal labels to one position).
     let n = SMOOTH_POINTS.min(window.as_secs() as usize + 1).max(2);
-    let points: Vec<(SharedString, f64)> =
-        app_state::resample(samples, SystemTime::now(), window, n, |s| value(s) as f64)
-            .into_iter()
-            .map(|(ago, v)| (SharedString::from(fmt_ago(ago)), v))
-            .collect();
+    let now = SystemTime::now().checked_sub(SMOOTH_DELAY).unwrap_or(SystemTime::UNIX_EPOCH);
+    let target = app_state::resample(samples, now, window, n, |s| value(s) as f64);
+
+    // Ease the drawn curve toward `target` rather than replacing it, so a
+    // reshaped resample (new reading, window edge) morphs over a few frames.
+    let clock = Instant::now();
+    let eased: Vec<f64> = {
+        let mut map = ease.borrow_mut();
+        let cur = map.entry(key.to_owned()).or_insert_with(|| EasedCurve {
+            at: clock,
+            vals: target.iter().map(|&(_, v)| v).collect(),
+        });
+        let dt = clock.saturating_duration_since(cur.at).as_secs_f64();
+        cur.at = clock;
+        if cur.vals.len() != target.len() || dt <= 0.0 || dt > 1.0 {
+            // Window switched, first paint, or the tab was away long enough
+            // that slewing would just crawl — snap instead.
+            cur.vals = target.iter().map(|&(_, v)| v).collect();
+        } else {
+            let alpha = 1.0 - (-dt / EASE_TAU).exp();
+            for (v, &(_, tv)) in cur.vals.iter_mut().zip(&target) {
+                *v += alpha * (tv - *v);
+            }
+        }
+        cur.vals.clone()
+    };
+
+    let points: Vec<(SharedString, f64)> = target
+        .iter()
+        .zip(&eased)
+        .map(|(&(ago, _), &v)| (SharedString::from(fmt_ago(ago)), v.max(0.0)))
+        .collect();
     let tick_margin = (points.len() / 6).max(1);
     let chart = LineChart::new(points)
         .x(|p: &(SharedString, f64)| p.0.clone())

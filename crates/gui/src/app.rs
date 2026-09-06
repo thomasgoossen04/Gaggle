@@ -3,11 +3,12 @@
 //! form inputs and the title-bar drag latch. All rendering is delegated to
 //! [`crate::ui`]; all behaviour is a thin wrapper over [`app_state::App`].
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_state::{
     AcceleratorRequest, App, AppState, Hash, LauncherChannel, LogHandle, LogLevel, LogLine,
@@ -39,6 +40,14 @@ pub enum Tab {
 pub enum StatsSource {
     Local,
     Remote(String),
+}
+
+/// The curve one Stats graph last actually drew, so the next 200 ms redraw can
+/// ease toward the fresh resample instead of snapping to its new shape. Keyed
+/// per graph in [`Gaggle::stats_ease`]. See [`crate::ui::views::speed_chart_card`].
+pub(crate) struct EasedCurve {
+    pub at: Instant,
+    pub vals: Vec<f64>,
 }
 
 /// How long a minted invite stays valid.
@@ -161,6 +170,12 @@ pub struct Gaggle {
     pub(crate) stats_source: StatsSource,
     /// Stats tab: the source dropdown is open.
     pub(crate) stats_source_menu_open: bool,
+    /// Stats tab: per-graph temporal smoothing state — the last-drawn curve for
+    /// each graph, eased toward every fresh resample so the line glides rather
+    /// than re-morphing on each 200 ms redraw. Interior-mutable because it is
+    /// updated from `render` (which only holds `&Gaggle` by the time it reaches
+    /// the view fns). Keyed "local:down" / "local:up" / "remote:<label>".
+    pub(crate) stats_ease: RefCell<HashMap<String, EasedCurve>>,
     /// Last `ThemeMode` pushed into gpui-component, so `render` can re-sync it
     /// when the resolved mode drifts (the OS appearance can land after frame 1).
     pub(crate) theme_mode: Option<gpui_component::ThemeMode>,
@@ -308,6 +323,7 @@ impl Gaggle {
             stats_window: Duration::from_secs(300),
             stats_source: StatsSource::Local,
             stats_source_menu_open: false,
+            stats_ease: RefCell::new(HashMap::new()),
             theme_mode: Some(initial_mode),
             dragging: false,
             show_directory: false,

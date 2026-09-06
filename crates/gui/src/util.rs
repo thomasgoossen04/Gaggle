@@ -23,6 +23,21 @@ pub fn cap(bytes_per_sec: Option<u64>) -> String {
     }
 }
 
+/// A coarse "time remaining" label — deliberately low-resolution (5-second,
+/// then whole-minute, then hour+minute buckets) so a steady estimate that
+/// drifts by a second or two doesn't visibly tick every refresh.
+pub fn fmt_eta(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("~{}s", (secs / 5 * 5).max(5)),
+        60..=3599 => format!("~{}m", (secs + 30) / 60),
+        3600..=86_399 => {
+            let (h, m) = (secs / 3600, (secs % 3600 + 30) / 60);
+            if m == 0 { format!("~{h}h") } else { format!("~{h}h{m}m") }
+        }
+        _ => format!("~{}d", (secs + 43_200) / 86_400),
+    }
+}
+
 /// Bytes/sec as a human rate, or "—" for zero.
 pub fn human_rate(n: u64) -> String {
     if n == 0 {

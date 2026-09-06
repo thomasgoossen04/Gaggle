@@ -122,6 +122,12 @@ pub struct TransferRow {
     /// a stall watchdog: if this goes stale too long the transfer fails with
     /// a clear error instead of sitting on "Connecting" forever.
     pub detail: Option<String>,
+    /// Download only, while `status` is `Active`: a slow rolling-average
+    /// estimate of the seconds left to completion — averaged over ~the last
+    /// minute of progress (see [`EtaEstimator`](crate::EtaEstimator)) so it is
+    /// steady enough to show as a countdown. `None` before there is enough
+    /// history, or whenever the row is not actively downloading.
+    pub eta_secs: Option<u64>,
 }
 
 impl TransferRow {
