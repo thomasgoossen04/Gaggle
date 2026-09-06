@@ -8,8 +8,12 @@ serde.workspace = true
 serde_json.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
-blake3 = "1.8"
+# `rayon` feature: `Hasher::update_rayon` tree-hashes a large buffer across the
+# global rayon pool — used by `Hash::of` for chunk-sized inputs.
+blake3 = { version = "1.8", features = ["rayon"] }
 fastcdc = "5"
+# Parallel folder scan in `snapshot::scan_tree`.
+rayon.workspace = true
 # Optional on-disk compression for the NAS-replica `DiskChunkStore` (one file
 # per chunk, `.zst` when it shrinks the chunk). Kept crate-local like `net`'s
 # own `lz4_flex` wire compression rather than promoted to workspace deps.

@@ -35,6 +35,23 @@ any store back onto disk. `snapshot::sync_share` is its delta form (milestone 10
 given the old + new manifests it rebuilds only added/changed files, deletes removed
 ones, and prunes emptied dirs.
 
+The scan (`snapshot::scan_tree`, behind `snapshot_dir` / `index_dir`) runs the
+CPU-bound work — FastCDC + BLAKE3 over every file — on the **rayon** pool: files
+in parallel via `par_iter`, and each chunk-sized buffer tree-hashed in parallel
+too (`Hash::of` switches to `blake3::Hasher::update_rayon` at/above a 128 KiB
+`RAYON_HASH_THRESHOLD`, and degrades to inline recursion when the pool is already
+busy, so the two levels compose without oversubscription — one huge file fills
+the pool per-chunk, a folder of many files fills it per-file). Results funnel
+back to the calling thread through a **bounded `sync_channel`** (`~2 ×
+current_num_threads` in-flight chunks — peak RAM stays bounded regardless of
+folder size), where the caller's non-`Send` sinks (`ChunkStore::put`, the
+progress callback, the `Hash -> ChunkLocation` map) stay single-threaded. Files
+finish out of walk order, so `manifest.files` is pushed unsorted and
+`canonicalize()` sorts it; `files_done` / `bytes_done` are still monotonic
+because they are counted on the collecting thread. For a deduped chunk shared
+across files, *which* file's `ChunkLocation` is recorded is now
+order-nondeterministic — fine, any occurrence serves identical bytes.
+
 Milestone 7 (private swarms) adds `identity` + `invite` to `gaggle-core`: a per-share
 Ed25519 `ShareKeypair` / `SharePublicKey`, and a bearer `Capability` (`Scope::All` or
 `Scope::Files`, optional expiry) the origin signs into a `SignedCapability`. An `Invite`
@@ -57,7 +74,11 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   the binary and does not gate private shares (that's still `invite`/`Capability`) —
   it only keeps raw file bytes off the wire in the clear and shrinks compressible
   chunks. Every other layer (verification, the relay cache, `DiskChunkStore`) only
-  ever sees plaintext, since `codec.rs` reverses it on read.
+  ever sees plaintext, since `codec.rs` reverses it on read. `codec.rs` runs the
+  chunk `seal` / `open` on `tokio::task::spawn_blocking`, not inline on the libp2p
+  swarm task — that per-chunk CPU pass would otherwise serialize every peer a node
+  serves (and every landing chunk a node downloads) onto the one core the swarm
+  event loop runs on; the tiny non-chunk frames still encode inline.
 - **`Node`** — a standard peer: the chunk protocol wired together with a **Kademlia**
   DHT (`ShareKey` = `Manifest::id`; `provide` / `find_providers`), **identify**, **mDNS**,
   **UPnP**, a **relay client** and **dcutr**. mDNS (`libp2p::mdns::tokio`, deliberately
@@ -79,7 +100,11 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   (fewest holders first) with a per-peer concurrency cap so load spreads across
   sources. Every chunk is still verified against the manifest; a failed or
   chunk-less source is re-routed around (transport failures drop the source
-  entirely, a `NotFound` only for that chunk). `SwarmConfig::prefer` /
+  entirely, a `NotFound` only for that chunk). The per-chunk `verify_chunk`
+  (`Hash::of` over up to 16 MiB) runs on `tokio::task::spawn_blocking` inside each
+  in-flight fetch future, so many chunks content-address in parallel while the
+  driver loop keeps issuing requests — instead of each landing chunk stalling the
+  next on one core. `SwarmConfig::prefer` /
   `Node::download_share_multi_preferring` biases the scheduler toward given sources
   first — the NAS's "LAN-priority" knob. `SwarmDownload` reports per-source chunk
   counts and fetch order. `pick_next` / `requeue` are pure and unit-tested.
@@ -593,7 +618,7 @@ Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), nine members und
 
 | Crate (package name) | Kind | Role |
 |---|---|---|
-| `crates/core` → **`gaggle-core`** | lib | Manifest format, chunking, merkle trees, dedup. Pure logic, no async, dependency-light. |
+| `crates/core` → **`gaggle-core`** | lib | Manifest format, chunking, merkle trees, dedup. Pure logic, no async; light on deps (rayon is the only heavy one — data-parallel folder scan). |
 | `crates/net` → `net` | lib | libp2p swarm: QUIC transport, Kademlia DHT, relay + dcutr NAT traversal. |
 | `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, NAT rendezvous (`rendezvous::{router, RendezvousRegistry, RendezvousClient}`), the seeder tracker (`tracker::{router, TrackerRegistry, TrackerClient}` — who else is serving a share, plus `GET /tracker` = the open directory of public shares), and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). `serve_daemon` merges admin + rendezvous + tracker routers onto one listener (or splits admin from the two unauthenticated ones). |
 | `crates/app-state` → `app-state` | lib | UI-framework-agnostic application state + transfer manager. Testable headless. |
@@ -654,6 +679,9 @@ reads. Module layout and how the pieces chain:
 - **`hash`** — `Hash`, a 32-byte digest newtype. Serdes as hex in human-readable
   formats, raw bytes otherwise. Plain (non-constant-time) equality — content
   addresses aren't secrets. Downstream crates use `gaggle_core::Hash`, not `blake3`.
+  `Hash::of` tree-hashes inputs ≥ 128 KiB (`RAYON_HASH_THRESHOLD`) across the
+  global rayon pool (`blake3` `rayon` feature); smaller inputs (Merkle nodes,
+  signing bytes) take the plain path.
 - **`chunk`** — FastCDC v2020 content-defined chunking (`chunk_slice` for buffers,
   `chunk_reader` for streaming so a 100 GB folder never needs 100 GB of RAM). A
   chunk's content address is `blake3(bytes)`. `ChunkerConfig::for_file_size` scales
@@ -687,7 +715,9 @@ reads. Module layout and how the pieces chain:
   same walk but records a `Hash -> ChunkLocation` map instead of storing bytes →
   `IndexedSnapshot` (for a `SourceChunkStore`). `write_share` is the inverse: rebuild
   the files under a root dir from a store (used by the NAS accelerator and the loopback
-  demo).
+  demo). `scan_tree` (shared by `snapshot_dir` / `index_dir`) chunks + hashes files
+  on the rayon pool and streams results to the caller's thread over a bounded
+  channel — see the parallelism note near the top of this file.
 - **`identity`** — per-share Ed25519 keypair. `ShareKeypair` (origin-only secret) /
   `SharePublicKey` (the share's authority, distinct from `Manifest::id`) / `Signature`,
   all with hex/base64url serde. `verify` uses `verify_strict` (no malleable sigs).

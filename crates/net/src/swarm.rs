@@ -306,13 +306,27 @@ where
         {
             pending.remove(idx);
             *load.get_mut(&peer).unwrap() += 1;
+            let want_len = chunk_len[&hash];
             in_flight.push(async move {
                 let result = request(peer, Request::GetChunk(hash)).await;
-                (peer, hash, result)
+                // Content-address the chunk (`Hash::of` over up to 16 MiB) on a
+                // blocking thread, not this single driver task: many chunks then
+                // verify in parallel while the loop keeps issuing requests,
+                // instead of each landing chunk stalling every other one on one
+                // core. A transport error needs no hashing — handle it inline.
+                let verified = match result {
+                    Ok(resp) => {
+                        tokio::task::spawn_blocking(move || verify_chunk(Ok(resp), hash, want_len))
+                            .await
+                            .expect("verify_chunk is panic-free")
+                    }
+                    Err(e) => verify_chunk(Err(e), hash, want_len),
+                };
+                (peer, hash, verified)
             });
         }
 
-        let Some((peer, hash, result)) = in_flight.next().await else {
+        let Some((peer, hash, verified)) = in_flight.next().await else {
             if pending.is_empty() {
                 break;
             }
@@ -323,7 +337,7 @@ where
         };
         *load.get_mut(&peer).unwrap() -= 1;
 
-        match verify_chunk(result, hash, chunk_len[&hash]) {
+        match verified {
             Ok(data) => {
                 let chunk_len = data.len() as u64;
                 bytes_done += chunk_len;

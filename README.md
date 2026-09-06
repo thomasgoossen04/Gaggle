@@ -81,6 +81,9 @@ can browse.
 - **Huge folders, bounded memory.** Content-defined chunking + a Merkle tree per file mean
   seeding a 100GB folder costs a bounded RAM cache, not a second on-disk copy or a full
   index held in memory.
+- **Uses all your cores.** Indexing a folder chunks and hashes files in parallel across
+  the CPU; serving and downloading verify and (de)compress chunks off the network thread,
+  so a fast disk or link isn't bottlenecked on a single core.
 - **Private, invite-based swarms.** Every share has its own keypair. Invites are signed,
   bearer tokens (`gaggleshare1…`) scoped to the whole share or specific files, with an
   optional expiry — no invite, no access.

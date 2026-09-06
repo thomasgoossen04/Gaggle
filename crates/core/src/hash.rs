@@ -33,9 +33,28 @@ impl Hash {
     }
 
     /// The content address of `data`: `blake3(data)` with no domain separation.
+    ///
+    /// For inputs at/above `RAYON_HASH_THRESHOLD` (128 KiB) the BLAKE3 tree hash
+    /// is split across the global rayon pool (`blake3::Hasher::update_rayon`) — a
+    /// large speedup for chunk-sized buffers when cores are idle (a single huge
+    /// file being indexed, chunks landing from a swarm download), and a graceful
+    /// no-op when an outer parallel walk has already saturated the pool: rayon's
+    /// `join` then just runs both halves inline. Small inputs (Merkle nodes,
+    /// capability signing bytes) take the plain path and pay no split overhead.
     pub fn of(data: &[u8]) -> Self {
-        Self(*blake3::hash(data).as_bytes())
+        if data.len() >= Self::RAYON_HASH_THRESHOLD {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_rayon(data);
+            Self(*hasher.finalize().as_bytes())
+        } else {
+            Self(*blake3::hash(data).as_bytes())
+        }
     }
+
+    /// Input size at which [`Self::of`] switches to the rayon-parallel BLAKE3
+    /// path. 128 KiB is roughly where the split pays for itself; every
+    /// content-defined chunk except a file's short tail clears it.
+    const RAYON_HASH_THRESHOLD: usize = 128 * 1024;
 
     /// 64-character lowercase hex.
     pub fn to_hex(self) -> String {

@@ -34,6 +34,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # Per-OS standard directories (config / data / downloads). Resolves XDG on
 # Linux, ~/Library/Application Support on macOS, and %APPDATA% on Windows.
 dirs = "6"
+# Data-parallelism for the CPU-bound folder scan (chunk + BLAKE3 every file).
+# Only `gaggle-core` uses it directly; `blake3`'s own `rayon` feature shares
+# the same global pool for within-chunk tree hashing.
+rayon = "1.10"
 
 [profile.release]
 # Smaller distributable binaries. No LTO on purpose — it roughly doubles the

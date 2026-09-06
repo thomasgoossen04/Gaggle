@@ -7,11 +7,19 @@
 //! incrementally, so a 100 GB folder never needs 100 GB of RAM), pushes chunk
 //! bytes into a [`ChunkStore`], and returns the [`Manifest`] plus the per-file
 //! [`ChunkList`]s.
+//!
+//! The chunk-and-hash pass runs on the rayon pool — files in parallel, and
+//! large chunks tree-hashed in parallel too (see [`Hash::of`]) — while the
+//! results are collected on the calling thread through a bounded channel, so the
+//! caller's `ChunkStore` and progress callback never see more than one thread.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, Metadata};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use crate::chunk::{ChunkWithData, ChunkerConfig, chunk_reader};
 use crate::chunklist::ChunkList;
@@ -154,40 +162,96 @@ fn scan_tree(
         files.iter().filter_map(|p| fs::symlink_metadata(p).ok()).map(|m| m.len()).sum();
     on_progress(ScanProgress { files_done: 0, files_total, bytes_done: 0, bytes_total });
 
-    let mut chunk_lists = BTreeMap::new();
-    let mut bytes_done = 0u64;
-    for (files_done, path) in files.iter().enumerate() {
-        let rel = rel_path(root, path)?;
-        let meta = fs::symlink_metadata(path)?;
-        let size = meta.len();
-        let cfg = ChunkerConfig::for_file_size(size);
+    // Chunk + hash every file in parallel across the rayon pool. The CPU-bound
+    // work (FastCDC + BLAKE3) is what scales; the results funnel back through a
+    // bounded channel to this thread, where the non-`Send` sinks (`on_chunk`,
+    // `on_progress`, and whatever `store` the caller closed over) stay
+    // single-threaded. The channel bound caps in-flight chunk bytes at roughly
+    // `2 * threads` chunks regardless of how large the folder is, preserving the
+    // "a 100 GB folder never needs 100 GB of RAM" guarantee. Files complete out
+    // of walk order, so `manifest.files` is pushed unsorted and
+    // `manifest.canonicalize()` below sorts it; `files_done` / `bytes_done` are
+    // counted on this thread and so still only ever grow.
+    let mut chunk_lists: BTreeMap<String, ChunkList> = BTreeMap::new();
+    let threads = rayon::current_num_threads().max(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ScanItem>(2 * threads);
+    let files = &files;
 
-        let reader = BufReader::new(File::open(path)?);
-        let mut chunks = Vec::new();
-        for item in chunk_reader(reader, cfg)? {
-            let cwd = item?;
-            let chunk = cwd.chunk;
-            on_chunk(&rel, cwd);
-            chunks.push(chunk);
+    let produced = std::thread::scope(|scope| {
+        let producer = scope.spawn(move || -> Result<()> {
+            files
+                .par_iter()
+                .try_for_each_with(tx, |tx, path| chunk_one_file(root, path, tx))
+        });
+
+        // Drain until every sender (the seed and each rayon clone) is dropped.
+        let mut files_done = 0usize;
+        let mut bytes_done = 0u64;
+        for item in rx {
+            match item {
+                ScanItem::Chunk { rel, cwd } => on_chunk(&rel, cwd),
+                ScanItem::File { rel, entry, list } => {
+                    bytes_done += entry.size;
+                    files_done += 1;
+                    manifest.files.push(entry);
+                    chunk_lists.insert(rel, list);
+                    on_progress(ScanProgress { files_done, files_total, bytes_done, bytes_total });
+                }
+            }
         }
-
-        let list = ChunkList::from_chunks(&chunks);
-        if list.total_size != size {
-            return Err(Error::Verify(format!(
-                "{rel}: chunked {} bytes but the file is {size}",
-                list.total_size
-            )));
-        }
-        manifest.files.push(FileEntry { path: rel.clone(), size, root: list.root(), mode: mode_of(&meta) });
-        chunk_lists.insert(rel, list);
-
-        bytes_done += size;
-        on_progress(ScanProgress { files_done: files_done + 1, files_total, bytes_done, bytes_total });
-    }
+        producer.join().expect("scan producer thread panicked")
+    });
+    produced?;
 
     manifest.canonicalize();
     manifest.validate()?;
     Ok(Snapshot { manifest, chunk_lists, skipped })
+}
+
+/// One message from a [`scan_tree`] worker to the collecting thread. `Chunk`
+/// carries a chunk's bytes (for the store / location map); `File` closes a file
+/// out with its finished [`FileEntry`] and [`ChunkList`]. `rel` on `Chunk` is an
+/// [`Arc<str>`] so a large file's thousands of chunks share one path allocation.
+enum ScanItem {
+    Chunk { rel: Arc<str>, cwd: ChunkWithData },
+    File { rel: String, entry: FileEntry, list: ChunkList },
+}
+
+/// Chunk one file and stream its chunks + closing [`ScanItem::File`] into `tx`.
+/// Runs on a rayon worker; the bounded `tx` provides backpressure so a fast
+/// worker cannot outrun the collector and buffer the whole file in the channel.
+fn chunk_one_file(
+    root: &Path,
+    path: &Path,
+    tx: &mut std::sync::mpsc::SyncSender<ScanItem>,
+) -> Result<()> {
+    let gone = || Error::Io(std::io::Error::other("scan collector went away"));
+
+    let rel = rel_path(root, path)?;
+    let rel_arc: Arc<str> = Arc::from(rel.as_str());
+    let meta = fs::symlink_metadata(path)?;
+    let size = meta.len();
+    let cfg = ChunkerConfig::for_file_size(size);
+
+    let reader = BufReader::new(File::open(path)?);
+    let mut chunks = Vec::new();
+    for item in chunk_reader(reader, cfg)? {
+        let cwd = item?;
+        chunks.push(cwd.chunk);
+        tx.send(ScanItem::Chunk { rel: rel_arc.clone(), cwd }).map_err(|_| gone())?;
+    }
+
+    let list = ChunkList::from_chunks(&chunks);
+    if list.total_size != size {
+        return Err(Error::Verify(format!(
+            "{rel}: chunked {} bytes but the file is {size}",
+            list.total_size
+        )));
+    }
+    let entry =
+        FileEntry { path: rel.clone(), size, root: list.root(), mode: mode_of(&meta) };
+    tx.send(ScanItem::File { rel, entry, list }).map_err(|_| gone())?;
+    Ok(())
 }
 
 /// Materialize `manifest`'s files under `root`, pulling each file's bytes from

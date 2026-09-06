@@ -60,7 +60,20 @@ impl request_response::Codec for GaggleCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        decode_response(&read_frame(io).await?)
+        let frame = read_frame(io).await?;
+        // A chunk's payload is decrypted + decompressed (`wire_crypto::open`) —
+        // real per-chunk CPU work. Run it on a blocking thread instead of the
+        // libp2p swarm task, which otherwise serializes every landing chunk (and
+        // every other connection this node is driving) onto one core. `read_frame`
+        // already bounded the size. Non-chunk replies are tiny — decode inline.
+        if frame.first() == Some(&tag::RES_CHUNK) {
+            return tokio::task::spawn_blocking(move || {
+                crate::wire_crypto::open(&frame[1..]).map(Response::Chunk).map_err(bad)
+            })
+            .await
+            .map_err(|e| bad(format!("chunk-open task failed: {e}")))?;
+        }
+        decode_response(&frame)
     }
 
     async fn write_request<T>(
@@ -84,7 +97,24 @@ impl request_response::Codec for GaggleCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_frame(io, &encode_response(&res)?).await
+        // Sealing a chunk (compress-if-smaller + XChaCha20Poly1305, via
+        // `wire_crypto::seal`) is the CPU cost of serving one. Off-load it to a
+        // blocking thread so the swarm task keeps multiplexing every other peer
+        // while it runs — one slow core must not be a whole accelerator's upload
+        // ceiling. Everything else framed here is small; encode it inline.
+        let body = match res {
+            Response::Chunk(data) => tokio::task::spawn_blocking(move || {
+                let sealed = crate::wire_crypto::seal(&data);
+                let mut v = Vec::with_capacity(1 + sealed.len());
+                v.push(tag::RES_CHUNK);
+                v.extend_from_slice(&sealed);
+                v
+            })
+            .await
+            .map_err(|e| bad(format!("chunk-seal task failed: {e}")))?,
+            other => encode_response(&other)?,
+        };
+        write_frame(io, &body).await
     }
 }
 
