@@ -727,24 +727,32 @@ fn accel_share_row(
     let mid = s.manifest_id.clone();
     let name = s.name.clone();
     let seeding = s.seeding;
+    // A pause/resume toggle applies to a local NAS share and to any share
+    // carried by a remote daemon (the daemon keeps the replica / cache entry
+    // and its token, it just stops serving it). A local *relay* share has no
+    // pause verb.
+    let show_toggle = is_local_nas || remote_label.is_some();
+    let dimmed = show_toggle && !seeding;
 
-    let mut info = div().flex().flex_col().min_w_0().child(
+    let mut info = div().flex().flex_col().flex_1().min_w_0().child(
         div()
             .flex()
             .items_center()
+            .flex_wrap()
             .gap_2()
             .child(
                 div()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if is_local_nas && !seeding { t.muted } else { t.fg })
+                    .text_color(if dimmed { t.muted } else { t.fg })
                     .child(s.name.clone()),
             )
-            .when(s.private, |el| el.child(chip("private", t.info)))
-            .when(is_local_nas && !seeding, |el| el.child(chip("paused", t.muted))),
+            .when(s.private, |el| el.child(chip("private", t.info))),
     );
     info = info.child(
         div()
+            .w_full()
+            .truncate()
             .text_xs()
             .font_family(theme::MONO)
             .text_color(if s.error.is_some() { t.bad } else { t.muted })
@@ -753,6 +761,8 @@ fn accel_share_row(
     if let Some(path) = &s.replica_path {
         info = info.child(
             div()
+                .w_full()
+                .truncate()
                 .text_xs()
                 .font_family(theme::MONO)
                 .text_color(t.muted)
@@ -760,20 +770,43 @@ fn accel_share_row(
         );
     }
 
+    // Right-hand action cluster: never shrinks, so it can't be pushed off the
+    // card's edge (and clipped by the scroll container) by wide meta text.
     let mut actions = div().flex().items_center().gap_2().flex_shrink_0();
-    if is_local_nas {
+    if show_toggle {
         let toggle_mid = mid.clone();
+        let toggle_remote = remote_label.clone();
         actions = actions.child(
             div()
                 .id((SharedString::from(format!("{key}-seed")), 0))
                 .flex()
                 .items_center()
-                .gap_1()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .border_1()
+                .border_color(if seeding { t.accent_dim } else { t.line })
+                .bg(t.panel_hi)
                 .cursor_pointer()
+                .hover(|s| s.border_color(t.accent))
                 .child(checkmark(if seeding { Tri::On } else { Tri::Off }))
-                .child(div().text_xs().text_color(t.muted).child("Seed"))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(t.muted)
+                        .child(if seeding { "SEEDING" } else { "PAUSED" }),
+                )
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.accel_set_seeding(toggle_mid.clone(), !seeding, cx)
+                    match &toggle_remote {
+                        Some(label) => this.remote_set_share_seeding(
+                            label.clone(),
+                            toggle_mid.clone(),
+                            !seeding,
+                            cx,
+                        ),
+                        None => this.accel_set_seeding(toggle_mid.clone(), !seeding, cx),
+                    }
                 })),
         );
     }
@@ -792,10 +825,10 @@ fn accel_share_row(
 
     div()
         .flex()
-        .items_center()
+        .items_start()
         .justify_between()
-        .gap_2()
-        .py(px(2.0))
+        .gap_3()
+        .py(px(4.0))
         .child(info)
         .child(actions)
 }
@@ -1190,7 +1223,7 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
     let c = app.confirm.as_ref()?;
     let t = theme::active();
 
-    let mut actions = div().flex().flex_wrap().gap_2().justify_end().child(
+    let mut actions = div().flex().flex_wrap().w_full().gap_2().justify_end().child(
         btn("cf-cancel", "Cancel")
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_cancel(cx))),
     );
@@ -1232,18 +1265,29 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
         }
     };
 
+    // A *definite* width (not a min/max range): a flex column with only a
+    // min/max width leaves gpui measuring the body paragraph at its unwrapped
+    // single-line width, so the card's computed height ignored the wrap and the
+    // buttons rendered below the border. A fixed width wraps the text properly.
     let card = div()
         .flex()
         .flex_col()
         .gap_3()
         .p_4()
-        .min_w(px(340.0))
-        .max_w(px(520.0))
+        .w(px(460.0))
+        .max_w(relative(0.92))
         .bg(t.panel)
         .border_1()
         .border_color(t.accent)
         .child(section_title(&format!("Remove “{}”?", c.name)))
-        .child(div().text_xs().font_family(theme::MONO).text_color(t.muted).child(body))
+        .child(
+            div()
+                .w_full()
+                .text_xs()
+                .font_family(theme::MONO)
+                .text_color(t.muted)
+                .child(body),
+        )
         .child(actions)
         // Clicks inside the card must not fall through to the backdrop.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
@@ -1320,8 +1364,8 @@ pub fn stats(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(speed_chart_card("Download", &samples, |s| s.down_bps, t.accent))
-                .child(speed_chart_card("Upload", &samples, |s| s.up_bps, t.info))
+                .child(speed_chart_card("Download", &samples, win, |s| s.down_bps, t.accent))
+                .child(speed_chart_card("Upload", &samples, win, |s| s.up_bps, t.info))
         }
         StatsSource::Remote(label) => {
             let samples = app
@@ -1335,6 +1379,7 @@ pub fn stats(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             div().flex().flex_col().gap_3().child(speed_chart_card(
                 &format!("Served — {label}"),
                 &samples,
+                win,
                 |s| s.up_bps,
                 t.accent,
             ))
@@ -1348,9 +1393,9 @@ pub fn stats(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         .child(controls)
         .child(body)
         .child(hint(
-            "Sampled every ~2 s and kept for up to an hour. \"Local\" is this \
-             machine's own transfer + serving rate; a remote accelerator only \
-             reports what it serves outward.",
+            "Sampled every ~2 s (kept up to an hour) and smoothed between \
+             readings. \"Local\" is this machine's own transfer + serving rate; \
+             a remote accelerator only reports what it serves outward.",
         ))
         .into_any_element()
 }
@@ -1459,10 +1504,21 @@ fn stats_source_dropdown(app: &Gaggle, remotes: &[String], cx: &mut Context<Gagg
     wrap.into_any_element()
 }
 
-/// One titled line chart of `value(sample)` over time, plus now/peak readouts.
+/// Points the throughput graphs interpolate their raw ~2 s samples onto. Fixed
+/// (bar a tiny-window clamp) regardless of the selected span so the categorical
+/// x-axis never folds repeated labels together, and dense enough that the
+/// 200 ms redraw shows a smoothly advancing curve rather than a step per
+/// sample.
+const SMOOTH_POINTS: usize = 90;
+
+/// One titled line chart of `value(sample)` over `window`, plus now/peak
+/// readouts. The raw samples are monotone-cubic resampled against a live `now`
+/// each redraw, so the line glides between the ~2 s readings instead of
+/// freezing then jumping once per sample.
 fn speed_chart_card(
     title: &str,
     samples: &[SpeedSample],
+    window: Duration,
     value: impl Fn(&SpeedSample) -> u64,
     color: Hsla,
 ) -> AnyElement {
@@ -1490,14 +1546,14 @@ fn speed_chart_card(
             .into_any_element();
     }
 
-    let now = SystemTime::now();
-    let points: Vec<(SharedString, f64)> = samples
-        .iter()
-        .map(|s| {
-            let ago = now.duration_since(s.at).unwrap_or_default().as_secs();
-            (SharedString::from(fmt_ago(ago)), value(s) as f64)
-        })
-        .collect();
+    // One grid point per whole second at most, so `fmt_ago` labels stay unique
+    // (the chart's categorical x-scale maps equal labels to one position).
+    let n = SMOOTH_POINTS.min(window.as_secs() as usize + 1).max(2);
+    let points: Vec<(SharedString, f64)> =
+        app_state::resample(samples, SystemTime::now(), window, n, |s| value(s) as f64)
+            .into_iter()
+            .map(|(ago, v)| (SharedString::from(fmt_ago(ago)), v))
+            .collect();
     let tick_margin = (points.len() / 6).max(1);
     let chart = LineChart::new(points)
         .x(|p: &(SharedString, f64)| p.0.clone())
@@ -1511,16 +1567,20 @@ fn speed_chart_card(
         .into_any_element()
 }
 
-/// A compact "how long ago" label for a graph's x-axis.
-fn fmt_ago(secs: u64) -> String {
-    if secs == 0 {
+/// A compact — and crucially *unique per whole second* — "how long ago" label
+/// for a graph's x-axis. The chart's categorical x-scale collapses any two
+/// points sharing a label onto the same position, so minute-resolution labels
+/// (the old behaviour) folded a wide window's line onto itself.
+fn fmt_ago(secs: f64) -> String {
+    let s = secs.round() as u64;
+    if s == 0 {
         "now".into()
-    } else if secs < 60 {
-        format!("-{secs}s")
-    } else if secs < 3600 {
-        format!("-{}m", secs / 60)
+    } else if s < 60 {
+        format!("-{s}s")
+    } else if s < 3600 {
+        format!("-{}m{:02}", s / 60, s % 60)
     } else {
-        format!("-{}h{:02}", secs / 3600, (secs % 3600) / 60)
+        format!("-{}h{:02}", s / 3600, (s % 3600) / 60)
     }
 }
 

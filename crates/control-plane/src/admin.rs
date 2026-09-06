@@ -48,6 +48,12 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// `#[serde(default)]` for [`ShareStatus::seeding`] — a reported share is a
+/// served one unless the daemon says otherwise.
+fn serde_true() -> bool {
+    true
+}
+
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -121,6 +127,13 @@ pub struct ShareStatus {
     /// NAS role: this share's own serving address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+    /// Whether the daemon is currently serving this share. `false` after an
+    /// operator paused it (`POST /admin/shares/{id}` `{"seeding":false}`) — the
+    /// replica / cache entry and token are kept, serving just stops until it is
+    /// resumed. Defaults to `true` so an older daemon that never sets it (a
+    /// share it reports is one it is serving) round-trips unchanged.
+    #[serde(default = "serde_true")]
+    pub seeding: bool,
     /// NAS role: set while the initial replication is still under way — the
     /// share is accepted and persisted (it'll retry across restarts) as soon
     /// as it's added, well before it's fully on disk.
@@ -151,6 +164,13 @@ pub enum AdminCommand {
         /// Keep the NAS replica's on-disk chunks (admin API `?keep_data=1`).
         /// Default is to delete them.
         keep_data: bool,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    /// Pause (`seeding = false`) or resume (`seeding = true`) serving one share
+    /// without forgetting it — the replica / cache entry and token stay.
+    SetSeeding {
+        manifest_id: String,
+        seeding: bool,
         ack: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -191,13 +211,17 @@ impl AdminState {
 }
 
 /// `GET /admin/status`, `GET /admin/shares`, `POST /admin/shares`,
+/// `POST /admin/shares/{manifest_id}` (pause/resume),
 /// `DELETE /admin/shares/{manifest_id}` — all behind operator-signature auth,
 /// all responses daemon-signed.
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/status", get(status_handler))
         .route("/admin/shares", get(shares_handler).post(add_share_handler))
-        .route("/admin/shares/{manifest_id}", delete(remove_share_handler))
+        .route(
+            "/admin/shares/{manifest_id}",
+            delete(remove_share_handler).post(set_seeding_handler),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), auth_and_sign))
         .with_state(state)
 }
@@ -275,6 +299,35 @@ async fn remove_share_handler(
     match rx.await {
         Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
         Ok(Err(e)) => (StatusCode::NOT_FOUND, e).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "daemon dropped the request").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetSeedingBody {
+    seeding: bool,
+}
+
+async fn set_seeding_handler(
+    State(state): State<AdminState>,
+    Path(manifest_id): Path<String>,
+    body: Result<axum::Json<SetSeedingBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(axum::Json(body)) = body else {
+        return (StatusCode::BAD_REQUEST, "expected { \"seeding\": true|false }").into_response();
+    };
+    let (ack, rx) = oneshot::channel();
+    if state
+        .commands
+        .send(AdminCommand::SetSeeding { manifest_id, seeding: body.seeding, ack })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down").into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "daemon dropped the request").into_response(),
     }
 }
@@ -433,6 +486,14 @@ impl AdminClient {
     pub async fn remove_share_keep_data(&mut self, manifest_id: &str) -> anyhow::Result<()> {
         self.send_unit("DELETE", &format!("/admin/shares/{manifest_id}"), "?keep_data=1", None)
             .await
+    }
+
+    /// Pause (`seeding = false`) or resume (`seeding = true`) serving one share.
+    /// The daemon keeps its replica / cache entry and its persisted token — only
+    /// serving stops or restarts.
+    pub async fn set_share_seeding(&mut self, manifest_id: &str, seeding: bool) -> anyhow::Result<()> {
+        let body = serde_json::to_vec(&serde_json::json!({ "seeding": seeding }))?;
+        self.send_unit("POST", &format!("/admin/shares/{manifest_id}"), "", Some(body)).await
     }
 
     async fn send_unit(

@@ -234,7 +234,10 @@ For a box that should stay current on its own with no manual redeploys, run it t
 Once authorized, add it as a **remote accelerator** from the GUI's Accelerator tab (label +
 its admin URL + the public key it printed) to manage its shares and watch its status from
 anywhere, without a `net`/libp2p connection between your machine and it — that traffic all
-goes over the signed HTTPS admin API.
+goes over the signed HTTPS admin API. Each remote share gets the same **Seed** toggle and
+**Remove** button as a local one: the toggle pauses/resumes serving on the daemon while
+keeping its replica and its place in the config; Remove drops it (and deletes a NAS
+replica).
 
 Any running accelerator (relay or NAS) doubles as a lightweight **NAT rendezvous** point —
 put its `http://host:port` (the same `admin_listen` address) into **Settings → Reachability

@@ -57,6 +57,9 @@ enum ShareRecord {
         replica_chunks: Option<usize>,
         listen_addr: Option<String>,
     },
+    /// An operator paused this share: the token stays in config and (NAS) the
+    /// replica stays on disk, but nothing serves it until it is resumed.
+    Paused { token: String, name_hint: String, meta: Option<ShareMeta> },
     Failed { token: String, name_hint: String, error: String },
 }
 
@@ -65,6 +68,7 @@ impl ShareRecord {
         match self {
             ShareRecord::Replicating { token, .. }
             | ShareRecord::Ready { token, .. }
+            | ShareRecord::Paused { token, .. }
             | ShareRecord::Failed { token, .. } => token,
         }
     }
@@ -165,7 +169,21 @@ impl Supervisor {
         };
 
         let tokens = sup.config.shares.clone();
+        let paused = sup.config.paused_shares.clone();
         for token in tokens {
+            let link = ShareLink::parse(&token).ok();
+            let is_paused = link
+                .as_ref()
+                .is_some_and(|l| paused.iter().any(|p| p == &l.manifest_id.to_hex()));
+            if is_paused && let Some(l) = link {
+                // Don't serve (or, for NAS, re-replicate) a paused share on
+                // boot — just record it so status shows it and it can resume.
+                sup.shares.insert(
+                    l.manifest_id,
+                    ShareRecord::Paused { token, name_hint: l.name.clone(), meta: None },
+                );
+                continue;
+            }
             let (ack, _rx) = oneshot::channel();
             sup.add_share(token, ack).await;
         }
@@ -188,6 +206,13 @@ impl Supervisor {
                         AdminCommand::RemoveShare { manifest_id, keep_data, ack } => {
                             let result = self
                                 .remove_share(&manifest_id, keep_data)
+                                .await
+                                .map_err(|e| format!("{e:#}"));
+                            let _ = ack.send(result);
+                        }
+                        AdminCommand::SetSeeding { manifest_id, seeding, ack } => {
+                            let result = self
+                                .set_seeding(&manifest_id, seeding)
                                 .await
                                 .map_err(|e| format!("{e:#}"));
                             let _ = ack.send(result);
@@ -347,6 +372,14 @@ impl Supervisor {
                 }
             }
             ShareEvent::Ready { manifest_id, meta, node, chunks, listen_addr, ack } => {
+                // Paused while its replication was still running: keep the
+                // fresh replica on disk but don't start serving it.
+                if let Some(ShareRecord::Paused { .. }) = self.shares.get(&manifest_id) {
+                    tracing::info!(share = %manifest_id, "replication finished for a paused share — not serving");
+                    tokio::spawn(async move { node.shutdown().await });
+                    let _ = ack.send(Ok(()));
+                    return;
+                }
                 tracing::info!(share = %manifest_id, name = %meta.name, files = meta.files, "accelerating share");
                 let token = self.shares.get(&manifest_id).map(|r| r.token().to_string()).unwrap_or_default();
                 self.shares.insert(
@@ -400,7 +433,9 @@ impl Supervisor {
                     relay.remove_share(id).await.ok();
                 }
             }
-            ShareRecord::Failed { .. } => {}
+            // Paused: nothing is serving it, so there's nothing to stop — the
+            // on-disk replica is dealt with below like any other NAS share.
+            ShareRecord::Paused { .. } | ShareRecord::Failed { .. } => {}
         }
 
         if !keep_data
@@ -417,6 +452,63 @@ impl Supervisor {
         tracing::info!(share = %id, "stopped accelerating share");
         self.persist();
         Ok(())
+    }
+
+    /// Pause (`seeding = false`) or resume (`seeding = true`) serving one share
+    /// without forgetting it. Pause shuts the share's serving node down (NAS) or
+    /// drops it from the relay cache, keeping the token and the on-disk replica;
+    /// resume re-runs the add path (a cheap NAS top-up over the existing
+    /// replica, or a relay re-cache).
+    async fn set_seeding(&mut self, manifest_id: &str, seeding: bool) -> anyhow::Result<()> {
+        let id = Hash::from_hex(manifest_id.trim())
+            .map_err(|_| anyhow::anyhow!("not a manifest id: {manifest_id:?}"))?;
+
+        if seeding {
+            let token = match self.shares.get(&id) {
+                Some(ShareRecord::Paused { token, .. }) => token.clone(),
+                Some(_) => return Ok(()), // already serving / replicating
+                None => anyhow::bail!("no such accelerated share"),
+            };
+            self.shares.remove(&id);
+            let (ack, mut rx) = oneshot::channel();
+            self.add_share(token, ack).await;
+            // A relay acks synchronously; a NAS re-replication acks later from
+            // its background task — don't block the command loop on it, just
+            // report acceptance and let status show the progress.
+            match rx.try_recv() {
+                Ok(r) => r.map_err(|e| anyhow::anyhow!(e)),
+                Err(_) => Ok(()),
+            }
+        } else {
+            let record = self.shares.remove(&id).context("no such accelerated share")?;
+            let (token, name_hint, meta) = match record {
+                ShareRecord::Ready { token, meta, node, .. } => {
+                    match node {
+                        Some(node) => {
+                            self.tracker.withdraw(&id.to_hex(), &node.peer_id().to_string());
+                            node.shutdown().await;
+                        }
+                        None => {
+                            if let Backend::Relay { relay, .. } = &self.backend {
+                                self.tracker.withdraw(&id.to_hex(), &relay.peer_id().to_string());
+                                relay.remove_share(id).await.ok();
+                            }
+                        }
+                    }
+                    (token, meta.name.clone(), Some(meta))
+                }
+                ShareRecord::Replicating { token, name_hint, abort, .. } => {
+                    abort.abort();
+                    (token, name_hint, None)
+                }
+                ShareRecord::Failed { token, name_hint, .. } => (token, name_hint, None),
+                ShareRecord::Paused { token, name_hint, meta } => (token, name_hint, meta),
+            };
+            tracing::info!(share = %id, "paused serving share (replica kept)");
+            self.shares.insert(id, ShareRecord::Paused { token, name_hint, meta });
+            self.persist();
+            Ok(())
+        }
     }
 
     /// Read the cumulative served-bytes counters off the running `net` nodes
@@ -445,7 +537,9 @@ impl Supervisor {
             let ids: Vec<Hash> = self
                 .shares
                 .iter()
-                .filter(|(_, r)| matches!(r, ShareRecord::Ready { .. }))
+                .filter(|(_, r)| {
+                    matches!(r, ShareRecord::Ready { .. } | ShareRecord::Paused { .. })
+                })
                 .map(|(id, _)| *id)
                 .collect();
             let dir_root = dir_root.clone();
@@ -463,6 +557,13 @@ impl Supervisor {
     fn persist(&mut self) {
         self.config.shares = self.shares.values().map(|r| r.token().to_string()).collect();
         self.config.shares.sort();
+        self.config.paused_shares = self
+            .shares
+            .iter()
+            .filter(|(_, r)| matches!(r, ShareRecord::Paused { .. }))
+            .map(|(id, _)| id.to_hex())
+            .collect();
+        self.config.paused_shares.sort();
         if let Err(e) = self.config.save(&self.home.config_path()) {
             tracing::warn!(error = %format!("{e:#}"), "could not rewrite config.toml");
         }
@@ -489,6 +590,7 @@ impl Supervisor {
                     replica_chunks: None,
                     disk_bytes: self.disk_bytes.get(id).copied(),
                     listen_addr: None,
+                    seeding: true,
                     replicating: progress.clone(),
                     error: None,
                 },
@@ -503,6 +605,22 @@ impl Supervisor {
                     replica_chunks: replica_chunks.map(|n| n as u64),
                     disk_bytes: self.disk_bytes.get(&meta.manifest_id).copied(),
                     listen_addr: listen_addr.clone(),
+                    seeding: true,
+                    replicating: None,
+                    error: None,
+                },
+                ShareRecord::Paused { name_hint, meta, .. } => ShareStatus {
+                    manifest_id: id.to_hex(),
+                    name: meta.as_ref().map_or_else(|| name_hint.clone(), |m| m.name.clone()),
+                    files: meta.as_ref().map_or(0, |m| m.files),
+                    total_bytes: meta.as_ref().map_or(0, |m| m.total_bytes),
+                    version: meta.as_ref().map_or(0, |m| m.version),
+                    private: meta.as_ref().is_some_and(|m| m.private),
+                    cached_chunks: None,
+                    replica_chunks: None,
+                    disk_bytes: self.disk_bytes.get(id).copied(),
+                    listen_addr: None,
+                    seeding: false,
                     replicating: None,
                     error: None,
                 },
@@ -517,6 +635,7 @@ impl Supervisor {
                     replica_chunks: None,
                     disk_bytes: None,
                     listen_addr: None,
+                    seeding: true,
                     replicating: None,
                     error: Some(error.clone()),
                 },

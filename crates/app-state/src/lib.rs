@@ -27,4 +27,4 @@ pub use state::{
     MintedInvite, RemoteAccelState, SourceStats, StatsSnapshot, SwarmStatus, TransferId,
     TransferKind, TransferRow, TransferStatus,
 };
-pub use stats::{SpeedHistory, SpeedSample};
+pub use stats::{SpeedHistory, SpeedSample, resample};

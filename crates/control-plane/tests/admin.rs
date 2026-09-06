@@ -153,6 +153,7 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
                         replica_chunks: None,
                         disk_bytes: None,
                         listen_addr: None,
+                        seeding: true,
                         replicating: None,
                         error: None,
                     });
@@ -161,6 +162,15 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
                 }
                 AdminCommand::RemoveShare { keep_data, ack, .. } => {
                     let _ = keep_data_tx.send(keep_data);
+                    let _ = ack.send(Ok(()));
+                }
+                AdminCommand::SetSeeding { manifest_id, seeding, ack } => {
+                    status_tx.send_modify(|s| {
+                        if let Some(sh) = s.shares.iter_mut().find(|sh| sh.manifest_id == manifest_id)
+                        {
+                            sh.seeding = seeding;
+                        }
+                    });
                     let _ = ack.send(Ok(()));
                 }
             }
@@ -173,6 +183,13 @@ async fn adding_a_share_reaches_the_supervisor_and_shows_up_in_status() {
     let shares = client.list_shares().await.unwrap();
     assert_eq!(shares.len(), 1);
     assert_eq!(shares[0].name, "gaggleshare1demo");
+    assert!(shares[0].seeding, "a freshly added share is serving");
+
+    // Pause / resume round-trips through POST /admin/shares/{id}.
+    client.set_share_seeding("deadbeef", false).await.unwrap();
+    assert!(!client.list_shares().await.unwrap()[0].seeding, "paused");
+    client.set_share_seeding("deadbeef", true).await.unwrap();
+    assert!(client.list_shares().await.unwrap()[0].seeding, "resumed");
 
     // A plain remove purges the on-disk replica; the opt-out keeps it.
     client.remove_share("deadbeef").await.unwrap();

@@ -753,6 +753,21 @@ impl Gaggle {
         self.set_notice(if on { "Resuming share…" } else { "Paused — replica kept on disk" }, cx);
     }
 
+    /// Pause / resume one share on a registered remote accelerator.
+    pub(crate) fn remote_set_share_seeding(
+        &mut self,
+        label: String,
+        manifest_id: String,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.app.remote_set_share_seeding(label, manifest_id, on);
+        self.set_notice(
+            if on { "Resuming share on remote…" } else { "Pausing share on remote…" },
+            cx,
+        );
+    }
+
     pub(crate) fn copy_operator_key(&mut self, cx: &mut Context<Self>) {
         let key = self.app.operator_public_key();
         self.copy_text(key, "Operator key copied to clipboard", cx);

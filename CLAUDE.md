@@ -190,27 +190,35 @@ share, and can be driven remotely:
   sibling identities (NAS uses one per share). `gaggle_core::{AgentKeypair,
   AgentId}` is a general Ed25519 signer (sibling of the per-share `identity` module).
 - **`control-plane::admin`** — `router(AdminState)` serves `GET /admin/status`,
-  `GET|POST /admin/shares`, `DELETE /admin/shares/{id}` (add `?keep_data=1` to
+  `GET|POST /admin/shares`, `POST /admin/shares/{id}` (`{"seeding":bool}` —
+  `AdminClient::set_share_seeding`, pause/resume serving a share without
+  forgetting it: token + NAS replica kept), `DELETE /admin/shares/{id}` (add
+  `?keep_data=1` to
   keep a NAS replica's bytes for a resume; the default and `AdminClient::remove_share`
   delete them — `remove_share_keep_data` opts out; the flag rides only the URL,
-  not the signed canonical path). Every request is signed
+  not the signed canonical path). `ShareStatus.seeding: bool` (`#[serde(default)]`
+  true) reports whether a share is currently served. Every request is signed
   by the operator's `AgentKeypair` (canonical `METHOD\nPATH\nTS\nNONCE\nblake3(body)`,
   headers `x-gaggle-agent|timestamp|nonce|signature`, ±60 s skew, checked against
   `AdminState.authorized`); every response is signed by the daemon key
   (`x-gaggle-daemon[-signature]`) so `AdminClient` TOFU-pins it. Mutations go out
   an `mpsc<AdminCommand>` (`RemoveShare { manifest_id, keep_data }`); status comes
-  in a `watch<DaemonStatus>` — no `net` dep. `ShareStatus.disk_bytes` reports the
-  replica's on-disk footprint.
+  in a `watch<DaemonStatus>` — no `net` dep (`AdminCommand::{AddShare, RemoveShare,
+  SetSeeding}`). `ShareStatus.disk_bytes` reports the replica's on-disk footprint.
   `DaemonStatus.bytes_served_total: Option<u64>` (additive, `skip_serializing_if`)
   carries the daemon's cumulative served bytes so a client can diff successive polls
   into an outbound-throughput graph.
 - **`accelerator` daemon** — `config.rs` (`AcceleratorConfig` toml: role, listen,
   admin_listen, cache_mib, replica_dir, `compress_replica` (default true; `accelerator
   run --no-compress-replica` opts out — NAS stores the replica zstd-compressed on
-  disk), `authorized_keys`, `shares`),
+  disk), `authorized_keys`, `shares`, `paused_shares` (manifest-id hex of shares
+  kept in config + on disk but not served until resumed)),
   `supervisor.rs` (`Supervisor` owns a multi-share `RelayNode` **or** a
   `HashMap<Hash, Node>` of per-share replicas; applies `AdminCommand`s and
   rewrites `config.toml`; `RemoveShare` deletes the replica dir unless `keep_data`;
+  `SetSeeding` moves a share to/from a `ShareRecord::Paused` (shuts its serving
+  node / drops it from the relay cache, keeps the token + on-disk replica; a
+  paused share isn't re-replicated on boot);
   `refresh_served()` reads the relay's `cache_stats().bytes_served`
   or the sum of each NAS node's `serve_stats()` into `last_served` (and each NAS
   replica's on-disk size into `disk_bytes`) before every
@@ -225,7 +233,8 @@ share, and can be driven remotely:
   `accel_set_seeding` mutate a *running* local
   accelerator. `Settings.remote_accelerators: Vec<RemoteAccelerator>` (label +
   admin URL + pinned `daemon_key`); `App::{add,remove}_remote_accelerator` /
-  `remote_{add,remove}_share`; the manager polls each every ~10 s via `AdminClient`
+  `remote_{add,remove}_share` / `remote_set_share_seeding` (pause/resume one
+  share on a remote daemon); the manager polls each every ~10 s via `AdminClient`
   into `AppState.remote_accelerators: Vec<RemoteAccelState>`.
 - **Throughput history (`app-state/src/stats.rs`)** — `SpeedSample { at, down_bps,
   up_bps }` + a capped `SpeedHistory` ring (~1 h at the 2 s tick). `Manager::tick`
@@ -237,14 +246,22 @@ share, and can be driven remotely:
   All of it is exposed always-on (not gated on the GUI) via
   `AppState.stats: StatsSnapshot { local: Vec<SpeedSample>, accelerators: Vec<AccelStatsRow
   { label, history }> }`. `stats::rate_from_cumulative` is the pure diff helper (unit-tested).
+  `stats::resample` (also pure/unit-tested) monotone-cubic-interpolates the raw ~2 s
+  samples onto a fixed 90-point grid anchored to a live `now` — the Stats graphs call it
+  every 200 ms redraw so the line glides between readings instead of freezing then
+  jumping once per sample, and the fixed point count keeps the categorical x-axis from
+  folding a wide window's repeated labels onto one position.
 - **`ShareLink`** moved from `app-state` to **`net`** (`net::ShareLink`, re-exported
   by `app-state`); `into_request()` is now `From<ShareLink> for SubscribeRequest`
   in `app-state`.
 - **`gui`** Accelerator tab: an operator-key card (copy → `accelerator authorize
   <key>`), the local form now taking one link per line + a running-status card
-  listing every carried share with Remove and an "Add share" field, and a
-  "Remote accelerators" section (reachable dot, role, per-share rows, "Add
-  remote" form + per-remote "Add share").
+  listing every carried share with a right-aligned action cluster — a
+  SEEDING/PAUSED toggle (local NAS *and* every remote share) + Remove — and an
+  "Add share" field, and a "Remote accelerators" section (reachable dot, role,
+  per-share rows, "Add remote" form + per-remote "Add share"). `accel_share_row`
+  keeps its info column `flex_1 min_w_0` (truncating) so the actions never get
+  pushed off the card and clipped.
 - **NAT rendezvous ("ICE-lite")** — a relay-free path for two peers with no shared
   network path and no working UPnP: `control_plane::rendezvous` (`PeerInfo`,
   `RendezvousRegistry`, `router`, `RendezvousClient`) is a small, unauthenticated,
@@ -319,7 +336,9 @@ transfer leaves the seeder with a non-zero-`up_bps` `stats.local` history and bo
 with a growing sample count**. `app-state` unit
 tests cover `Settings`
 persistence, `ShareLink` round trips, name sanitizing, and `stats::{SpeedHistory,
-rate_from_cumulative}` (capping, windowing, counter/clock resets).
+rate_from_cumulative, resample}` (capping, windowing, counter/clock resets; and that
+`resample` holds a fixed point count, stays within the sample range, and advances the
+curve when only `now` moves).
 `crates/net/src/catalog.rs` unit-tests that `ServeStats` counts only `GetChunk` hits;
 `crates/net/tests/accelerator.rs`'s relay-cache test asserts `CacheStats::bytes_served`
 tracks both forwarded and cache-hit chunks (doubling on a second full pull);
@@ -331,7 +350,10 @@ remote reporting unreachable + persisting. `crates/net/tests/accelerator.rs` add
 one-relay-two-shares, mixed public/private on one relay, `remove_share`, and
 persistent-identity tests. `crates/control-plane/tests/admin.rs` round-trips a
 signed request through the admin router (authorised ok; bad key / stale ts → 401;
-add-share reaches the supervisor channel; `DELETE /admin/shares/{id}` reaches it
+add-share reaches the supervisor channel; `POST /admin/shares/{id}`
+`{"seeding":false|true}` round-trips a pause then a resume through
+`AdminClient::set_share_seeding` and flips `ShareStatus.seeding`;
+`DELETE /admin/shares/{id}` reaches it
 with `keep_data=false`, `?keep_data=1` with `true`). `crates/control-plane/tests/rendezvous.rs`
 round-trips a subscriber/origin pair through a live rendezvous server, including two
 subscribers waiting on the same origin at once. `a_share_reachable_only_through_nat_rendezvous_still_completes`

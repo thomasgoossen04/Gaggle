@@ -130,6 +130,7 @@ enum Command {
     RemoveRemoteAccelerator(String),
     RemoteAddShare { label: String, token: String },
     RemoteRemoveShare { label: String, manifest_id: String },
+    RemoteSetShareSeeding { label: String, manifest_id: String, on: bool },
     UpdateSettings(Box<Settings>),
     Shutdown,
 
@@ -466,6 +467,22 @@ impl App {
         self.send(Command::RemoteRemoveShare {
             label: label.into(),
             manifest_id: manifest_id.into(),
+        });
+    }
+
+    /// Pause (`on = false`) or resume (`on = true`) one share on a registered
+    /// remote accelerator. The daemon keeps the share's on-disk replica / cache
+    /// entry and its token; it just stops (or restarts) serving it.
+    pub fn remote_set_share_seeding(
+        &self,
+        label: impl Into<String>,
+        manifest_id: impl Into<String>,
+        on: bool,
+    ) {
+        self.send(Command::RemoteSetShareSeeding {
+            label: label.into(),
+            manifest_id: manifest_id.into(),
+            on,
         });
     }
 
@@ -916,6 +933,9 @@ impl Manager {
             Command::RemoteAddShare { label, token } => self.remote_share_op(label, Some(token), None),
             Command::RemoteRemoveShare { label, manifest_id } => {
                 self.remote_share_op(label, None, Some(manifest_id))
+            }
+            Command::RemoteSetShareSeeding { label, manifest_id, on } => {
+                self.remote_set_seeding(label, manifest_id, on)
             }
             Command::RemoteStatusRefresh { label, state, served_total } => {
                 if let Some(k) = &state.daemon_key
@@ -1646,6 +1666,34 @@ impl Manager {
                 tracing::warn!(%label, error = %format!("{e:#}"), "remote share op failed");
             }
             // Re-poll so the UI reflects the change quickly.
+            let _ = tx.send(Command::RepollRemote(label)).await;
+        });
+    }
+
+    /// Pause / resume one share on a remote daemon via its signed admin API,
+    /// then re-poll its status so the row reflects the new state promptly.
+    fn remote_set_seeding(&mut self, label: String, manifest_id: String, on: bool) {
+        let Some(pinned) = self.remotes.get(&label).copied() else { return };
+        let Some(base) = self
+            .state
+            .settings
+            .remote_accelerators
+            .iter()
+            .find(|r| r.label == label)
+            .map(|r| r.admin_url.clone())
+        else {
+            return;
+        };
+        let operator = AgentKeypair::from_seed(self.operator.to_seed());
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let result = match AdminClient::new(base, operator, pinned) {
+                Ok(mut client) => client.set_share_seeding(manifest_id.trim(), on).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = result {
+                tracing::warn!(%label, error = %format!("{e:#}"), "remote set-seeding failed");
+            }
             let _ = tx.send(Command::RepollRemote(label)).await;
         });
     }
@@ -2828,9 +2876,7 @@ fn share_status_row(s: &control_plane::ShareStatus) -> AccelShareRow {
         replica_chunks: s.replica_chunks,
         disk_bytes: s.disk_bytes,
         replica_path: None,
-        // A remote daemon share is always serving unless it errored; there is
-        // no remote pause verb.
-        seeding: s.error.is_none(),
+        seeding: s.seeding,
         listen_addr: s.listen_addr.clone(),
         replicating: s.replicating.as_ref().map(|p| ReplicaProgress {
             chunks_done: p.chunks_done,

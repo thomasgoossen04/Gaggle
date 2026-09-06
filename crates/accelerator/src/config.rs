@@ -100,6 +100,11 @@ pub struct AcceleratorConfig {
     pub authorized_keys: Vec<String>,
     /// `gaggleshare1…` tokens to accelerate on boot and keep in sync.
     pub shares: Vec<String>,
+    /// Manifest-id hex of shares in `shares` an operator has paused: kept in
+    /// config and (NAS) kept on disk, but not served until resumed via
+    /// `POST /admin/shares/{id}` `{"seeding":true}`.
+    #[serde(default)]
+    pub paused_shares: Vec<String>,
 }
 
 impl Default for AcceleratorConfig {
@@ -114,6 +119,7 @@ impl Default for AcceleratorConfig {
             compress_replica: true,
             authorized_keys: Vec::new(),
             shares: Vec::new(),
+            paused_shares: Vec::new(),
         }
     }
 }
