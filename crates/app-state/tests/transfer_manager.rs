@@ -1202,6 +1202,118 @@ async fn a_download_swarms_across_tracker_discovered_replicas() {
     dir_matches(folder.path(), &row.output_dir.clone().unwrap());
 }
 
+/// A public share is joinable straight off the tracker's open directory, with
+/// no share link ever exchanged: the origin announces it (name + public flag),
+/// a second device lists the directory, sees it by name, and subscribes by
+/// manifest id alone — sources resolved from the tracker — completing
+/// byte-for-byte.
+#[tokio::test]
+async fn a_public_share_is_joinable_from_the_tracker_directory_with_no_link() {
+    let tracker_url = serve_tracker().await;
+
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.update_settings(Settings {
+        rendezvous_url: Some(tracker_url.clone()),
+        ..Settings::default()
+    });
+    wait_for(&seeder, 5, |s| s.settings.rendezvous_url.is_some()).await;
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let manifest_id = seed.manifest_id;
+    let seed_bytes = seed.total_bytes;
+    let share_name = seed.name.clone();
+
+    // Second device: never handed a link, only the same tracker URL.
+    let out = TempDir::new().unwrap();
+    let leech = App::new(None).await.unwrap();
+    leech.update_settings(Settings {
+        download_dir: out.path().to_path_buf(),
+        rendezvous_url: Some(tracker_url),
+        ..Settings::default()
+    });
+    wait_for(&leech, 5, |s| s.settings.rendezvous_url.is_some()).await;
+
+    // Browse the directory until the origin's public share shows up by name.
+    let discovered = timeout(Duration::from_secs(20), async {
+        loop {
+            leech.refresh_directory();
+            if let Some(d) = leech
+                .snapshot()
+                .discovered_shares
+                .iter()
+                .find(|d| d.manifest_id == manifest_id)
+                .cloned()
+            {
+                return d;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("the public share should appear in the tracker directory");
+    assert_eq!(discovered.name, share_name);
+    assert!(discovered.seeders >= 1);
+
+    leech.subscribe_discovered(discovered.manifest_id, discovered.name.clone());
+
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    assert_eq!(row.done_bytes, row.total_bytes);
+    assert_eq!(row.total_bytes, seed_bytes);
+    dir_matches(folder.path(), &row.output_dir.clone().unwrap());
+}
+
+/// A private share never leaks into the open tracker directory, even though
+/// its origin still announces to the same tracker (so invite holders swarm
+/// across replicas).
+#[tokio::test]
+async fn a_private_share_stays_out_of_the_tracker_directory() {
+    let tracker_url = serve_tracker().await;
+
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.update_settings(Settings {
+        rendezvous_url: Some(tracker_url.clone()),
+        ..Settings::default()
+    });
+    wait_for(&seeder, 5, |s| s.settings.rendezvous_url.is_some()).await;
+    seeder.add_private_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.private)
+    })
+    .await;
+    let manifest_id = seeded.seeds().next().unwrap().manifest_id;
+
+    // Give the seeder several announce ticks, then confirm the tracker's
+    // keyed query sees it but the open directory does not.
+    let tracker = control_plane::TrackerClient::new(&tracker_url);
+    let share_hex = manifest_id.to_hex();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if !tracker.seeders(&share_hex).await.unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the private seed should still register with the tracker");
+
+    let dir = tracker.directory().await.unwrap();
+    assert!(
+        !dir.iter().any(|e| e.manifest_id == share_hex),
+        "a private share must never appear in the open directory"
+    );
+}
+
 #[tokio::test]
 async fn stats_history_accumulates_local_download_and_upload_rates() {
     // A real loopback transfer should leave both ends with a throughput

@@ -329,7 +329,8 @@ impl Supervisor {
                 let me = peer_info(relay.peer_id().to_string(), &addrs);
                 for (id, record) in &self.shares {
                     if matches!(record, ShareRecord::Ready { .. }) {
-                        self.announce_one(remote.as_ref(), id, &me).await;
+                        let (name, private) = link_meta(record.token());
+                        self.announce_one(remote.as_ref(), id, &me, name.as_deref(), private).await;
                     }
                 }
             }
@@ -348,19 +349,53 @@ impl Supervisor {
                     if addrs.is_empty() {
                         continue;
                     }
-                    self.announce_one(remote.as_ref(), id, &peer_info(node.peer_id().to_string(), &addrs))
-                        .await;
+                    let (name, private) = link_meta(record.token());
+                    self.announce_one(
+                        remote.as_ref(),
+                        id,
+                        &peer_info(node.peer_id().to_string(), &addrs),
+                        name.as_deref(),
+                        private,
+                    )
+                    .await;
                 }
             }
         }
     }
 
-    /// Announce one share/`PeerInfo` pair to the in-process tracker and, when
-    /// configured, the external one.
-    async fn announce_one(&self, remote: Option<&TrackerClient>, id: &Hash, me: &PeerInfo) {
-        self.tracker.announce(&id.to_hex(), me.clone());
+    /// Announce one share/`PeerInfo` pair to the in-process tracker (a
+    /// same-machine downloader may use a loopback address) and, when
+    /// configured, the external one — the latter with loopback addresses
+    /// stripped, since a remote peer can only waste a dial on them.
+    async fn announce_one(
+        &self,
+        remote: Option<&TrackerClient>,
+        id: &Hash,
+        me: &PeerInfo,
+        name: Option<&str>,
+        private: bool,
+    ) {
+        self.tracker.announce_with_meta(
+            &id.to_hex(),
+            me.clone(),
+            name.map(str::to_string),
+            private,
+        );
         if let Some(client) = remote {
-            let _ = client.announce(&id.to_hex(), me).await;
+            let far = PeerInfo {
+                peer_id: me.peer_id.clone(),
+                addrs: me
+                    .addrs
+                    .iter()
+                    .filter(|a| {
+                        a.parse::<Multiaddr>().map(|m| !net::addr_is_loopback(&m)).unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect(),
+            };
+            if !far.addrs.is_empty() {
+                let _ = client.announce_share(&id.to_hex(), &far, name, private).await;
+            }
         }
     }
 
@@ -828,6 +863,16 @@ fn peer_info(peer_id: String, addrs: &[Multiaddr]) -> PeerInfo {
     PeerInfo { peer_id, addrs: addrs.iter().map(Multiaddr::to_string).collect() }
 }
 
+/// A share link's display name and whether it is invite-only — the metadata
+/// the seeder tracker's open directory needs. A token that no longer parses
+/// yields `(None, false)`: it will just show nameless, not leak as private.
+fn link_meta(token: &str) -> (Option<String>, bool) {
+    match ShareLink::parse(token) {
+        Ok(link) => (Some(link.name).filter(|n| !n.is_empty()), link.invite.is_some()),
+        Err(_) => (None, false),
+    }
+}
+
 /// Dial the relay at `relay_addr` (a `…/p2p/<id>` multiaddr), reserve a
 /// circuit slot, and return the resulting `/p2p-circuit/…/p2p/<self>`
 /// address — dialable by a downloader even when `node` sits behind a NAT
@@ -861,12 +906,20 @@ async fn answer_punch_requests(
     if pending.is_empty() {
         return Ok(());
     }
-    let mut addrs: Vec<String> =
-        node.reachable_addrs().await?.iter().map(Multiaddr::to_string).collect();
+    let mut addrs: Vec<String> = node
+        .reachable_addrs()
+        .await?
+        .into_iter()
+        .filter(|a| !net::addr_is_loopback(a))
+        .map(|a| a.to_string())
+        .collect();
     if let Some(circuit) = circuit_addr
         && !addrs.iter().any(|a| a == circuit)
     {
         addrs.push(circuit.to_string());
+    }
+    if addrs.is_empty() {
+        return Ok(());
     }
     let me = PeerInfo { peer_id: my_id.clone(), addrs };
 

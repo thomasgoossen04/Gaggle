@@ -24,7 +24,7 @@ pub use net::{CacheStats, Multiaddr, PeerId, Scope};
 pub use settings::{RemoteAccelerator, Settings, Theme};
 pub use state::{
     AccelStatsRow, AcceleratorRole, AcceleratorState, AccelShareRow, AppState, BenchmarkResult,
-    MintedInvite, RemoteAccelState, SourceStats, StatsSnapshot, SwarmStatus, TransferId,
-    TransferKind, TransferRow, TransferStatus,
+    DiscoveredShare, MintedInvite, RemoteAccelState, SourceStats, StatsSnapshot, SwarmStatus,
+    TransferId, TransferKind, TransferRow, TransferStatus,
 };
 pub use stats::{SpeedHistory, SpeedSample, resample};

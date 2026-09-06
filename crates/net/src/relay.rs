@@ -173,6 +173,9 @@ impl RelayNode {
     /// (LAN, then any other reachable address, then loopback last).
     pub async fn reachable_addrs(&self) -> anyhow::Result<Vec<Multiaddr>> {
         let mut addrs = self.listen_addrs().await?;
+        // Drop a wildcard `0.0.0.0`/`::` entry — undialable, and libp2p-quic
+        // rejects it with `MultiaddrNotSupported` (see `Node::reachable_addrs`).
+        addrs.retain(|a| !crate::addr_is_unspecified(a));
         crate::prefer_reachable(&mut addrs);
         Ok(addrs.into_iter().map(|a| a.with(Protocol::P2p(self.peer_id))).collect())
     }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_state::{
-    AcceleratorRequest, App, AppState, LogHandle, LogLevel, LogLine, Scope, Settings, ShareLink,
-    Theme, TransferId, TransferKind, TransferRow,
+    AcceleratorRequest, App, AppState, Hash, LogHandle, LogLevel, LogLine, Scope, Settings,
+    ShareLink, Theme, TransferId, TransferKind, TransferRow,
 };
 use gpui::prelude::*;
 use gpui::{ClipboardItem, Entity, FocusHandle, PathPromptOptions, SharedString, Timer, Window, div};
@@ -160,6 +160,8 @@ pub struct Gaggle {
     /// Armed on mouse-down in the title bar; a subsequent move starts a
     /// compositor window drag (so a plain click still reaches the buttons).
     pub(crate) dragging: bool,
+    /// Transfers tab: the "Browse public shares" directory panel is open.
+    pub(crate) show_directory: bool,
 
     // Settings form.
     pub(crate) set_dir: Entity<InputState>,
@@ -297,6 +299,7 @@ impl Gaggle {
             stats_source_menu_open: false,
             theme_mode: Some(initial_mode),
             dragging: false,
+            show_directory: false,
             set_dir,
             set_dl,
             set_ul,
@@ -572,6 +575,39 @@ impl Gaggle {
             Some(Err(e)) => self.set_notice(format!("Clipboard is not a share link: {e}"), cx),
             None => self.set_notice("Clipboard is empty — copy a share link first", cx),
         }
+    }
+
+    /// Toggle the "Browse public shares" panel; opening it kicks a tracker
+    /// directory refresh.
+    pub(crate) fn toggle_directory(&mut self, cx: &mut Context<Self>) {
+        self.show_directory = !self.show_directory;
+        if self.show_directory {
+            if self.state.settings.rendezvous_url.is_none() {
+                self.set_notice(
+                    "Set a Rendezvous / tracker URL in Settings to browse shares",
+                    cx,
+                );
+            }
+            self.app.refresh_directory();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn refresh_directory(&mut self, cx: &mut Context<Self>) {
+        self.app.refresh_directory();
+        self.set_notice("Refreshing shared folders…", cx);
+    }
+
+    /// Subscribe to a public share discovered on the tracker.
+    pub(crate) fn join_discovered(
+        &mut self,
+        manifest_id: Hash,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.app.subscribe_discovered(manifest_id, name.clone());
+        self.tab = Tab::Transfers;
+        self.set_notice(format!("Joining “{name}”…"), cx);
     }
 
     pub(crate) fn copy_text(&mut self, text: String, note: &str, cx: &mut Context<Self>) {

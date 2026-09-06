@@ -21,7 +21,9 @@ pub use rendezvous::{
     PeerInfo, PendingRequest, RendezvousClient, RendezvousRegistry, RequestState,
     router as rendezvous_router,
 };
-pub use tracker::{TrackerClient, TrackerRegistry, router as tracker_router};
+pub use tracker::{
+    SeederAnnounce, ShareDirEntry, TrackerClient, TrackerRegistry, router as tracker_router,
+};
 
 /// One-line status string for the accelerator daemon's start-up log.
 pub fn describe() -> &'static str {

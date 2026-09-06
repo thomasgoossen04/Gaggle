@@ -257,6 +257,18 @@ pub struct AccelStatsRow {
     pub history: Vec<SpeedSample>,
 }
 
+/// A public share the seeder tracker at [`Settings::rendezvous_url`] is
+/// currently advertising — browsable and joinable with no share link. Refresh
+/// the list with [`App::refresh_directory`](crate::App::refresh_directory);
+/// join one with [`App::subscribe_discovered`](crate::App::subscribe_discovered).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredShare {
+    pub manifest_id: Hash,
+    pub name: String,
+    /// How many peers are serving it right now (origins + replicas).
+    pub seeders: usize,
+}
+
 /// A `gaggleshare1…` token just produced by
 /// [`App::mint_invite`](crate::App::mint_invite), so the GUI can pick it up on
 /// its next poll.
@@ -288,6 +300,10 @@ pub struct AppState {
     pub operator_key: String,
     /// Rolling download / upload throughput history — see the Stats tab.
     pub stats: StatsSnapshot,
+    /// Public shares the seeder tracker is advertising, from the last
+    /// [`App::refresh_directory`](crate::App::refresh_directory). Empty until
+    /// asked for, and when no `rendezvous_url` is set.
+    pub discovered_shares: Vec<DiscoveredShare>,
 }
 
 impl AppState {

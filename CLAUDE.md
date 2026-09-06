@@ -135,6 +135,15 @@ round-trips an invite through a live server. Plus the
 (`serve [seed]` / `mint-invite` / `fetch [invite]` / `fetch-swarm`).
 Peer `Node`s deliberately do **not** `add_external_address` their own loopback addr —
 that would make the swarm swallow the identify address candidates dcutr needs.
+`Node`/`RelayNode::reachable_addrs` drop any wildcard `0.0.0.0`/`::` entry
+(`net::addr_is_unspecified`) — a node listening on `/ip4/0.0.0.0/...` can surface
+the bind address itself on kernels where `if-watch` doesn't enumerate concrete
+interfaces (containers, some NAS boxes), and libp2p-quic rejects a dial to it with
+`MultiaddrNotSupported`. The accelerator daemon additionally strips loopback
+(`net::addr_is_loopback`) from what it announces to an *external* tracker /
+publishes in a rendezvous answer (kept only for its own in-process tracker, which
+a same-machine downloader may use); `app-state::merge_tracked_sources` also skips
+unspecified addresses a tracker hands back.
 
 Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
 
@@ -309,7 +318,9 @@ share, and can be driven remotely:
   `TrackerClient`, re-exported at the crate root) is the discovery half of the
   same idea: a small, unauthenticated, in-memory directory keyed by a share's
   **manifest id (hex)** that answers "who else is serving this?". A peer serving
-  a share `POST /tracker/{manifest_id}`s its `PeerInfo` (entry TTL 150s, so a
+  a share `POST /tracker/{manifest_id}`s a `SeederAnnounce` (its `PeerInfo`
+  flattened + optional `name` + `private` flag; a bare `PeerInfo` still
+  deserializes) (entry TTL 150s, so a
   gone seed drops itself); a downloader `GET /tracker/{manifest_id}` once and
   swarms across everyone it gets back plus the addresses in its share link; a
   clean shutdown can `DELETE /tracker/{manifest_id}/{peer_id}`. It fixes the
@@ -321,20 +332,35 @@ share, and can be driven remotely:
   and every discovered chunk is still verified against the manifest root.
   `app-state` reuses `Settings.rendezvous_url` as the tracker URL too:
   `Manager::tick` re-announces every locally-served share (origin seeds +
-  in-process NAS replicas + relay-cached shares) every `TRACKER_ANNOUNCE_INTERVAL`
+  in-process NAS replicas + relay-cached shares), now tagged with its name +
+  private flag, every `TRACKER_ANNOUNCE_INTERVAL`
   (30s), and `run_download` / `run_resync` / `check_remote_version` merge the
   tracker's seeder list into their sources up front (`merge_tracked_sources`,
   bounded by `TRACKER_QUERY_TIMEOUT`, 4s). The standalone `accelerator` daemon's
   `Supervisor` shares one `TrackerRegistry` with its HTTP router and announces
-  every ready share into it directly (in-process, no round trip), so a
+  every ready share into it directly (in-process, no round trip — name/private
+  from `link_meta(token)`), so a
   daemon-run relay/NAS is discoverable the same way. Keyed by manifest id, so a
   post-rescan share whose id changed simply returns nothing extra until the new
   id propagates — the share link's own source still carries it.
+- **Open share directory** — `GET /tracker` (no id) lists every *public* share
+  the tracker currently knows a live seeder for, as `ShareDirEntry { manifest_id,
+  name, seeders }`, name-then-id ordered; `private: true` announces are tracked
+  (invite holders still swarm across replicas via the keyed query) but never
+  listed. `TrackerClient::directory()` is the client side. `App::refresh_directory()`
+  fetches it into `AppState::discovered_shares: Vec<DiscoveredShare>` (empty when
+  no `rendezvous_url`); `App::subscribe_discovered(manifest_id, name)` resolves
+  that share's seeders from the tracker and hands the result to the normal
+  subscribe path — a public share is joinable with **no share link at all**. The
+  `gui` Transfers tab has a "Browse public shares" toggle
+  (`Gaggle::show_directory`) that renders the directory with a per-row Download
+  button (or a "joined" chip for shares already in the transfer list).
 
 - **`gui`** — a gpui shell over `App`: Shares (add public / private folder, copy link,
   rescan, per-row ▸ panel with the invite form), Transfers (progress bars,
   pause/resume/remove, check-updates/resync, `update vN` badge, per-row ▸ swarm
-  inspector = per-source chunk/byte breakdown), Accelerator (benchmark → suggested role
+  inspector = per-source chunk/byte breakdown, plus a "Browse public shares"
+  toggle listing the tracker's open directory with per-row Download), Accelerator (benchmark → suggested role
   → start relay / NAS → live status), Stats (download/upload `gpui_component::chart::LineChart`s
   over a 1m/5m/15m/1h window — ephemeral `Gaggle::stats_window`; a "Local" / per-remote
   source dropdown — `Gaggle::stats_source: StatsSource`; reads `AppState.stats`, no polling
@@ -382,13 +408,20 @@ in `app-state/tests/transfer_manager.rs` subscribes with only a deliberately-bog
 unreachable address for the origin (same peer id, garbage transport) and still
 completes — proof the transfer's reachability came from the rendezvous exchange, not
 the address in the link. `crates/control-plane/tests/tracker.rs` round-trips
-announce / list / withdraw through a live seeder-tracker server, and
+announce / list / withdraw through a live seeder-tracker server (incl.
+`the_open_directory_lists_public_shares_by_name` — a private announce is served
+by the keyed query but kept out of `GET /tracker`), and
 `admin_tls.rs` checks the tracker rides the same (unauthenticated) listener as
 rendezvous, not the admin one. `a_download_swarms_across_tracker_discovered_replicas`
 in `app-state/tests/transfer_manager.rs` runs an origin + a fully-replicated NAS
 both announcing to one tracker, then a third `App` subscribes with only the
 origin's address in its request and still completes with chunks credited to
-**two** sources — the replica came from the tracker, not the link. `crates/net/tests/discovery.rs`'s dcutr test now pins every
+**two** sources — the replica came from the tracker, not the link.
+`a_public_share_is_joinable_from_the_tracker_directory_with_no_link` in the same
+file has a second `App` `refresh_directory()` → find the share by name in
+`discovered_shares` → `subscribe_discovered` → complete byte-exact, never
+touching a share link; `a_private_share_stays_out_of_the_tracker_directory` is
+its negative. `crates/net/tests/discovery.rs`'s dcutr test now pins every
 node to `127.0.0.1` (`Node::spawn_with`/`spawn_serving_with` + a loopback-only
 `RelayNode::spawn_with_opts`) — mDNS deliberately skips loopback, so without this a
 same-host relay/dcutr test races against (and loses to) mDNS finding the peer
@@ -517,7 +550,7 @@ Cargo virtual workspace (`resolver = "2"`, `edition = "2024"`), nine members und
 |---|---|---|
 | `crates/core` → **`gaggle-core`** | lib | Manifest format, chunking, merkle trees, dedup. Pure logic, no async, dependency-light. |
 | `crates/net` → `net` | lib | libp2p swarm: QUIC transport, Kademlia DHT, relay + dcutr NAT traversal. |
-| `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, NAT rendezvous (`rendezvous::{router, RendezvousRegistry, RendezvousClient}`), the seeder tracker (`tracker::{router, TrackerRegistry, TrackerClient}` — who else is serving a share), and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). `serve_daemon` merges admin + rendezvous + tracker routers onto one listener (or splits admin from the two unauthenticated ones). |
+| `crates/control-plane` → `control-plane` | lib | `axum` server + `reqwest` client: invite exchange, NAT rendezvous (`rendezvous::{router, RendezvousRegistry, RendezvousClient}`), the seeder tracker (`tracker::{router, TrackerRegistry, TrackerClient}` — who else is serving a share, plus `GET /tracker` = the open directory of public shares), and the signed accelerator **admin API** (`admin::{router, AdminClient, AdminState, DaemonStatus}`). `serve_daemon` merges admin + rendezvous + tracker routers onto one listener (or splits admin from the two unauthenticated ones). |
 | `crates/app-state` → `app-state` | lib | UI-framework-agnostic application state + transfer manager. Testable headless. |
 | `crates/ui-kit` → `gaggle-ui-kit` | lib | Shared `gpui` look: the colour `theme` (`Palette`, `DARK`/`LIGHT`, `active()`) + stateless `widgets`. Depends only on `gpui` + `gpui-component`. Used by `gui` and `launcher`. |
 | `crates/accelerator` → `accelerator` | **bin** | Headless daemon; `--role relay\|nas` selects bandwidth-heavy vs storage-heavy behaviour. |

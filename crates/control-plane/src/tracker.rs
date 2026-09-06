@@ -22,6 +22,13 @@
 //! 3. A seed shutting down cleanly may `DELETE /tracker/{manifest_id}/{peer_id}`
 //!    to leave immediately rather than waiting out the TTL.
 //!
+//! `GET /tracker` (no id) is the open **directory**: every *public* share the
+//! tracker currently knows a live seeder for, with its human-readable name and
+//! seeder count — so a downloader can browse and join a public share it was
+//! never handed a link for. Invite-only shares announce with `private: true`
+//! and are kept out of that listing (their invite is still the only way in),
+//! but invite holders still swarm across every replica via step 2.
+//!
 //! Entries are in memory only; this is a discovery hint, not a source of
 //! truth — every chunk a discovered peer serves is still verified against
 //! the manifest root exactly as one from the link would be.
@@ -34,7 +41,8 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, post};
+use axum::routing::{delete, get, post};
+use serde::{Deserialize, Serialize};
 
 use crate::rendezvous::PeerInfo;
 
@@ -51,9 +59,45 @@ const MAX_SHARES: usize = 100_000;
 
 const JSON: &[(&str, &str)] = &[("content-type", "application/json")];
 
+/// The body of a `POST /tracker/{manifest_id}` — a seeder's [`PeerInfo`] plus
+/// the two bits of share metadata the open [directory](TrackerRegistry::directory)
+/// listing needs. `name` / `private` are `#[serde(default)]` and the peer
+/// fields are flattened in, so an older caller that only cares about the
+/// who-serves-what half can still `POST` a bare `PeerInfo` and it deserializes
+/// with `name: None`, `private: false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeederAnnounce {
+    #[serde(flatten)]
+    pub peer: PeerInfo,
+    /// Human-readable share name, for the directory listing. The last
+    /// non-empty value announced for a share wins.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `true` for an invite-only share — such shares are tracked (so invite
+    /// holders still swarm across every replica) but never appear in the open
+    /// [directory](TrackerRegistry::directory).
+    #[serde(default)]
+    pub private: bool,
+}
+
+/// One row of the open share [directory](TrackerRegistry::directory): a public
+/// share some peer is currently serving, discoverable without a share link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareDirEntry {
+    /// Manifest id, hex — the key to `GET /tracker/{manifest_id}` for the
+    /// actual seeder addresses, and to a `SubscribeRequest`.
+    pub manifest_id: String,
+    /// Human-readable name, or empty if no announce carried one.
+    pub name: String,
+    /// How many distinct peers are serving it right now.
+    pub seeders: usize,
+}
+
 struct Seeder {
     info: PeerInfo,
     refreshed_at: u64,
+    name: Option<String>,
+    private: bool,
 }
 
 #[derive(Default)]
@@ -83,9 +127,23 @@ impl TrackerRegistry {
     /// refresh of an already-known peer id never counts against the
     /// per-share cap.
     pub fn announce(&self, share: &str, seeder: PeerInfo) {
+        self.announce_with_meta(share, seeder, None, false);
+    }
+
+    /// Like [`announce`](Self::announce) but also records the share's
+    /// human-readable `name` and whether it is `private` — the two fields the
+    /// open [`directory`](Self::directory) listing needs.
+    pub fn announce_with_meta(
+        &self,
+        share: &str,
+        seeder: PeerInfo,
+        name: Option<String>,
+        private: bool,
+    ) {
         if seeder.peer_id.is_empty() {
             return;
         }
+        let name = name.filter(|n| !n.is_empty());
         let mut store = self.inner.lock().unwrap();
         prune(&mut store);
 
@@ -109,7 +167,36 @@ impl TrackerRegistry {
         {
             entries.remove(&oldest);
         }
-        entries.insert(seeder.peer_id.clone(), Seeder { info: seeder, refreshed_at: unix_now() });
+        entries.insert(
+            seeder.peer_id.clone(),
+            Seeder { info: seeder, refreshed_at: unix_now(), name, private },
+        );
+    }
+
+    /// Every *public* share the tracker currently knows a live seeder for,
+    /// name-then-id ordered. Invite-only shares are omitted — discovering one
+    /// still needs its invite. A discovery hint only: chunks a discovered
+    /// source serves are verified against the manifest root regardless.
+    pub fn directory(&self) -> Vec<ShareDirEntry> {
+        let mut store = self.inner.lock().unwrap();
+        prune(&mut store);
+        let mut out: Vec<ShareDirEntry> = store
+            .by_share
+            .iter()
+            .filter(|(_, entries)| !entries.values().any(|s| s.private))
+            .filter(|(_, entries)| !entries.is_empty())
+            .map(|(id, entries)| ShareDirEntry {
+                manifest_id: id.clone(),
+                name: entries
+                    .values()
+                    .filter_map(|s| s.name.clone())
+                    .next()
+                    .unwrap_or_default(),
+                seeders: entries.len(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.manifest_id.cmp(&b.manifest_id)));
+        out
     }
 
     /// The seeders currently known for `share`, freshest announce first.
@@ -158,6 +245,7 @@ fn prune(store: &mut Store) {
 /// data.
 pub fn router(registry: TrackerRegistry) -> Router {
     Router::new()
+        .route("/tracker", get(directory_handler))
         .route("/tracker/{manifest_id}", post(announce_handler).get(seeders_handler))
         .route("/tracker/{manifest_id}/{peer_id}", delete(withdraw_handler))
         .with_state(registry)
@@ -166,13 +254,17 @@ pub fn router(registry: TrackerRegistry) -> Router {
 async fn announce_handler(
     State(registry): State<TrackerRegistry>,
     Path(manifest_id): Path<String>,
-    body: Result<axum::Json<PeerInfo>, axum::extract::rejection::JsonRejection>,
+    body: Result<axum::Json<SeederAnnounce>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Ok(axum::Json(seeder)) = body else {
-        return (StatusCode::BAD_REQUEST, "expected a PeerInfo body").into_response();
+    let Ok(axum::Json(a)) = body else {
+        return (StatusCode::BAD_REQUEST, "expected a SeederAnnounce body").into_response();
     };
-    registry.announce(&manifest_id, seeder);
+    registry.announce_with_meta(&manifest_id, a.peer, a.name, a.private);
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn directory_handler(State(registry): State<TrackerRegistry>) -> Response {
+    axum::Json(registry.directory()).into_response()
 }
 
 async fn seeders_handler(
@@ -219,12 +311,41 @@ impl TrackerClient {
         }
     }
 
-    /// Publish (or refresh) `me` as a current seeder of `manifest_id`.
+    /// Publish (or refresh) `me` as a current seeder of `manifest_id`, with no
+    /// share metadata — the share never shows up in the open [`directory`].
     pub async fn announce(&self, manifest_id: &str, me: &PeerInfo) -> anyhow::Result<()> {
+        self.announce_share(manifest_id, me, None, false).await
+    }
+
+    /// Publish (or refresh) `me` as a current seeder of `manifest_id`, tagging
+    /// it with a human-readable `name` and whether it is `private`. A public
+    /// share announced this way is discoverable through [`directory`](Self::directory)
+    /// with no share link.
+    pub async fn announce_share(
+        &self,
+        manifest_id: &str,
+        me: &PeerInfo,
+        name: Option<&str>,
+        private: bool,
+    ) -> anyhow::Result<()> {
         let url = format!("{}/tracker/{manifest_id}", self.base);
-        let (status, _, _) = self.http.send("POST", &url, JSON, serde_json::to_vec(me)?).await?;
+        let body = SeederAnnounce {
+            peer: me.clone(),
+            name: name.map(str::to_string),
+            private,
+        };
+        let (status, _, _) =
+            self.http.send("POST", &url, JSON, serde_json::to_vec(&body)?).await?;
         anyhow::ensure!(status.is_success(), "tracker announce failed: {status}");
         Ok(())
+    }
+
+    /// Every public share the tracker currently knows a live seeder for.
+    pub async fn directory(&self) -> anyhow::Result<Vec<ShareDirEntry>> {
+        let url = format!("{}/tracker", self.base);
+        let (status, _, bytes) = self.http.send("GET", &url, &[], Vec::new()).await?;
+        anyhow::ensure!(status.is_success(), "tracker directory query failed: {status}");
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     /// The seeders the tracker currently knows for `manifest_id`.
@@ -299,6 +420,33 @@ mod tests {
             }
         }
         assert!(reg.seeders("s").is_empty());
+    }
+
+    #[test]
+    fn directory_lists_public_shares_only() {
+        let reg = TrackerRegistry::new();
+        reg.announce_with_meta("pub1", info("a"), Some("Alpha".into()), false);
+        reg.announce_with_meta("pub1", info("b"), None, false);
+        reg.announce_with_meta("pub2", info("c"), Some("Bravo".into()), false);
+        reg.announce_with_meta("priv1", info("d"), Some("Secret".into()), true);
+
+        let dir = reg.directory();
+        let names: Vec<&str> = dir.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Bravo"]);
+        let alpha = dir.iter().find(|e| e.name == "Alpha").unwrap();
+        assert_eq!(alpha.manifest_id, "pub1");
+        assert_eq!(alpha.seeders, 2);
+        assert!(!dir.iter().any(|e| e.manifest_id == "priv1"));
+    }
+
+    #[test]
+    fn a_private_announce_hides_an_otherwise_public_share() {
+        let reg = TrackerRegistry::new();
+        reg.announce_with_meta("s", info("a"), Some("Name".into()), false);
+        reg.announce_with_meta("s", info("b"), Some("Name".into()), true);
+        assert!(reg.directory().is_empty());
+        // …but invite holders still get every seeder from the keyed query.
+        assert_eq!(reg.seeders("s").len(), 2);
     }
 
     #[test]

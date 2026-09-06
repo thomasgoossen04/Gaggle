@@ -45,6 +45,31 @@ async fn a_downloader_discovers_every_announced_seeder() {
 }
 
 #[tokio::test]
+async fn the_open_directory_lists_public_shares_by_name() {
+    let base = serve(TrackerRegistry::new()).await;
+    let seeder = TrackerClient::new(&base);
+    let browser = TrackerClient::new(&base);
+
+    seeder.announce_share("pub-a", &info("a1"), Some("Skyrim Modpack"), false).await.unwrap();
+    seeder.announce_share("pub-a", &info("a2"), Some("Skyrim Modpack"), false).await.unwrap();
+    seeder.announce_share("pub-b", &info("b1"), Some("Blender Assets"), false).await.unwrap();
+    // A private share is tracked (invite holders still swarm) but never listed.
+    seeder.announce_share("priv-c", &info("c1"), Some("Private Backup"), true).await.unwrap();
+
+    let dir = browser.directory().await.unwrap();
+    let names: Vec<&str> = dir.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["Blender Assets", "Skyrim Modpack"]);
+
+    let a = dir.iter().find(|e| e.manifest_id == "pub-a").unwrap();
+    assert_eq!(a.name, "Skyrim Modpack");
+    assert_eq!(a.seeders, 2);
+    assert!(!dir.iter().any(|e| e.manifest_id == "priv-c"));
+
+    // The private share is still reachable through the keyed query.
+    assert_eq!(browser.seeders("priv-c").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn re_announce_refreshes_rather_than_duplicating() {
     let base = serve(TrackerRegistry::new()).await;
     let client = TrackerClient::new(&base);

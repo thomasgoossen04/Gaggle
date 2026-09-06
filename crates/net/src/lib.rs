@@ -69,6 +69,31 @@ pub(crate) fn prefer_reachable(addrs: &mut [Multiaddr]) {
     addrs.sort_by_key(addr_rank);
 }
 
+/// `true` if `addr`'s IP is the unspecified/wildcard address (`0.0.0.0` or
+/// `::`). libp2p-quic rejects a dial to one with `MultiaddrNotSupported`, and
+/// it is meaningless to hand to a remote peer — a node listening on
+/// `/ip4/0.0.0.0/udp/0/quic-v1` can still surface the wildcard entry (some
+/// container / NAS kernels don't enumerate concrete interfaces via `if-watch`),
+/// so it must be filtered out of anything advertised.
+pub fn addr_is_unspecified(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_unspecified(),
+        libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_unspecified(),
+        _ => false,
+    })
+}
+
+/// `true` if `addr`'s IP is loopback (`127.0.0.0/8` or `::1`) — reachable only
+/// from the same machine, so useless (and a wasted dial) when advertised to a
+/// remote peer via a tracker or rendezvous exchange.
+pub fn addr_is_loopback(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_loopback(),
+        libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
+}
+
 fn addr_rank(addr: &Multiaddr) -> u8 {
     addr.iter()
         .find_map(|p| match p {
@@ -225,5 +250,27 @@ mod tests {
         prefer_reachable(&mut addrs);
 
         assert_eq!(addrs, vec![lan, tailscale, link_local, loopback]);
+    }
+
+    #[test]
+    fn classifies_unspecified_and_loopback_addrs() {
+        let wildcard4: Multiaddr = "/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap();
+        let wildcard6: Multiaddr = "/ip6/::/udp/4001/quic-v1".parse().unwrap();
+        let loopback4: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+        let loopback6: Multiaddr = "/ip6/::1/udp/4001/quic-v1".parse().unwrap();
+        let lan: Multiaddr = "/ip4/192.168.1.23/udp/4001/quic-v1".parse().unwrap();
+        let circuit: Multiaddr = "/ip4/1.2.3.4/udp/4001/quic-v1/p2p-circuit".parse().unwrap();
+
+        assert!(addr_is_unspecified(&wildcard4));
+        assert!(addr_is_unspecified(&wildcard6));
+        assert!(!addr_is_unspecified(&loopback4));
+        assert!(!addr_is_unspecified(&lan));
+        assert!(!addr_is_unspecified(&circuit));
+
+        assert!(addr_is_loopback(&loopback4));
+        assert!(addr_is_loopback(&loopback6));
+        assert!(!addr_is_loopback(&wildcard4));
+        assert!(!addr_is_loopback(&lan));
+        assert!(!addr_is_loopback(&circuit));
     }
 }

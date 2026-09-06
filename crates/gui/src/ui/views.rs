@@ -4,8 +4,8 @@
 use std::time::{Duration, SystemTime};
 
 use app_state::{
-    AccelShareRow, AcceleratorRole, AcceleratorState, LogLevel, RemoteAccelState, SourceStats,
-    SpeedSample, Theme, TransferRow, TransferStatus,
+    AccelShareRow, AcceleratorRole, AcceleratorState, DiscoveredShare, LogLevel, RemoteAccelState,
+    SourceStats, SpeedSample, Theme, TransferRow, TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -373,23 +373,113 @@ fn tree_rows(
 
 /// Remote shares this node is pulling down.
 pub fn transfers(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
+    let dir_open = app.show_directory;
     let mut col = div().flex().flex_col().gap_2().child(
-        div().flex().child(
-            btn("paste-sub", "Paste subscription link")
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.paste_subscription(cx))),
-        ),
+        div()
+            .flex()
+            .gap_2()
+            .child(
+                btn("paste-sub", "Paste subscription link").on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.paste_subscription(cx)),
+                ),
+            )
+            .child(
+                btn(
+                    "browse-shares",
+                    if dir_open { "Hide public shares" } else { "Browse public shares" },
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_directory(cx))),
+            ),
     );
+
+    if dir_open {
+        col = col.child(directory_panel(app, cx));
+    }
 
     let downloads: Vec<TransferRow> = app.state.downloads().cloned().collect();
     if downloads.is_empty() {
         col = col.child(hint(
-            "NO ACTIVE DOWNLOADS — copy a share link on another node, then paste it here.",
+            "NO ACTIVE DOWNLOADS — paste a share link, or Browse public shares on the tracker.",
         ));
     }
     for row in downloads {
         col = col.child(transfer_row(app, &row, cx));
     }
     col.into_any_element()
+}
+
+/// The "Browse public shares" panel: every public share the configured
+/// rendezvous/tracker is currently advertising, each joinable with one click
+/// and no share link.
+fn directory_panel(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
+    let t = theme::active();
+    let shares: Vec<DiscoveredShare> = app.state.discovered_shares.clone();
+    let joined: std::collections::HashSet<_> =
+        app.state.transfers_sorted().map(|r| r.manifest_id).collect();
+
+    let mut panel = card().child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child("PUBLIC SHARES ON THE TRACKER"))
+            .child(
+                btn("dir-refresh", "Refresh").on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.refresh_directory(cx)),
+                ),
+            ),
+    );
+
+    if app.state.settings.rendezvous_url.is_none() {
+        return panel
+            .child(hint("Set a Rendezvous / tracker URL in Settings to browse shares."))
+            .into_any_element();
+    }
+    if shares.is_empty() {
+        return panel
+            .child(hint("NOTHING ADVERTISED — no public share has announced to this tracker yet."))
+            .into_any_element();
+    }
+
+    for (i, s) in shares.into_iter().enumerate() {
+        let already = joined.contains(&s.manifest_id);
+        let id = s.manifest_id;
+        let hexid = id.to_hex();
+        let name = s.name.clone();
+        let label = if name.is_empty() {
+            format!("{}…", &hexid[..hexid.len().min(16)])
+        } else {
+            name.clone()
+        };
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .py_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().child(label))
+                        .child(chip(&format!("{} seed(s)", s.seeders), t.muted)),
+                )
+                .child(if already {
+                    chip("joined", t.good).into_any_element()
+                } else {
+                    btn(("dir-join", i), "Download")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.join_discovered(id, name.clone(), cx)
+                        }))
+                        .into_any_element()
+                }),
+        );
+    }
+    panel.into_any_element()
 }
 
 fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl IntoElement {

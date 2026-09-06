@@ -212,6 +212,11 @@ impl Node {
     /// networks can connect, instead of gambling on one guessed-best address.
     pub async fn reachable_addrs(&self) -> anyhow::Result<Vec<Multiaddr>> {
         let mut addrs = self.listen_addrs().await?;
+        // A node listening on `/ip4/0.0.0.0/udp/0/quic-v1` can surface the
+        // wildcard entry itself (some container/NAS kernels don't enumerate
+        // concrete interfaces via `if-watch`); handing that to a peer just
+        // earns a `MultiaddrNotSupported` when they try to dial it.
+        addrs.retain(|a| !crate::addr_is_unspecified(a));
         crate::prefer_reachable(&mut addrs);
         Ok(addrs.into_iter().map(|a| a.with(Protocol::P2p(self.peer_id))).collect())
     }

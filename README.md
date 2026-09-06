@@ -188,7 +188,11 @@ cargo run -p accelerator -- run --role relay   # headless accelerator daemon
 ### Join a share
 
 1. Open the **Transfers** tab.
-2. Paste a share link or invite token into the field and confirm.
+2. Paste a share link or invite token into the field and confirm — **or**, if you've set a
+   **Settings → Rendezvous URL**, click **Browse public shares** to see every public share
+   that accelerator's seeder tracker knows about and hit **Download** on one. No link
+   needed, and the download swarms across every seed and replica the tracker lists, not
+   just one address. (Private shares never appear here — they still need their invite.)
 3. Watch progress in the transfer list — pause/resume any time, and expand a row (▸) to
    see the per-source chunk breakdown while it's swarming from multiple peers.
 
@@ -251,7 +255,11 @@ The same URL also enables the accelerator's **seeder tracker**: while it's set, 
 folder this node serves (and every replica a local or remote NAS holds) announces itself
 there, and every download asks it who else has the share before starting. That's what lets
 a download fan out across a NAS replica and the origin at the same time even though the
-share link only ever carried the origin's address. No chunk data or share secret touches
+share link only ever carried the origin's address. It also powers **Browse public shares**
+on the Transfers tab: every public folder announced to that tracker is listed by name and
+joinable in one click, so on a trusted accelerator you never have to pass links around at
+all. Private shares announce too (so invite holders still fan out across replicas) but are
+kept off that list. No chunk data or share secret touches
 the tracker — it only exchanges peer ids and addresses, and every chunk is still verified
 against the manifest.
 

@@ -32,8 +32,8 @@ use crate::persist::{PersistedSeed, PersistedState};
 use crate::settings::{PersistedAccelRole, PersistedAccelerator, Settings};
 use crate::state::{
     AccelShareRow, AccelStatsRow, AcceleratorRole, AcceleratorState, AppState, BenchmarkResult,
-    MintedInvite, RemoteAccelState, ReplicaProgress, SourceStats, StatsSnapshot, SwarmStatus,
-    TransferId, TransferKind, TransferRow, TransferStatus,
+    DiscoveredShare, MintedInvite, RemoteAccelState, ReplicaProgress, SourceStats, StatsSnapshot,
+    SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
 };
 use crate::stats::{SpeedHistory, SpeedSample, rate_from_cumulative};
 
@@ -112,6 +112,12 @@ pub enum AcceleratorRequest {
 enum Command {
     AddLocalShare { dir: PathBuf, private: bool },
     Subscribe(SubscribeRequest),
+    /// Fetch the seeder tracker's public-share directory into
+    /// [`AppState::discovered_shares`].
+    RefreshDirectory,
+    /// Join a public share discovered via [`Command::RefreshDirectory`] — its
+    /// sources are resolved from the tracker, no share link needed.
+    SubscribeDiscovered { manifest_id: Hash, name: String },
     Pause(TransferId),
     Resume(TransferId),
     Retry(TransferId),
@@ -188,6 +194,8 @@ enum Command {
     /// Result of a [`Manager::sample_local_stats`] gather: the current sum of
     /// every locally-served node's cumulative served-bytes counter.
     ServedTotalSample(u64),
+    /// Result of a [`Command::RefreshDirectory`] fetch.
+    DirectoryRefreshed(Vec<DiscoveredShare>),
 }
 
 struct ShareInfo {
@@ -278,6 +286,7 @@ impl App {
             minted_invite: None,
             operator_key: operator.public().to_hex(),
             stats: StatsSnapshot::default(),
+            discovered_shares: Vec::new(),
         };
 
         let (commands_tx, commands_rx) = mpsc::channel(128);
@@ -364,6 +373,21 @@ impl App {
     /// Start pulling a remote share.
     pub fn subscribe(&self, request: SubscribeRequest) {
         self.send(Command::Subscribe(request));
+    }
+
+    /// Refresh [`AppState::discovered_shares`] from the seeder tracker at
+    /// [`Settings::rendezvous_url`](crate::Settings::rendezvous_url) — the
+    /// public shares it is currently advertising, joinable with no link. A
+    /// no-op when no `rendezvous_url` is configured.
+    pub fn refresh_directory(&self) {
+        self.send(Command::RefreshDirectory);
+    }
+
+    /// Join a public share from [`AppState::discovered_shares`] by its manifest
+    /// id. Its seeder addresses are resolved from the tracker; behaves like
+    /// [`subscribe`](Self::subscribe) from there on.
+    pub fn subscribe_discovered(&self, manifest_id: Hash, name: impl Into<String>) {
+        self.send(Command::SubscribeDiscovered { manifest_id, name: name.into() });
     }
 
     /// Check a completed subscription for a newer manifest version. A newer
@@ -747,20 +771,53 @@ impl Manager {
         // announce, so a share that appears shortly after startup is
         // published on the next tick rather than waiting out a full interval.
         if let Some(url) = self.state.settings.rendezvous_url.clone() {
-            let mut nodes: Vec<(Hash, Arc<Node>)> = self
+            // Manifest-id hex -> (name, private) for whatever the in-process
+            // accelerator is carrying, so its NAS replicas / relay cache
+            // announce with the same directory metadata an origin seed does.
+            let accel_meta: HashMap<String, (String, bool)> = self
+                .accel
+                .as_ref()
+                .map(|a| {
+                    a.rows
+                        .iter()
+                        .map(|r| (r.manifest_id.clone(), (r.name.clone(), r.private)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut nodes: Vec<(Hash, String, bool, Arc<Node>)> = self
                 .seeds
                 .values()
-                .map(|s| (s.manifest_id, Arc::clone(&s.node)))
+                .map(|s| {
+                    (s.manifest_id, s.name.clone(), s.share_seed.is_some(), Arc::clone(&s.node))
+                })
                 .collect();
             let relay = self.accel.as_ref().and_then(|a| a.relay.clone());
+            let mut relay_meta: Vec<(Hash, String, bool)> = Vec::new();
             if let Some(accel) = &self.accel {
-                nodes.extend(accel.nas_nodes.iter().map(|(id, n)| (*id, Arc::clone(n))));
+                for (id, n) in &accel.nas_nodes {
+                    let (name, private) =
+                        accel_meta.get(&id.to_hex()).cloned().unwrap_or_default();
+                    nodes.push((*id, name, private, Arc::clone(n)));
+                }
+                if relay.is_some() {
+                    relay_meta = accel
+                        .rows
+                        .iter()
+                        .filter_map(|r| {
+                            Hash::from_hex(&r.manifest_id)
+                                .ok()
+                                .map(|h| (h, r.name.clone(), r.private))
+                        })
+                        .collect();
+                }
             }
             if (!nodes.is_empty() || relay.is_some())
                 && self.last_tracker_announce.elapsed() >= TRACKER_ANNOUNCE_INTERVAL
             {
                 self.last_tracker_announce = Instant::now();
-                tokio::spawn(async move { announce_to_tracker(&url, nodes, relay).await });
+                tokio::spawn(async move {
+                    announce_to_tracker(&url, nodes, relay, relay_meta).await
+                });
             }
         }
     }
@@ -904,6 +961,16 @@ impl Manager {
         match command {
             Command::AddLocalShare { dir, private } => self.add_share(dir, private),
             Command::Subscribe(req) => self.subscribe(req),
+            Command::RefreshDirectory => self.refresh_directory(),
+            Command::SubscribeDiscovered { manifest_id, name } => {
+                self.subscribe_discovered(manifest_id, name)
+            }
+            Command::DirectoryRefreshed(shares) => {
+                if self.state.discovered_shares != shares {
+                    self.state.discovered_shares = shares;
+                    self.publish();
+                }
+            }
             Command::Pause(id) => self.pause(id),
             Command::Resume(id) => self.resume(id),
             Command::Retry(id) => self.retry(id),
@@ -1989,6 +2056,59 @@ impl Manager {
         });
     }
 
+    /// Fetch the tracker's public-share directory off-thread and feed it back
+    /// as [`Command::DirectoryRefreshed`].
+    fn refresh_directory(&mut self) {
+        let Some(url) = self.state.settings.rendezvous_url.clone() else {
+            if !self.state.discovered_shares.is_empty() {
+                self.state.discovered_shares.clear();
+                self.publish();
+            }
+            return;
+        };
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let client = TrackerClient::new(&url);
+            let Ok(Ok(list)) =
+                tokio::time::timeout(TRACKER_QUERY_TIMEOUT, client.directory()).await
+            else {
+                return;
+            };
+            let shares: Vec<DiscoveredShare> = list
+                .into_iter()
+                .filter_map(|e| {
+                    Hash::from_hex(&e.manifest_id).ok().map(|manifest_id| DiscoveredShare {
+                        manifest_id,
+                        name: e.name,
+                        seeders: e.seeders,
+                    })
+                })
+                .collect();
+            let _ = tx.send(Command::DirectoryRefreshed(shares)).await;
+        });
+    }
+
+    /// Resolve a discovered share's seeder addresses from the tracker, then
+    /// hand it to the normal [`subscribe`](Self::subscribe) path.
+    fn subscribe_discovered(&mut self, manifest_id: Hash, name: String) {
+        let Some(url) = self.state.settings.rendezvous_url.clone() else {
+            return;
+        };
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let mut sources: Vec<Multiaddr> = Vec::new();
+            merge_tracked_sources(&url, manifest_id, &mut sources).await;
+            let _ = tx
+                .send(Command::Subscribe(SubscribeRequest {
+                    name,
+                    manifest_id,
+                    sources,
+                    credential: None,
+                }))
+                .await;
+        });
+    }
+
     fn subscribe(&mut self, request: SubscribeRequest) {
         let id = self.alloc_id();
         let mut row = new_row(id, request.name.clone(), TransferKind::Downloading);
@@ -2322,15 +2442,19 @@ const TRACKER_QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Publish every locally-served share to the seeder tracker at `url`
 /// (best-effort — a missing or unreachable tracker is a silent no-op).
-/// `nodes` are per-share serving nodes (origin seeds and NAS replicas);
-/// `relay`, if present, is announced for every share it currently caches.
+/// `nodes` are `(manifest id, name, private, serving node)` for origin seeds
+/// and NAS replicas; `relay`, if present, is announced for every share it
+/// currently caches, its name/private looked up in `relay_meta`. The name +
+/// private flag are what put a public share in the tracker's open directory
+/// (and keep a private one out of it).
 async fn announce_to_tracker(
     url: &str,
-    nodes: Vec<(Hash, Arc<Node>)>,
+    nodes: Vec<(Hash, String, bool, Arc<Node>)>,
     relay: Option<Arc<RelayNode>>,
+    relay_meta: Vec<(Hash, String, bool)>,
 ) {
     let client = TrackerClient::new(url);
-    for (id, node) in nodes {
+    for (id, name, private, node) in nodes {
         let Ok(addrs) = node.reachable_addrs().await else { continue };
         if addrs.is_empty() {
             continue;
@@ -2339,7 +2463,7 @@ async fn announce_to_tracker(
             peer_id: node.peer_id().to_string(),
             addrs: addrs.iter().map(Multiaddr::to_string).collect(),
         };
-        let _ = client.announce(&id.to_hex(), &me).await;
+        let _ = client.announce_share(&id.to_hex(), &me, Some(&name), private).await;
     }
     if let Some(relay) = relay {
         let (Ok(addrs), Ok(shares)) = (relay.reachable_addrs().await, relay.shares().await) else {
@@ -2353,7 +2477,12 @@ async fn announce_to_tracker(
             addrs: addrs.iter().map(Multiaddr::to_string).collect(),
         };
         for id in shares {
-            let _ = client.announce(&id.to_hex(), &me).await;
+            let (name, private) = relay_meta
+                .iter()
+                .find(|(h, _, _)| *h == id)
+                .map(|(_, n, p)| (n.clone(), *p))
+                .unwrap_or_default();
+            let _ = client.announce_share(&id.to_hex(), &me, Some(&name), private).await;
         }
     }
 }
@@ -2379,6 +2508,11 @@ async fn merge_tracked_sources(url: &str, manifest_id: Hash, sources: &mut Vec<M
     for info in found {
         for addr in info.addrs {
             if let Ok(addr) = addr.parse::<Multiaddr>()
+                // A wildcard `0.0.0.0`/`::` entry is undialable — libp2p-quic
+                // rejects it with `MultiaddrNotSupported` — and only ever
+                // appears when a seeder failed to enumerate its real
+                // interfaces. Skip it rather than let it look like a source.
+                && !net::addr_is_unspecified(&addr)
                 && !sources.contains(&addr)
             {
                 sources.push(addr);
