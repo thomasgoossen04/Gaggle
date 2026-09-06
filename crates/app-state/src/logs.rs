@@ -163,8 +163,9 @@ static HANDLE: OnceLock<LogHandle> = OnceLock::new();
 
 /// Install a process-global `tracing` subscriber that captures every log line
 /// (from every crate, not just `app-state`) into a bounded in-memory ring
-/// buffer, and returns a handle to read it. Also honours `RUST_LOG` (default
-/// `info`), same as the `accelerator` daemon. Idempotent: call it once at
+/// buffer, and returns a handle to read it. Also honours `RUST_LOG` (falling
+/// back to [`net::DEFAULT_LOG_DIRECTIVES`] when unset), same as the
+/// `accelerator` daemon. Idempotent: call it once at
 /// start-up; later calls (e.g. from tests) just return the same handle
 /// without re-installing anything.
 pub fn init() -> LogHandle {
@@ -173,8 +174,8 @@ pub fn init() -> LogHandle {
             let inner =
                 Arc::new(Inner { lines: Mutex::new(VecDeque::new()), version: AtomicU64::new(0) });
             let handle = LogHandle(inner.clone());
-            let filter =
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            let filter = EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(net::DEFAULT_LOG_DIRECTIVES));
             // `try_init` rather than `init`: a second call (e.g. a test that
             // also wants capture) must not panic the process.
             let _ = tracing_subscriber::registry()

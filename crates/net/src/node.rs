@@ -832,12 +832,18 @@ impl EventLoop {
                 self.grants.remove(&peer_id);
             }
             SwarmEvent::OutgoingConnectionError { peer_id: Some(peer), error, .. } => {
+                // `debug`, not `warn`: a dial that fails against some of a
+                // peer's candidate addresses (a relay circuit with no
+                // reservation, a LAN IP that times out) is routine and usually
+                // harmless — another candidate, or a later attempt, connects.
+                // The caller still gets a hard error through `pending_connect` /
+                // `fail_awaiting` below when the connection genuinely matters.
                 // `%error` alone often collapses to a generic one-liner (e.g.
                 // "failed to negotiate transport protocol(s)"); `?error`'s Debug
                 // usually itemizes every address that was tried and how each
                 // one failed, which is what actually tells a LAN-firewall
                 // failure apart from a dead relay circuit.
-                tracing::warn!(%peer, error = %error, detail = ?error, "outgoing connection failed");
+                tracing::debug!(%peer, error = %error, detail = ?error, "outgoing connection failed");
                 if let Some(reply) = self.pending_connect.remove(&peer) {
                     let _ = reply.send(Err(anyhow::anyhow!("connecting to {peer}: {error}")));
                 }

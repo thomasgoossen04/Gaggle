@@ -191,6 +191,7 @@ dependencies = [
  "gaggle-core",
  "libc",
  "net",
+ "postcard",
  "serde",
  "serde_json",
  "tempfile",

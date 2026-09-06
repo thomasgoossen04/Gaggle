@@ -12,6 +12,7 @@
 mod logs;
 mod manager;
 mod persist;
+mod reach;
 mod settings;
 mod state;
 mod stats;
@@ -21,6 +22,7 @@ pub use logs::{LogHandle, LogLevel, LogLine, init as init_logging};
 pub use manager::{App, AppEvent, AcceleratorRequest, SubscribeRequest};
 pub use net::ShareLink;
 pub use net::{CacheStats, Multiaddr, PeerId, Scope};
+pub use reach::ReachLink;
 pub use settings::{RemoteAccelerator, Settings, Theme};
 pub use state::{
     AccelStatsRow, AcceleratorRole, AcceleratorState, AccelShareRow, AppState, BenchmarkResult,

@@ -90,6 +90,9 @@ can browse.
   at an accelerator (**Settings → Rendezvous URL**) every seed announces itself to that
   accelerator's live *seeder tracker*, so a download also swarms across any NAS replica
   or extra origin the link never mentioned.
+- **Finished downloads seed back.** Once a transfer completes it keeps serving the files
+  to the swarm automatically (per-row pause, or a global off switch), so every downloader
+  becomes a source.
 - **NAT traversal built in, relay-free when possible.** mDNS finds same-LAN peers
   instantly; UPnP asks the router for a public port with no server involved at all; and
   when both peers are behind NAT with no accelerator, an accelerator's control-plane can
@@ -109,6 +112,12 @@ can browse.
 - **Throughput graphs.** The **Stats** tab plots download and upload speed over a
   selectable window (1m / 5m / 15m / 1h) for this machine, or the outbound rate of any
   connected remote accelerator.
+- **Simple by default, deep when you need it.** The GUI opens with just Transfers, Shares,
+  Stats and Settings. Flip **Settings → Advanced mode** on to unlock the Accelerator and
+  Logs tabs and the editable relay / rendezvous fields. With Advanced mode off, network
+  reachability is configured in one step: someone who has it set clicks **Copy as link**
+  to get a short `gagglenet1…` token, and you **Paste reachability link** on the other
+  device.
 - **Cross-platform desktop GUI**, a headless accelerator daemon, and a self-updating
   launcher — see "Getting started" below.
 
@@ -195,6 +204,10 @@ cargo run -p accelerator -- run --role relay   # headless accelerator daemon
    just one address. (Private shares never appear here — they still need their invite.)
 3. Watch progress in the transfer list — pause/resume any time, and expand a row (▸) to
    see the per-source chunk breakdown while it's swarming from multiple peers.
+4. When it finishes it keeps **seeding** the files back to the swarm automatically, so
+   you help everyone else who's downloading. The completed row shows a `seeding` chip and
+   a **Pause seeding** / **Start seeding** button; turn it off for every download under
+   **Settings → Startup → "Keep seeding after a download finishes"**.
 
 ### Keep a synced copy up to date
 
@@ -209,6 +222,9 @@ subscribers see an update is available. A rescanned *private* share needs a fres
 since the invite is pinned to a specific manifest.
 
 ### Run an accelerator
+
+The **Accelerator** and **Logs** tabs are hidden until you turn on **Settings → Advanced
+mode**.
 
 From the GUI's **Accelerator** tab: **Benchmark** measures your disk throughput and free
 space and suggests a role, then **Start relay** (bandwidth-heavy hot-chunk cache) or
@@ -247,7 +263,10 @@ Any running accelerator (relay or NAS) doubles as a lightweight **NAT rendezvous
 put its `http://host:port` (the same `admin_listen` address) into **Settings → Reachability
 → Rendezvous URL** on both ends of a transfer, and two peers that have never talked before
 can swap current addresses and punch straight through each side's NAT, with no chunk data
-ever routed through the accelerator. It's a fallback of last resort's opposite: try this
+ever routed through the accelerator. (That field, and the public-relay one next to it, are
+only shown with **Advanced mode** on; with it off, click **Copy as link** on a device
+that's already configured and **Paste reachability link** on the others to carry both
+values across in one `gagglenet1…` token.) It's a fallback of last resort's opposite: try this
 *before* reserving a full relay circuit above, since it costs the accelerator only a few KB
 of signaling instead of carrying the transfer.
 

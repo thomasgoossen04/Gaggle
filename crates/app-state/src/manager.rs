@@ -7,7 +7,7 @@
 //! [`App::snapshot`], and optionally listens on [`App::events`]. All the async
 //! lives here.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -22,7 +22,8 @@ use gaggle_core::{
 use net::accel::{nas_pull_with_progress, nas_serve, relay_add_share};
 use net::{
     CacheStats, Capability, Catalog, Invite, Keypair, Multiaddr, Node, PeerId, RelayConfig,
-    RelayNode, Scope, ShareKeypair, ShareLink, SwarmConfig, SwarmProgress, peer_id_of,
+    RelayNode, Scope, ShareKeypair, ShareLink, SharePublicKey, SwarmConfig, SwarmProgress,
+    peer_id_of,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -167,6 +168,9 @@ enum Command {
     /// sources, authenticating, fetching metadata) — feeds `TransferRow::detail`.
     DownloadStage { id: TransferId, message: String },
     DownloadDone { id: TransferId, outcome: Box<DownloadOutcome> },
+    /// A completed download's files have been indexed and a serving node is up
+    /// — this peer is now seeding them back to the swarm.
+    CompletedSeedReady { id: TransferId, node: Arc<Node>, addrs: Vec<Multiaddr> },
     UpdateSeen { id: TransferId, version: u64 },
     ResyncProgress { id: TransferId, p: SwarmProgress },
     ResyncDone { id: TransferId, outcome: Box<ResyncOutcome> },
@@ -306,6 +310,7 @@ impl App {
             seeds: HashMap::new(),
             subs: HashMap::new(),
             downloads: HashMap::new(),
+            paused_seeds: HashSet::new(),
             resync_samples: HashMap::new(),
             accel: None,
             remotes,
@@ -549,6 +554,15 @@ struct SubEntry {
     manifest: Manifest,
     chunk_lists: BTreeMap<String, ChunkList>,
     version: u64,
+    /// Set once this peer is seeding the downloaded files back to the swarm —
+    /// the serving node. `None` when seeding is off (globally or paused for
+    /// this transfer).
+    seed: Option<CompletedSeed>,
+}
+
+/// The serving side of a finished download that is now also a seed.
+struct CompletedSeed {
+    node: Arc<Node>,
 }
 
 struct DownloadJob {
@@ -590,6 +604,10 @@ struct Manager {
     seeds: HashMap<TransferId, SeedEntry>,
     subs: HashMap<TransferId, SubEntry>,
     downloads: HashMap<TransferId, DownloadJob>,
+    /// Manifest ids of completed downloads the user has paused seeding for, so
+    /// the auto-seed on [`Command::DownloadDone`] (and on a restart's
+    /// re-completion) skips them. Persisted in `shares.json`.
+    paused_seeds: HashSet<Hash>,
     resync_samples: HashMap<TransferId, Option<(Instant, u64)>>,
     accel: Option<AccelHandle>,
     /// Registered remote accelerators: label → pinned daemon identity (if known).
@@ -757,8 +775,10 @@ impl Manager {
         // NAT rendezvous: check whether some subscriber is waiting to punch
         // through to one of our served shares, and answer if so.
         if let Some(url) = self.state.settings.rendezvous_url.clone() {
-            for seed in self.seeds.values() {
-                let node = Arc::clone(&seed.node);
+            let seed_nodes = self.seeds.values().map(|s| Arc::clone(&s.node)).chain(
+                self.subs.values().filter_map(|s| s.seed.as_ref().map(|c| Arc::clone(&c.node))),
+            );
+            for node in seed_nodes {
                 let url = url.clone();
                 tokio::spawn(async move { answer_rendezvous_requests(&node, &url).await });
             }
@@ -791,6 +811,17 @@ impl Manager {
                     (s.manifest_id, s.name.clone(), s.share_seed.is_some(), Arc::clone(&s.node))
                 })
                 .collect();
+            // Completed downloads this node is now also seeding.
+            for sub in self.subs.values() {
+                if let Some(seed) = &sub.seed {
+                    nodes.push((
+                        sub.manifest.id(),
+                        sub.manifest.name.clone(),
+                        sub.request.credential.is_some(),
+                        Arc::clone(&seed.node),
+                    ));
+                }
+            }
             let relay = self.accel.as_ref().and_then(|a| a.relay.clone());
             let mut relay_meta: Vec<(Hash, String, bool)> = Vec::new();
             if let Some(accel) = &self.accel {
@@ -843,6 +874,11 @@ impl Manager {
     fn sample_local_stats(&mut self) {
         let mut nodes: Vec<Arc<Node>> =
             self.seeds.values().map(|s| Arc::clone(&s.node)).collect();
+        // Completed downloads this node is now also seeding count toward its
+        // upload throughput just like an origin seed.
+        nodes.extend(
+            self.subs.values().filter_map(|s| s.seed.as_ref().map(|c| Arc::clone(&c.node))),
+        );
         let relay = self.accel.as_ref().and_then(|a| a.relay.clone());
         if let Some(accel) = &self.accel {
             nodes.extend(accel.nas_nodes.iter().map(|(_, n)| Arc::clone(n)));
@@ -1049,11 +1085,46 @@ impl Manager {
                 self.publish();
             }
             Command::UpdateSettings(s) => {
+                let was_seed_after = self.state.settings.seed_after_download;
                 self.state.settings = *s;
                 if let Some(path) = &self.config_path
                     && let Err(e) = self.state.settings.save(path)
                 {
                     tracing::warn!(error = %e, "could not save settings");
+                }
+                // React to the seed-after-download switch flipping: start
+                // seeding every completed download that isn't individually
+                // paused, or stop them all.
+                match (was_seed_after, self.state.settings.seed_after_download) {
+                    (false, true) => {
+                        let start: Vec<TransferId> = self
+                            .subs
+                            .iter()
+                            .filter(|(_, sub)| {
+                                sub.seed.is_none()
+                                    && !self.paused_seeds.contains(&sub.manifest.id())
+                            })
+                            .map(|(id, _)| *id)
+                            .collect();
+                        for id in start {
+                            self.start_completed_seed(id);
+                        }
+                    }
+                    (true, false) => {
+                        let ids: Vec<TransferId> = self.subs.keys().copied().collect();
+                        for id in ids {
+                            if let Some(sub) = self.subs.get_mut(&id)
+                                && let Some(seed) = sub.seed.take()
+                            {
+                                let mid = sub.manifest.id();
+                                self.withdraw_from_tracker(mid, seed.node.peer_id());
+                                if let Some(row) = self.state.transfers.get_mut(&id) {
+                                    row.seeding = false;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 // Persistence may have just been turned on (or off) — either
                 // way, make sure the file matches reality going forward.
@@ -1183,6 +1254,7 @@ impl Manager {
                             manifest: outcome.manifest.clone(),
                             chunk_lists: outcome.chunk_lists.clone(),
                             version: outcome.version,
+                            seed: None,
                         },
                     );
                 }
@@ -1209,6 +1281,36 @@ impl Manager {
                 self.recount();
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
+                // Contribute upload back to the swarm: index the files just
+                // written and start serving them, unless the user turned that
+                // off globally or paused it for this transfer.
+                if self.state.settings.seed_after_download
+                    && !self.paused_seeds.contains(&outcome.manifest.id())
+                {
+                    self.start_completed_seed(id);
+                }
+                self.persist_shares();
+            }
+            Command::CompletedSeedReady { id, node, addrs } => {
+                // If the transfer is gone (removed while the index ran) or was
+                // paused in the meantime, just drop `node` — dropping the last
+                // `Arc<Node>` aborts its swarm task.
+                if let Some(sub) = self.subs.get_mut(&id)
+                    && !self.paused_seeds.contains(&sub.manifest.id())
+                {
+                    sub.seed = Some(CompletedSeed { node });
+                    if let Some(row) = self.state.transfers.get_mut(&id) {
+                        row.seeding = true;
+                        row.share_addrs = addrs.clone();
+                        row.share_addr = addrs.into_iter().next();
+                    }
+                    // Announce to the seeder tracker promptly rather than
+                    // waiting out the next full interval.
+                    self.last_tracker_announce = Instant::now()
+                        .checked_sub(TRACKER_ANNOUNCE_INTERVAL)
+                        .unwrap_or_else(Instant::now);
+                    self.publish();
+                }
             }
             Command::UpdateSeen { id, version } => {
                 if let Some(row) = self.state.transfers.get_mut(&id) {
@@ -1509,8 +1611,10 @@ impl Manager {
         h.tokens.retain(|t| {
             ShareLink::parse(t).map(|l| l.manifest_id.to_hex() != id).unwrap_or(true)
         });
+        let mut withdraw: Option<(Hash, PeerId)> = None;
         if let Some(pos) = h.nas_nodes.iter().position(|(mid, _)| mid.to_hex() == id) {
-            let (_, node) = h.nas_nodes.remove(pos);
+            let (mid, node) = h.nas_nodes.remove(pos);
+            withdraw = Some((mid, node.peer_id()));
             // Gracefully shut down if this was the last reference; a brief
             // overlapping tracker-announce task just drops its clone and the
             // node's own `Drop` aborts the swarm task.
@@ -1540,6 +1644,9 @@ impl Manager {
             tokio::spawn(async move { let _ = relay.remove_share(mid).await; });
         }
         let rows = h.rows.clone();
+        if let Some((mid, peer)) = withdraw {
+            self.withdraw_from_tracker(mid, peer);
+        }
         if let Some(a) = &mut self.state.accelerator {
             a.shares = rows.clone();
             a.detail = accel_detail(a.role, &rows);
@@ -1768,6 +1875,89 @@ impl Manager {
     fn add_share(&mut self, dir: PathBuf, private: bool) {
         let share_seed = private.then(|| ShareKeypair::generate().to_seed());
         self.start_seed(dir, share_seed, 1);
+    }
+
+    /// Start seeding a completed download: index the materialized output tree
+    /// (streaming chunks from it on demand through a [`SourceChunkStore`], same
+    /// as a local seed) and stand up a serving node for it. For a private
+    /// share the node is restricted to invite holders using the public key
+    /// from the subscription's own credential. A failure is logged, not
+    /// surfaced as a transfer error — the download itself already succeeded.
+    fn start_completed_seed(&mut self, id: TransferId) {
+        let Some(sub) = self.subs.get(&id) else { return };
+        if sub.seed.is_some() {
+            return;
+        }
+        let output_dir = sub.output_dir.clone();
+        let name = sub.manifest.name.clone();
+        let version = sub.version;
+        let share_pubkey: Option<SharePublicKey> =
+            sub.request.credential.as_ref().map(|c| c.capability.share);
+        let cache_bytes = self.state.settings.seed_cache_bytes;
+        let public_relay = self.state.settings.public_relay.clone();
+        let tx = self.self_tx.clone();
+
+        if let Some(row) = self.state.transfers.get_mut(&id) {
+            row.seeding = false;
+        }
+
+        tokio::spawn(async move {
+            let scan_dir = output_dir.clone();
+            let scan_name = name.clone();
+            let built = tokio::task::spawn_blocking(move || {
+                let idx =
+                    index_dir_with_progress(&scan_dir, scan_name, version, |_: ScanProgress| {})?;
+                let store =
+                    SourceChunkStore::new(&scan_dir, idx.locations.clone(), cache_bytes);
+                anyhow::Ok((idx, store))
+            })
+            .await;
+            let (snap, store) = match built {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    tracing::warn!(id, error = %format!("{e:#}"), "seed-after-download: index failed");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(id, error = %e, "seed-after-download: index task panicked");
+                    return;
+                }
+            };
+            let catalog = Catalog::new(snap.manifest, snap.chunk_lists, store);
+            let node = match Node::spawn_serving(catalog).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(id, error = %format!("{e:#}"), "seed-after-download: could not start serving");
+                    return;
+                }
+            };
+            if let Some(pubkey) = share_pubkey
+                && let Err(e) = node.restrict_to_invite_holders(pubkey).await
+            {
+                tracing::warn!(id, error = %format!("{e:#}"), "seed-after-download: could not restrict private share");
+                return;
+            }
+            let mut addrs = match node.reachable_addrs().await {
+                Ok(a) if !a.is_empty() => a,
+                _ => {
+                    tracing::warn!(id, "seed-after-download: no listen address");
+                    return;
+                }
+            };
+            if let Some(relay_addr) = &public_relay {
+                match reserve_relay(&node, relay_addr).await {
+                    Ok(circuit) => addrs.push(circuit),
+                    Err(e) => tracing::warn!(
+                        id,
+                        error = %format!("{e:#}"),
+                        "seed-after-download: relay reservation failed — LAN/VPN addresses only"
+                    ),
+                }
+            }
+            let _ = tx
+                .send(Command::CompletedSeedReady { id, node: Arc::new(node), addrs })
+                .await;
+        });
     }
 
     /// Re-scan `dir` and start serving it again exactly as it was before a
@@ -2143,7 +2333,38 @@ impl Manager {
             .insert(id, DownloadJob { task, request, chunk_dir, last_sample: None });
     }
 
+    /// Best-effort `DELETE /tracker/{manifest_id}/{peer_id}` so a share this
+    /// node has stopped serving drops out of the seeder directory / seeder
+    /// list right away instead of lingering until its entry TTL expires. A
+    /// no-op without a configured `rendezvous_url`.
+    fn withdraw_from_tracker(&self, manifest_id: Hash, peer_id: PeerId) {
+        let Some(url) = self.state.settings.rendezvous_url.clone() else { return };
+        tokio::spawn(async move {
+            let client = TrackerClient::new(&url);
+            let _ = client.withdraw(&manifest_id.to_hex(), &peer_id.to_string()).await;
+        });
+    }
+
     fn pause(&mut self, id: TransferId) {
+        // A completed download that is currently seeding: stop serving it,
+        // withdraw from the tracker, and remember the pause so it does not
+        // auto-restart on the next launch. The files stay on disk.
+        if !self.downloads.contains_key(&id)
+            && let Some(sub) = self.subs.get_mut(&id)
+        {
+            let mid = sub.manifest.id();
+            let gone = sub.seed.take();
+            self.paused_seeds.insert(mid);
+            if let Some(seed) = gone {
+                self.withdraw_from_tracker(mid, seed.node.peer_id());
+            }
+            if let Some(row) = self.state.transfers.get_mut(&id) {
+                row.seeding = false;
+            }
+            self.persist_shares();
+            self.publish();
+            return;
+        }
         let Some(job) = self.downloads.get_mut(&id) else { return };
         job.task.abort();
         job.last_sample = None;
@@ -2157,6 +2378,18 @@ impl Manager {
     }
 
     fn resume(&mut self, id: TransferId) {
+        // Resume seeding a completed download the user had paused.
+        if !self.downloads.contains_key(&id)
+            && let Some(sub) = self.subs.get(&id)
+        {
+            let mid = sub.manifest.id();
+            if self.paused_seeds.remove(&mid) {
+                self.start_completed_seed(id);
+                self.persist_shares();
+                self.publish();
+            }
+            return;
+        }
         let Some(job) = self.downloads.remove(&id) else { return };
         let is_paused = self
             .state
@@ -2197,8 +2430,18 @@ impl Manager {
     }
 
     fn remove(&mut self, id: TransferId, delete_files: bool) {
-        self.seeds.remove(&id);
-        self.subs.remove(&id);
+        // Drop out of the seeder tracker immediately for anything this node
+        // was serving under `id` — a local seed, or a completed download that
+        // was seeding — rather than lingering until the entry TTL expires.
+        if let Some(seed) = self.seeds.remove(&id) {
+            self.withdraw_from_tracker(seed.manifest_id, seed.node.peer_id());
+        }
+        if let Some(sub) = self.subs.remove(&id) {
+            self.paused_seeds.remove(&sub.manifest.id());
+            if let Some(seed) = sub.seed {
+                self.withdraw_from_tracker(sub.manifest.id(), seed.node.peer_id());
+            }
+        }
         self.resync_samples.remove(&id);
         if let Some(job) = self.downloads.remove(&id) {
             job.task.abort();
@@ -2302,6 +2545,14 @@ impl Manager {
                 return;
             }
         };
+        // Load paused-seed state *before* re-issuing subscriptions, so a
+        // download that re-completes on this launch and was paused before the
+        // restart does not auto-start seeding again.
+        self.paused_seeds = persisted
+            .paused_seeds
+            .iter()
+            .filter_map(|h| Hash::from_hex(h).ok())
+            .collect();
         for seed in persisted.seeds {
             self.start_seed(seed.dir, seed.share_seed, seed.version.max(1));
         }
@@ -2359,6 +2610,7 @@ impl Manager {
                 .map(|j| j.request.clone())
                 .chain(self.subs.values().map(|s| s.request.clone()))
                 .collect(),
+            paused_seeds: self.paused_seeds.iter().map(|h| h.to_hex()).collect(),
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2395,6 +2647,7 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
         source_dir: None,
         file_paths: Arc::new(Vec::new()),
         update_available: None,
+        seeding: false,
         detail: None,
     }
 }
@@ -2455,7 +2708,12 @@ async fn announce_to_tracker(
 ) {
     let client = TrackerClient::new(url);
     for (id, name, private, node) in nodes {
-        let Ok(addrs) = node.reachable_addrs().await else { continue };
+        let Ok(mut addrs) = node.reachable_addrs().await else { continue };
+        // The tracker is the *cross-machine* discovery path — a loopback
+        // address it hands another peer is a dead dial there, and on the very
+        // machine that announced it points at whatever now holds that port.
+        // Strip it, matching the standalone daemon's own tracker announce.
+        addrs.retain(|a| !net::addr_is_loopback(a));
         if addrs.is_empty() {
             continue;
         }
@@ -2466,9 +2724,11 @@ async fn announce_to_tracker(
         let _ = client.announce_share(&id.to_hex(), &me, Some(&name), private).await;
     }
     if let Some(relay) = relay {
-        let (Ok(addrs), Ok(shares)) = (relay.reachable_addrs().await, relay.shares().await) else {
+        let (Ok(mut addrs), Ok(shares)) = (relay.reachable_addrs().await, relay.shares().await)
+        else {
             return;
         };
+        addrs.retain(|a| !net::addr_is_loopback(a));
         if addrs.is_empty() {
             return;
         }

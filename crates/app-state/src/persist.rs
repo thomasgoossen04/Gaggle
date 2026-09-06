@@ -22,6 +22,10 @@ use crate::manager::SubscribeRequest;
 pub(crate) struct PersistedState {
     pub seeds: Vec<PersistedSeed>,
     pub subscriptions: Vec<SubscribeRequest>,
+    /// Manifest-id hexes of completed downloads the user paused seeding for.
+    /// A re-completed subscription checks this before auto-seeding again, so a
+    /// pause survives a restart. Old files without the key load as empty.
+    pub paused_seeds: Vec<String>,
 }
 
 /// One local folder this node was seeding.

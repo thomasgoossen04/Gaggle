@@ -235,6 +235,28 @@ pub fn describe() -> &'static str {
     "net: libp2p QUIC + Kademlia DHT + relay/dcutr + rarest-first swarm + hot-cache + invite ACLs"
 }
 
+/// Default `RUST_LOG`-style filter used when the environment sets nothing.
+///
+/// Starts at `info`, then silences the sources that log routine churn and
+/// dead-end retries the operator can do nothing about:
+/// - `libp2p_mdns` / `libp2p_swarm` — per-interface and per-peer discovery
+///   noise on every start;
+/// - `libp2p_kad` — a `warn` ("Failed to trigger bootstrap: No known peers")
+///   fired on every start before the DHT has learned a peer;
+/// - `log` — the `log`-crate bridge, which in the GUI is almost entirely the
+///   graphics stack (blade / naga / gpui / wgpu) narrating buffer and pipeline
+///   creation at `info`.
+///
+/// A node dialling stale candidate addresses (relay circuits with no
+/// reservation, LAN IPs that time out) is expected while another candidate
+/// succeeds; `net::node` logs those at `debug`, so they stay off at this level.
+/// Everything here is overridable — set `RUST_LOG` and this string is ignored.
+pub const DEFAULT_LOG_DIRECTIVES: &str = "info,\
+libp2p_swarm=warn,\
+libp2p_mdns=warn,\
+libp2p_kad=error,\
+log=warn";
+
 #[cfg(test)]
 mod tests {
     use super::*;

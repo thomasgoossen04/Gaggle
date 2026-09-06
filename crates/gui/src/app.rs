@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_state::{
-    AcceleratorRequest, App, AppState, Hash, LogHandle, LogLevel, LogLine, Scope, Settings,
-    ShareLink, Theme, TransferId, TransferKind, TransferRow,
+    AcceleratorRequest, App, AppState, Hash, LogHandle, LogLevel, LogLine, ReachLink, Scope,
+    Settings, ShareLink, Theme, TransferId, TransferKind, TransferRow,
 };
 use gpui::prelude::*;
 use gpui::{ClipboardItem, Entity, FocusHandle, PathPromptOptions, SharedString, Timer, Window, div};
@@ -703,6 +703,63 @@ impl Gaggle {
         self.set_notice("Settings saved", cx);
     }
 
+    /// Flip the advanced UI surface (Accelerator + Logs tabs, editable
+    /// Reachability fields). Turning it off while on one of the now-hidden tabs
+    /// bounces back to Transfers.
+    pub(crate) fn toggle_advanced_ui(&mut self, cx: &mut Context<Self>) {
+        let next = !self.state.settings.advanced_ui;
+        self.state.settings.advanced_ui = next;
+        self.app.update_settings(Settings { advanced_ui: next, ..self.state.settings.clone() });
+        if !next && matches!(self.tab, Tab::Accelerator | Tab::Logs) {
+            self.tab = Tab::Transfers;
+        }
+        self.set_notice(
+            if next {
+                "Advanced mode on — Accelerator & Logs tabs shown"
+            } else {
+                "Advanced mode off"
+            },
+            cx,
+        );
+    }
+
+    /// Normal-mode Reachability: apply a `gagglenet1…` link from the clipboard
+    /// to the relay + rendezvous settings (and the still-hidden edit fields, so
+    /// they're correct if Advanced mode is turned on later).
+    pub(crate) fn paste_reachability(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = cx.read_from_clipboard().and_then(|c| c.text());
+        match text.as_deref().map(str::trim).map(ReachLink::parse) {
+            Some(Ok(link)) => {
+                let mut next = self.state.settings.clone();
+                next.public_relay = link.public_relay.clone();
+                next.rendezvous_url = link.rendezvous_url.clone();
+                self.state.settings = next.clone();
+                self.app.update_settings(next);
+
+                let relay = link.public_relay.unwrap_or_default();
+                let rendezvous = link.rendezvous_url.unwrap_or_default();
+                self.set_relay.update(cx, |st, cx| st.set_value(relay, window, cx));
+                self.set_rendezvous.update(cx, |st, cx| st.set_value(rendezvous, window, cx));
+                self.set_notice("Reachability settings applied from clipboard", cx);
+            }
+            Some(Err(e)) => self.set_notice(format!("Clipboard is not a reachability link: {e}"), cx),
+            None => self.set_notice("Clipboard is empty — copy a reachability link first", cx),
+        }
+    }
+
+    /// Advanced-mode Reachability: bundle the two edit fields into a short
+    /// `gagglenet1…` link on the clipboard, to paste on another device.
+    pub(crate) fn copy_reachability(&mut self, cx: &mut Context<Self>) {
+        let relay = self.set_relay.read(cx).value().to_string();
+        let rendezvous = self.set_rendezvous.read(cx).value().to_string();
+        let link = ReachLink::from_fields(&relay, &rendezvous);
+        if link.is_empty() {
+            self.set_notice("Set a relay address or rendezvous URL first", cx);
+            return;
+        }
+        self.copy_text(link.encode(), "Reachability link copied to clipboard", cx);
+    }
+
     pub(crate) fn toggle_persist_shares(&mut self, cx: &mut Context<Self>) {
         let next = !self.state.settings.persist_shares;
         // Reflect it locally right away, same as `set_theme` — the manager's
@@ -714,6 +771,23 @@ impl Gaggle {
                 "Shares & transfers will be remembered across restarts"
             } else {
                 "Shares & transfers will no longer be remembered"
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn toggle_seed_after_download(&mut self, cx: &mut Context<Self>) {
+        let next = !self.state.settings.seed_after_download;
+        self.state.settings.seed_after_download = next;
+        self.app.update_settings(Settings {
+            seed_after_download: next,
+            ..self.state.settings.clone()
+        });
+        self.set_notice(
+            if next {
+                "Finished downloads will keep seeding"
+            } else {
+                "Finished downloads will stop after downloading"
             },
             cx,
         );

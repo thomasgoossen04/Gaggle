@@ -143,6 +143,71 @@ async fn share_a_folder_then_subscribe_and_complete() {
     dir_matches(folder.path(), &output);
 }
 
+/// A finished download keeps seeding by default: once complete it stands up
+/// its own serving node, a third peer downloads the whole share from *only*
+/// that node (the origin's address is never handed over), and the per-row
+/// pause / resume control stops and restarts it.
+#[tokio::test]
+async fn a_finished_download_seeds_and_can_be_paused() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let (origin_addr, manifest_id, seed_bytes) =
+        (seed.share_addr.clone().unwrap(), seed.manifest_id, seed.total_bytes);
+
+    // First leech completes, then keeps seeding (default `seed_after_download`).
+    let out1 = TempDir::new().unwrap();
+    let leech = app_downloading_into(out1.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![origin_addr],
+        credential: None,
+    });
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete && r.seeding)
+    })
+    .await;
+    let leech_row = done.downloads().next().unwrap();
+    let leech_seed_addr = leech_row.share_addr.clone().expect("a completed seed has an address");
+    let leech_id = leech_row.id;
+
+    // Second leech pulls the whole share from ONLY the first leech's node.
+    let out2 = TempDir::new().unwrap();
+    let leech2 = app_downloading_into(out2.path()).await;
+    leech2.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![leech_seed_addr],
+        credential: None,
+    });
+    let done2 = wait_for(&leech2, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row2 = done2.downloads().next().unwrap();
+    assert_eq!(row2.total_bytes, seed_bytes);
+    assert_eq!(row2.done_bytes, row2.total_bytes);
+    dir_matches(folder.path(), &row2.output_dir.clone().unwrap());
+
+    // Pause seeding on the first leech: the flag clears and stays cleared.
+    leech.pause(leech_id);
+    let paused = wait_for(&leech, 10, |s| {
+        s.get(leech_id).is_some_and(|r| r.status == TransferStatus::Complete && !r.seeding)
+    })
+    .await;
+    assert!(!paused.get(leech_id).unwrap().seeding);
+
+    // Resume it: seeding comes back.
+    leech.resume(leech_id);
+    wait_for(&leech, 20, |s| s.get(leech_id).is_some_and(|r| r.seeding)).await;
+}
+
 #[tokio::test]
 async fn adding_a_share_passes_through_a_scanning_phase() {
     let folder = sample_folder();

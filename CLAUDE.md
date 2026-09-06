@@ -160,6 +160,26 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   pulls a remote share into a `DiskChunkStore` under the download dir (so pause = abort,
   resume = top up), then `write_share`s the tree out. Progress rides
   `Node::download_share_multi_with_progress` (`SwarmProgress` per chunk).
+- **Seed-after-download** — when `Settings::seed_after_download` is set (default true),
+  a finished download does not go idle: `Command::DownloadDone` indexes the just-written
+  output tree (`index_dir` + a streaming `SourceChunkStore`, same as a local seed) and
+  stands up its own serving `Node`, so the peer contributes upload back to the swarm and
+  shows up in the seeder tracker. State lives on `SubEntry::seed` (`Option<CompletedSeed>`)
+  and `TransferRow::seeding`; `Manager::tick`'s tracker-announce / rendezvous-answer loops
+  and `sample_local_stats` all fold these nodes in alongside origin seeds. `App::pause(id)`
+  on a completed download stops its serving node, best-effort withdraws it from the tracker
+  (`DELETE /tracker/{id}/{peer}` — otherwise it lingers a full entry TTL), and records the
+  manifest id in `Manager::paused_seeds` (persisted in `shares.json` as `paused_seeds`);
+  `App::resume(id)` re-serves. Flipping `seed_after_download` off stops every completed
+  seed; flipping it on starts every one not individually paused. The GUI Transfers tab
+  gets a per-row Start/Pause-seeding button and a `seeding` chip; Settings → Startup gets
+  the global toggle. A restart re-runs the subscription, which re-completes and re-seeds
+  (unless paused) — no separate persisted seed record needed.
+- `Manager::remove` / a stopped local NAS / `accel_remove_share` now also best-effort
+  withdraw from the seeder tracker (`Manager::withdraw_from_tracker`), and
+  `announce_to_tracker` strips loopback from what it publishes (matching the standalone
+  daemon) — the tracker is the cross-machine discovery path, so a `127.0.0.1` entry there
+  is a dead dial for other peers and points at the wrong process on the announcing machine.
 - **Delta sync (milestone 10)** — `App::rescan_share(id)` re-indexes a seeded folder
   (`index_dir`, same streaming `SourceChunkStore`), bumps `Manifest::version`, and re-serves. `App::check_updates(id)` fetches just the
   remote manifest (`Node::fetch_manifest`) and flags `TransferRow::update_available` when
@@ -332,11 +352,18 @@ share, and can be driven remotely:
   and every discovered chunk is still verified against the manifest root.
   `app-state` reuses `Settings.rendezvous_url` as the tracker URL too:
   `Manager::tick` re-announces every locally-served share (origin seeds +
-  in-process NAS replicas + relay-cached shares), now tagged with its name +
+  in-process NAS replicas + relay-cached shares + **completed downloads that
+  are still seeding**), now tagged with its name +
   private flag, every `TRACKER_ANNOUNCE_INTERVAL`
   (30s), and `run_download` / `run_resync` / `check_remote_version` merge the
   tracker's seeder list into their sources up front (`merge_tracked_sources`,
-  bounded by `TRACKER_QUERY_TIMEOUT`, 4s). The standalone `accelerator` daemon's
+  bounded by `TRACKER_QUERY_TIMEOUT`, 4s). `announce_to_tracker` strips loopback
+  addresses (`net::addr_is_loopback`) — the tracker is the cross-machine path, so
+  a `127.0.0.1` entry is a dead dial for other peers and resolves to the wrong
+  process on the announcing box. When a share stops being served — `Manager::remove`,
+  a paused completed-download seed, `accel_remove_share` — `withdraw_from_tracker`
+  fires a best-effort `DELETE /tracker/{id}/{peer}` so it drops out immediately
+  instead of lingering a full entry TTL (150s). The standalone `accelerator` daemon's
   `Supervisor` shares one `TrackerRegistry` with its HTTP router and announces
   every ready share into it directly (in-process, no round trip — name/private
   from `link_meta(token)`), so a
@@ -368,6 +395,16 @@ share, and can be driven remotely:
   `App::snapshot()` on a 200 ms `Timer` and re-renders; it never touches `net`. Raw gpui
   for layout/interaction, plus `gpui_component::{init, v_flex, window_border}` and
   `gpui_component::input::{Input, InputState}` for the form fields.
+  **Advanced mode** (`Settings::advanced_ui`, `#[serde(default)]` false, toggled from the
+  Settings → Interface card): off = only the Transfers / Shares / Stats / Settings tabs,
+  and the Reachability card is a single "Paste reachability link" button
+  (`Gaggle::paste_reachability`); on = also the Accelerator + Logs tabs
+  (`chrome::header` + `views::body` both gate on the flag), and the Reachability card
+  shows the editable `public_relay` / `rendezvous_url` fields plus a "Copy as link"
+  button (`Gaggle::copy_reachability`). The link is `app_state::ReachLink` (`reach.rs`):
+  `{public_relay, rendezvous_url}` postcard-encoded behind a `gagglenet1` prefix, same
+  shape as `net::ShareLink` — the short, copy-pasteable way to move reachability config
+  between devices.
 
 Tests: `app-state/tests/transfer_manager.rs` runs real loopback transfers through two
 `App`s — share→subscribe→complete with byte-exact output, incremental progress events,
@@ -378,9 +415,11 @@ strangers then admits a minted invite**, **benchmark reports throughput + free s
 **a NAS accelerator replicates a share**, **a NAS share pauses (replica kept on
 disk) / resumes / and Remove deletes the replica dir**, **a seed streams a folder
 several times its
-`seed_cache_bytes` budget from disk and still serves every chunk**, **a real loopback
-transfer leaves the seeder with a non-zero-`up_bps` `stats.local` history and both ends
-with a growing sample count**. `app-state` unit
+`seed_cache_bytes` budget from disk and still serves every chunk**, **a finished
+download keeps seeding — a third peer pulls the whole share from only the first
+leech's node, and the per-row pause/resume control stops and restarts it**, **a real
+loopback transfer leaves the seeder with a non-zero-`up_bps` `stats.local` history and
+both ends with a growing sample count**. `app-state` unit
 tests cover `Settings`
 persistence, `ShareLink` round trips, name sanitizing, and `stats::{SpeedHistory,
 rate_from_cumulative, resample}` (capping, windowing, counter/clock resets; and that
@@ -440,9 +479,9 @@ old chunks while writing new ones compressed.
 ```bash
 cargo build --workspace                     # build everything
 cargo build -p <crate>                      # build one crate
-cargo test --workspace                      # run all tests
 cargo test -p gaggle-core                   # test one crate (unit + tests/snapshot.rs)
 cargo test -p gaggle-core merkle::tests::every_proof_verifies   # single test
+cargo test -p app-state --test transfer_manager -- <names> --test-threads=2   # targeted
 cargo clippy --workspace --all-targets      # lint (CI-level check)
 
 cargo run -p accelerator -- run --role relay   # run the daemon (relay role)
@@ -461,6 +500,12 @@ cargo run -p accelerator-launcher -- service --role nas        # print a systemd
 
 `RUST_LOG=info` (or `debug`, `trace`) controls the `accelerator` daemon's logging via
 `tracing-subscriber`'s `EnvFilter`; it defaults to `info` when unset.
+
+**Run only the tests your change touches — never `cargo test --workspace` or the whole
+`app-state` suite.** `app-state/tests/transfer_manager.rs` spins up many real libp2p/QUIC
+nodes per test; run in parallel the whole file trips its own `wait_for` timeouts on a
+busy machine (several "failures" that pass fine in isolation). Pick the handful of tests
+that exercise your change and pass their names plus `--test-threads=2`.
 
 First build of `-p gui` / `-p launcher` is slow: they pull the full `gpui` graphics
 stack, and on Linux need the usual system libs for a windowed GPU app

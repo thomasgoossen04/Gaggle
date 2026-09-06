@@ -47,6 +47,13 @@ pub struct Settings {
     #[serde(default = "default_seed_cache_bytes")]
     pub seed_cache_bytes: u64,
     pub theme: Theme,
+    /// Show the "advanced" surface: the Accelerator and Logs tabs, and the
+    /// Reachability section's editable relay / rendezvous fields plus a "copy
+    /// as link" button. Off by default — a normal user only sees Transfers,
+    /// Shares, Stats and Settings, and moves reachability config between
+    /// devices with a single [`ReachLink`](crate::ReachLink) paste.
+    #[serde(default)]
+    pub advanced_ui: bool,
     /// If set, subscribed shares are polled this often (seconds) for a newer
     /// manifest version. A newer version is only *flagged* — never applied
     /// without an explicit resync. `None` disables the background poll.
@@ -55,6 +62,13 @@ pub struct Settings {
     /// Remote accelerator daemons this node manages over their admin API.
     #[serde(default)]
     pub remote_accelerators: Vec<RemoteAccelerator>,
+    /// Keep seeding a share after its download finishes: once the files are
+    /// on disk, spin up a serving node for them so this peer contributes
+    /// upload back to the swarm (and shows up in the seeder tracker). Each
+    /// completed transfer can still be paused individually. On by default;
+    /// turn off to only ever download.
+    #[serde(default = "default_seed_after_download")]
+    pub seed_after_download: bool,
     /// Remember the share/transfer list across restarts: on the next launch,
     /// every seeded folder is re-indexed and re-served, and every
     /// subscription is re-issued (resuming from whatever partial chunks
@@ -152,8 +166,10 @@ impl Default for Settings {
             storage_cap_bytes: None,
             seed_cache_bytes: default_seed_cache_bytes(),
             theme: Theme::System,
+            advanced_ui: false,
             auto_resync_secs: None,
             remote_accelerators: Vec::new(),
+            seed_after_download: default_seed_after_download(),
             persist_shares: default_persist_shares(),
             public_relay: None,
             rendezvous_url: None,
@@ -169,6 +185,11 @@ fn default_seed_cache_bytes() -> u64 {
 
 /// Shares/transfers are remembered across restarts by default.
 fn default_persist_shares() -> bool {
+    true
+}
+
+/// A finished download keeps seeding by default.
+fn default_seed_after_download() -> bool {
     true
 }
 
@@ -222,6 +243,10 @@ mod tests {
         let loaded = serde_json::from_str::<Settings>(legacy).unwrap();
         assert_eq!(loaded.seed_cache_bytes, 256 << 20);
         assert!(loaded.persist_shares, "persistence defaults on for a pre-existing config");
+        assert!(
+            loaded.seed_after_download,
+            "seed-after-download defaults on for a pre-existing config"
+        );
     }
 
     #[test]

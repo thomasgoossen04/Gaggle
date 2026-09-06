@@ -109,6 +109,12 @@ pub struct TransferRow {
     /// Download only: a newer manifest version seen by the last update check.
     /// Cleared by a successful resync.
     pub update_available: Option<u64>,
+    /// Completed download only: `true` while this peer is serving the
+    /// downloaded files back to the swarm. Toggled by the per-row
+    /// seed/pause control; starts on when
+    /// [`Settings::seed_after_download`](crate::Settings::seed_after_download)
+    /// is set.
+    pub seeding: bool,
     /// Human-readable phase text while `status` is `Connecting` — e.g.
     /// "resolving 2 source(s)…", "authenticating…", "fetching share
     /// metadata…" — so the UI can show *what* it's waiting on instead of a

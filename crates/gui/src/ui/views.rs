@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use app_state::{
     AccelShareRow, AcceleratorRole, AcceleratorState, DiscoveredShare, LogLevel, RemoteAccelState,
-    SourceStats, SpeedSample, Theme, TransferRow, TransferStatus,
+    SourceStats, SpeedSample, Theme, TransferKind, TransferRow, TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -485,6 +485,7 @@ fn directory_panel(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
 fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl IntoElement {
     let t = theme::active();
     let id = row.id;
+    let row_seeding = row.seeding;
     let open = app.expanded.contains(&id);
     let frac = row.progress().clamp(0.0, 1.0);
     let fill = match row.status {
@@ -529,6 +530,7 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                         .child(expand_caret(id, open, cx))
                         .child(div().font_weight(FontWeight::SEMIBOLD).child(row.name.clone()))
                         .child(chip(&format!("v{}", row.version.max(1)), t.muted))
+                        .when(row.seeding, |el| el.child(chip("seeding", t.good)))
                         .when_some(row.update_available, |el, v| {
                             el.child(chip(&format!("update v{v}"), t.info))
                         }),
@@ -594,6 +596,23 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                         move |this, _: &ClickEvent, _, cx| this.open_output_dir(id, cx),
                     )))
                 })
+                .when(
+                    row.status == TransferStatus::Complete
+                        && row.kind == TransferKind::Downloading,
+                    |el| {
+                        let label = if row.seeding { "Pause seeding" } else { "Start seeding" };
+                        el.child(btn(("seedtog", id as usize), label).on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                if row_seeding {
+                                    this.app.pause(id);
+                                } else {
+                                    this.app.resume(id);
+                                }
+                                cx.notify();
+                            },
+                        )))
+                    },
+                )
                 .when(row.status == TransferStatus::Complete, |el| {
                     el.child(btn(("chk", id as usize), "Check updates").on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| this.check_updates(id, cx),
@@ -1171,25 +1190,75 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             ),
         )
         .child(
-            card().child(section_title("Startup")).child(
-                div()
-                    .id("toggle-persist-shares")
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.toggle_persist_shares(cx)
-                    }))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_family(theme::MONO)
-                            .text_color(t.muted)
-                            .child("REMEMBER SHARES & TRANSFERS ON RESTART"),
-                    )
-                    .child(checkmark(if s.persist_shares { Tri::On } else { Tri::Off })),
-            ),
+            card()
+                .child(section_title("Interface"))
+                .child(
+                    div()
+                        .id("toggle-advanced-ui")
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.toggle_advanced_ui(cx)
+                        }))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(theme::MONO)
+                                .text_color(t.muted)
+                                .child("ADVANCED MODE"),
+                        )
+                        .child(checkmark(if s.advanced_ui { Tri::On } else { Tri::Off })),
+                )
+                .child(hint(
+                    "Adds the Accelerator and Logs tabs, and turns the Reachability \
+                     section below into editable fields with a “Copy as link” button. \
+                     Off by default — a normal setup only needs Transfers, Shares, Stats \
+                     and Settings, and receives reachability config as a single paste.",
+                )),
+        )
+        .child(
+            card()
+                .child(section_title("Startup"))
+                .child(
+                    div()
+                        .id("toggle-persist-shares")
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.toggle_persist_shares(cx)
+                        }))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(theme::MONO)
+                                .text_color(t.muted)
+                                .child("REMEMBER SHARES & TRANSFERS ON RESTART"),
+                        )
+                        .child(checkmark(if s.persist_shares { Tri::On } else { Tri::Off })),
+                )
+                .child(
+                    div()
+                        .id("toggle-seed-after-download")
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.toggle_seed_after_download(cx)
+                        }))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(theme::MONO)
+                                .text_color(t.muted)
+                                .child("KEEP SEEDING AFTER A DOWNLOAD FINISHES"),
+                        )
+                        .child(checkmark(if s.seed_after_download { Tri::On } else { Tri::Off })),
+                ),
         )
         .child(
             card()
@@ -1217,32 +1286,70 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         .child(
             card()
                 .child(section_title("Reachability"))
-                .child(field("Public relay p2p address", &app.set_relay))
-                .child(field("Rendezvous URL (accelerator admin API)", &app.set_rendezvous))
-                .child(
-                    div().mt_1().flex().child(
-                        primary_btn("apply-settings-relay", "Save settings").on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.apply_settings(cx)),
+                .when(s.advanced_ui, |c| {
+                    c.child(field("Public relay p2p address", &app.set_relay))
+                        .child(field(
+                            "Rendezvous URL (accelerator admin API)",
+                            &app.set_rendezvous,
+                        ))
+                        .child(
+                            div()
+                                .mt_1()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(primary_btn("apply-settings-relay", "Save settings").on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.apply_settings(cx)
+                                    }),
+                                ))
+                                .child(btn("copy-reach", "Copy as link").on_click(cx.listener(
+                                    |this, _: &ClickEvent, _, cx| this.copy_reachability(cx),
+                                ))),
+                        )
+                        .child(hint(
+                            "A relay's dialable …/p2p/<id> address (e.g. one you run on a \
+                             public VPS with `accelerator run --role relay`). When set, \
+                             every share this node creates also reserves a slot on it and \
+                             adds that address to the link, so it stays dialable even from \
+                             a network with no path to this machine directly. Leave blank \
+                             for LAN/VPN-only sharing.",
+                        ))
+                        .child(hint(
+                            "Rendezvous URL: that accelerator's rendezvous address \
+                             (host:port; TLS is automatic) — usually the same as its admin \
+                             API, but its operator may run it on a separate address (e.g. \
+                             admin kept private behind a VPN, rendezvous exposed \
+                             publicly). Ask the operator if unsure. Two peers that have \
+                             never talked before use it to swap current addresses and \
+                             punch a direct hole through NAT — no data flows through it, \
+                             just a few KB of signaling. Works even without a relay \
+                             reservation above.",
+                        ))
+                        .child(hint(
+                            "“Copy as link” bundles both fields into a short gagglenet1… \
+                             token. On another device, turn Advanced mode off and use the \
+                             Paste button here to apply it in one step.",
+                        ))
+                })
+                .when(!s.advanced_ui, |c| {
+                    c.child(hint(
+                        "These control how peers on other networks reach this node and \
+                         discover each other — a public relay address and a rendezvous / \
+                         tracker URL. Get a link from someone who already has them set \
+                         (their Settings → Reachability → Copy as link, with Advanced \
+                         mode on) and paste it here.",
+                    ))
+                    .child(
+                        div().mt_1().flex().child(
+                            primary_btn("paste-reach", "Paste reachability link").on_click(
+                                cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.paste_reachability(window, cx)
+                                }),
+                            ),
                         ),
-                    ),
-                )
-                .child(hint(
-                    "A relay's dialable …/p2p/<id> address (e.g. one you run on a public \
-                     VPS with `accelerator run --role relay`). When set, every share this \
-                     node creates also reserves a slot on it and adds that address to the \
-                     link, so it stays dialable even from a network with no path to this \
-                     machine directly. Leave blank for LAN/VPN-only sharing.",
-                ))
-                .child(hint(
-                    "Rendezvous URL: that accelerator's rendezvous address (host:port; \
-                     TLS is automatic) — usually the same as its admin API, but its \
-                     operator may run it on a separate address (e.g. admin kept private \
-                     behind a VPN, rendezvous exposed publicly). Ask the operator if \
-                     unsure. Two peers that have never talked before use it to swap \
-                     current addresses and punch a direct hole through NAT — no data \
-                     flows through it, just a few KB of signaling. Works even without a \
-                     relay reservation above.",
-                )),
+                    )
+                }),
         )
         .child(
             card()
@@ -1412,10 +1519,13 @@ pub fn body(tab: Tab, app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     match tab {
         Tab::Shares => shares(app, cx),
         Tab::Transfers => transfers(app, cx),
-        Tab::Accelerator => accelerator(app, cx),
+        // Accelerator + Logs live behind advanced mode; fall back if somehow
+        // selected while it's off.
+        Tab::Accelerator if app.state.settings.advanced_ui => accelerator(app, cx),
+        Tab::Logs if app.state.settings.advanced_ui => logs(app, cx),
+        Tab::Accelerator | Tab::Logs => transfers(app, cx),
         Tab::Stats => stats(app, cx),
         Tab::Settings => settings(app, cx),
-        Tab::Logs => logs(app, cx),
     }
 }
 
@@ -1762,7 +1872,8 @@ fn logs(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
         )
         .child(hint(
             "Everything this process has logged, oldest at the bottom. RUST_LOG (if set \
-             before launch) controls verbosity; INFO+ is the default.",
+             before launch) controls verbosity; the default is INFO with the noisiest \
+             libp2p and graphics targets turned down.",
         ));
 
     if order.is_empty() {
