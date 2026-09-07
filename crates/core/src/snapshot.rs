@@ -282,6 +282,37 @@ pub fn write_share(
     Ok(())
 }
 
+/// Rebuild just the files named in `only` under `root`, exactly as
+/// [`write_share`] would — same chunk verification, same size check, same mode
+/// handling. Entries of `only` that `manifest` does not list are ignored;
+/// returns the paths actually rebuilt, in manifest order.
+///
+/// This is the surgical form of [`write_share`], for verify-and-repair:
+/// re-materialize only the files that failed their integrity check, leaving
+/// every untouched file's bytes unread and unwritten. `chunk_lists` must contain
+/// an entry for each rebuilt file, and `store` every chunk those lists name.
+pub fn write_files(
+    root: &Path,
+    manifest: &Manifest,
+    chunk_lists: &BTreeMap<String, ChunkList>,
+    store: &dyn ChunkStore,
+    only: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    fs::create_dir_all(root)?;
+    let mut rebuilt = Vec::new();
+    for file in &manifest.files {
+        if !only.contains(&file.path) {
+            continue;
+        }
+        let list = chunk_lists
+            .get(&file.path)
+            .ok_or_else(|| Error::Manifest(format!("no chunk list for {}", file.path)))?;
+        materialize_file(root, file, list, store)?;
+        rebuilt.push(file.path.clone());
+    }
+    Ok(rebuilt)
+}
+
 /// What [`sync_share`] changed on disk.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncOutcome {

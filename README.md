@@ -1,174 +1,242 @@
-# Gaggle
+<div align="center">
 
-## Download the launcher
+<img src="docs/logo.png" alt="Gaggle" width="120">
 
-Direct links to the standalone `gaggle-launcher` from the latest release of each channel.
-Run it and it installs the rest itself (see [Getting started](#getting-started) below).
+<h1>Gaggle</h1>
+
+<p><strong>Share very large folders over private, invite-only peer-to-peer swarms.</strong></p>
+
+<p>
+  <img src="https://img.shields.io/badge/license-MIT-3b5bdb?style=flat-square" alt="MIT license">
+  <img src="https://img.shields.io/badge/platforms-Linux%20%C2%B7%20Windows%20%C2%B7%20macOS-6c757d?style=flat-square" alt="Platforms">
+  <img src="https://img.shields.io/badge/built%20with-Rust-b7410e?style=flat-square" alt="Built with Rust">
+</p>
+
+</div>
+
+Gaggle moves 100 GB+ folders — modded game installs, media libraries, datasets — between
+people who already trust each other. Peers trade content-addressed chunks directly;
+optional always-on **accelerator nodes** keep a share available and fast when nobody else
+is online.
+
+Content is chunked, hashed and Merkle-verified with BLAKE3, like a torrent. Unlike a
+torrent, there is no public tracker or browsable DHT: each share has an owner, an Ed25519
+identity, and signed invite tokens that can be scoped to specific files and set to expire.
+
+## Contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Run an accelerator](#run-an-accelerator)
+- [Build from source](#build-from-source)
+
+## Install
 
 | Platform | Stable | Beta |
 |---|---|---|
-| Linux (x86_64) | [Download](https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-launcher-linux-x86_64) | [Download](https://github.com/thomasgoossen04/Gaggle/releases/download/beta/gaggle-launcher-linux-x86_64) |
-| Windows (x86_64) | [Download](https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-launcher-windows-x86_64.exe) | [Download](https://github.com/thomasgoossen04/Gaggle/releases/download/beta/gaggle-launcher-windows-x86_64.exe) |
-| macOS (Apple Silicon) | [Download](https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-launcher-macos-aarch64) | [Download](https://github.com/thomasgoossen04/Gaggle/releases/download/beta/gaggle-launcher-macos-aarch64) |
-| macOS (Intel) | [Download](https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-launcher-macos-x86_64) | [Download](https://github.com/thomasgoossen04/Gaggle/releases/download/beta/gaggle-launcher-macos-x86_64) |
+| macOS (Apple Silicon) | [Gaggle.dmg](https://github.com/thomasgoossen04/Gaggle/releases/latest/download/Gaggle-macos-aarch64.dmg) | [Gaggle.dmg](https://github.com/thomasgoossen04/Gaggle/releases/download/beta/Gaggle-macos-aarch64.dmg) |
+| macOS (Intel) | [Gaggle.dmg](https://github.com/thomasgoossen04/Gaggle/releases/latest/download/Gaggle-macos-x86_64.dmg) | [Gaggle.dmg](https://github.com/thomasgoossen04/Gaggle/releases/download/beta/Gaggle-macos-x86_64.dmg) |
+| Windows (x86_64) | [gaggle-launcher.exe](https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-launcher-windows-x86_64.exe) | [gaggle-launcher.exe](https://github.com/thomasgoossen04/Gaggle/releases/download/beta/gaggle-launcher-windows-x86_64.exe) |
+| Linux (x86_64) | [gaggle-launcher](https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-launcher-linux-x86_64) | [gaggle-launcher](https://github.com/thomasgoossen04/Gaggle/releases/download/beta/gaggle-launcher-linux-x86_64) |
 
-Stable tracks the latest non-prerelease build off `main`; beta is a rolling, less-tested
-build off the `beta` branch, overwritten on every push. Both links always resolve to that
-channel's current build — bookmark them, they don't need updating.
+- **macOS** — open the `.dmg` and drag **Gaggle** to **Applications**. The app checks for
+  updates on launch and updates itself in place.
+- **Windows / Linux** — run `gaggle-launcher`. It installs the app under your user data
+  directory, adds a menu entry, and checks for updates on every launch. (Linux: `chmod +x`
+  it first.)
 
-## Download the accelerator
+**Stable** is the latest build off `main`; **Beta** is a rolling, less-tested build off the
+`beta` branch. Both links always resolve to that channel's current build — bookmark them.
+Switch channels with the in-app **Update channel** dropdown (Advanced mode), the launcher
+window's `CH` toggle, or `gaggle-launcher --channel beta`.
 
-For a headless box (a spare server, a NAS, a VPS) running just the
-[accelerator daemon](#run-an-accelerator) with no GUI — copy-paste onto the machine:
+## Quick start
+
+### Share a folder
+
+1. **Shares** tab → **Add folder**. Gaggle indexes it in place (no copy) and starts seeding.
+2. **Copy link** for a public share, or **Add private folder** to require an invite for
+   every connection.
+3. For a private share, expand its row, pick a scope (whole share or specific files) and
+   an optional expiry, and **Mint invite**. Send the `gaggleshare1…` token to the other
+   person. An invite can only be revoked by letting it expire, so keep scopes and expiries
+   tight for anything sensitive.
+
+### Join a share
+
+1. **Transfers** tab → paste a share link or invite token.
+   Or, if you've set a **Settings → Rendezvous URL**, use **Browse public shares** to
+   pick one from that accelerator's directory — no link needed.
+2. A picker opens with the share's contents: tick the files and folders you want (or
+   **Select all**), choose where to download them, and start. Downloading a strict
+   subset is a leech-only copy — it won't seed back, since its file set has a
+   different id than the origin's.
+3. Watch progress per row: transferred / total, speed, source count, time left. Expand a
+   row to see the per-source chunk breakdown.
+4. A transfer seeds the chunks it already has while still downloading, and keeps serving
+   the whole share once done. Pause per row, or turn it off under **Settings → Startup**.
+5. **Verify & repair** on a finished download re-checks every file against the manifest
+   and refetches only the parts that no longer match (a local check when the tree is
+   intact — nothing is pulled).
+
+### Keep a copy up to date
+
+A completed transfer's row has **Check updates** (ask the source for its version) and
+**Resync** (pull only the changed chunks — new files added, removed files deleted, changed
+files patched). On the owner's side, **Rescan** re-indexes a share and bumps its version.
+A rescanned private share needs a fresh invite, since invites pin one manifest.
+
+## Features
+
+- **Built for huge folders.** Content-defined chunking and a Merkle tree per file mean
+  seeding 100 GB costs a bounded RAM cache, not a second on-disk copy.
+- **Private by invite.** Every share has its own keypair. Access needs a signed token,
+  scoped to the share or specific files, with an optional expiry.
+- **Multi-source downloads.** Pulls from every seed and replica at once, rarest chunk
+  first, routing around dead or partial sources.
+- **Pick what you download.** A pre-download picker shows the share's file tree; take
+  the whole thing or just the files you want, into a folder you choose.
+- **Verify & repair.** Re-check a finished download against the manifest and refetch only
+  the pieces that don't match — Gaggle's equivalent of "verify integrity".
+- **Seeds while downloading.** A transfer uploads the chunks it already holds and keeps
+  serving after it finishes.
+- **NAT traversal.** mDNS on the LAN, UPnP for a direct port, accelerator-assisted
+  rendezvous hole-punching, and a full libp2p relay circuit as the fallback.
+- **Delta sync.** Re-syncing a changed share moves only the chunks that changed.
+- **Encrypted, compressed transfer.** Each chunk is compressed (when that helps) and
+  sealed before it leaves, on top of QUIC's TLS — one chunk at a time, so nothing waits
+  on a whole-share pass.
+- **Accelerators.** Optional always-on nodes that cache hot chunks (relay role) or hold a
+  full replica (NAS role). One carries many shares and can be driven remotely over a
+  signed admin API.
+- **Uses every core.** Chunking, hashing, verification and compression run off the
+  network thread.
+- **Throughput graphs.** The **Stats** tab plots up/down speed over 1m / 5m / 15m / 1h,
+  for this machine or any connected remote accelerator.
+- **Simple or advanced.** The GUI opens with Transfers, Shares, Stats and Settings.
+  **Advanced mode** adds the Accelerator and Logs tabs and the editable network fields.
+- **Themes.** System (follows the OS) plus Dark, Light, Dracula, Nord, Gruvbox, Tokyo
+  Night, Catppuccin, Solarized and Rosé Pine Dawn.
+
+## How it works
+
+The network is split into two planes:
+
+- **Data plane** — peer-to-peer and peer-to-accelerator chunk transfer over QUIC (via
+  `rust-libp2p`), independently multiplexed so many chunks move at once.
+- **Control plane** — plain HTTPS for low-volume traffic: invite exchange, NAT
+  rendezvous, the seeder tracker, and the accelerator admin API.
+
+**Trust flows from the manifest.** A share's manifest id is authenticated by a signed
+invite; every chunk is verified against the manifest's Merkle root no matter which peer
+or accelerator sent it. Chunk data itself is never trusted, only counted.
+
+## Run an accelerator
+
+An accelerator keeps a share available and fast when the owner is offline. Two roles:
+**relay** (a bandwidth-heavy hot-chunk cache) and **NAS** (a storage-heavy full replica).
+
+### From the GUI
+
+Turn on **Settings → Advanced mode**, open the **Accelerator** tab, and either:
+
+- **Add a remote accelerator** by its label, admin URL and public key, to manage a
+  headless daemon from here — the common case.
+- **Start relay** or **Start NAS** on this machine after **Benchmark** suggests a role.
+
+Each carried share has a **Seed** toggle (pause uploading without dropping the copy) and
+**Remove**. Removing a NAS share deletes its on-disk replica (you're asked first). NAS
+replicas are stored zstd-compressed.
+
+A NAS share starts uploading the chunks it already holds **while** it is still
+replicating — it doesn't wait for the whole folder to land first — and each share
+replicates concurrently. If a share can't reach its source (a restart before the origin
+is back, a stale address), it retries on its own with a short backoff instead of stopping.
+
+### Headless daemon
+
+For a spare server, NAS or VPS with no GUI:
 
 ```bash
-# Stable
-curl -fsSL -o gaggle-accelerator https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-accelerator-linux-x86_64
+curl -fsSL -o gaggle-accelerator \
+  https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-accelerator-linux-x86_64
 chmod +x gaggle-accelerator
-./gaggle-accelerator run --role relay
+./gaggle-accelerator run --role relay        # or: --role nas
 ```
 
 ```bash
-# Beta
-curl -fsSL -o gaggle-accelerator https://github.com/thomasgoossen04/Gaggle/releases/download/beta/gaggle-accelerator-linux-x86_64
-chmod +x gaggle-accelerator
-./gaggle-accelerator run --role relay
+./gaggle-accelerator identity                # print its public key
+./gaggle-accelerator authorize <operator-key-hex>   # let your GUI manage it
+./gaggle-accelerator share add gaggleshare1… # queue a share, offline
+./gaggle-accelerator share rm <manifest-id>  # stop carrying it (deletes the NAS replica)
 ```
 
-Swap `--role relay` for `--role nas` for a full durable replica instead of a hot-chunk
-cache. Windows and macOS builds are published too, as `gaggle-accelerator-windows-x86_64.exe`,
-`gaggle-accelerator-macos-aarch64` and `gaggle-accelerator-macos-x86_64` alongside the
-launcher under the same `releases/latest/download/` (stable) and `releases/download/beta/`
-(beta) paths.
+Windows and macOS builds are published alongside the launcher under the same
+`releases/latest/download/` (stable) and `releases/download/beta/` (beta) paths.
 
-### Auto-updating accelerator (systemd)
+<details>
+<summary>Auto-updating via systemd</summary>
 
-For a box you want to just keep running — updating itself on every restart, no manual
-redeploy — use `gaggle-accelerator-launcher` instead: it's the same idea as the desktop
-launcher, headless. Point a systemd unit's `ExecStart=` at it and it checks for a newer
-`accelerator` build, installs it if there is one (falling back to whatever's already
-installed if the check fails, so a network blip never stops the service from starting),
-then runs the daemon.
+`gaggle-accelerator-launcher` is the headless counterpart of the desktop launcher: on
+every start it installs a newer `accelerator` build if one exists (falling back to the
+installed one if the check fails), then runs the daemon.
 
 ```bash
-curl -fsSL -o gaggle-accelerator-launcher https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-accelerator-launcher-linux-x86_64
+curl -fsSL -o gaggle-accelerator-launcher \
+  https://github.com/thomasgoossen04/Gaggle/releases/latest/download/gaggle-accelerator-launcher-linux-x86_64
 chmod +x gaggle-accelerator-launcher
-sudo mv gaggle-accelerator-launcher /usr/local/bin/   # give it a stable path first
+sudo mv gaggle-accelerator-launcher /usr/local/bin/
 
 gaggle-accelerator-launcher service --role relay --install
 systemctl --user daemon-reload
 systemctl --user enable --now gaggle-accelerator.service
-loginctl enable-linger "$USER"   # so it runs without staying logged in
+loginctl enable-linger "$USER"
 ```
 
-`service` prints (rather than installs, without `--install`) a ready-to-use systemd user
-unit; `--channel beta` tracks pre-release builds, same flag as the desktop launcher.
-`gaggle-accelerator-launcher check` / `update` work the same way for scripting, and
-`--no-update` on `run` skips the check for a quick manual restart.
+`service` without `--install` just prints the unit. `check` / `update` and `--channel beta`
+work like the desktop launcher.
 
-Gaggle is a hybrid-P2P application for sharing very large folders (100GB+ — think modded
-game installs, media libraries, datasets) over private, invite-based swarms. Peers exchange
-content-addressed chunks directly with each other; optional always-on **accelerator nodes**
-improve availability and throughput without needing anyone to stay online.
+</details>
 
-Content is chunked, hashed and Merkle-verified (BLAKE3) the same way a torrent is, but
-sharing is **invite-only** rather than public: a share has an owner, an Ed25519 identity,
-and signed, scoped, revocable-by-expiry invite tokens — no public tracker, no DHT anyone
-can browse.
+<details>
+<summary>Rendezvous and the seeder tracker</summary>
 
-## Features
+Any running accelerator doubles as a **rendezvous point**: put its `http://host:port` into
+**Settings → Rendezvous URL** on both ends of a transfer and two peers behind NAT can
+swap addresses and punch a direct hole, with no chunk data routed through the accelerator.
 
-- **Huge folders, bounded memory.** Content-defined chunking + a Merkle tree per file mean
-  seeding a 100GB folder costs a bounded RAM cache, not a second on-disk copy or a full
-  index held in memory.
-- **Uses all your cores.** Indexing a folder chunks and hashes files in parallel across
-  the CPU; serving and downloading verify and (de)compress chunks off the network thread,
-  so a fast disk or link isn't bottlenecked on a single core.
-- **Private, invite-based swarms.** Every share has its own keypair. Invites are signed,
-  bearer tokens (`gaggleshare1…`) scoped to the whole share or specific files, with an
-  optional expiry — no invite, no access.
-- **Multi-peer swarming.** Downloads pull from several sources at once, scheduling
-  rarest-chunk-first with per-peer concurrency caps, and route around dead or partial
-  sources automatically. A share link only names the origin, but if you point both ends
-  at an accelerator (**Settings → Rendezvous URL**) every seed announces itself to that
-  accelerator's live *seeder tracker*, so a download also swarms across any NAS replica
-  or extra origin the link never mentioned.
-- **Downloads seed while they download.** A running transfer stands up its own serving
-  node over the chunks that have already landed, so a leech uploads the part of the
-  share it holds instead of only taking — and once it completes it keeps serving the
-  whole thing. Both have per-row pause and a global off switch.
-- **NAT traversal built in, relay-free when possible.** mDNS finds same-LAN peers
-  instantly; UPnP asks the router for a public port with no server involved at all; and
-  when both peers are behind NAT with no accelerator, an accelerator's control-plane can
-  act as a lightweight *rendezvous* point — the two peers swap current addresses and punch
-  a direct hole through each side's NAT, without ever routing chunk data through it. Kademlia
-  DHT discovery plus a full libp2p relay circuit + `dcutr` hole-punch remains the fallback
-  when none of that works.
-- **Delta sync.** Re-scanning a changed folder and re-syncing a subscribed copy only moves
-  the chunks that actually changed — not the whole share again.
-- **Compressed, encrypted chunk transfer.** Every chunk is compressed (when that shrinks
-  it) and sealed before it goes out over the wire, on top of QUIC's own TLS — one chunk at
-  a time, so this adds no delay before a transfer can start streaming.
-- **Accelerators.** Optional always-on nodes that either cache hot chunks for many
-  downloaders (relay role) or hold a full durable replica (NAS role), so a share stays
-  available when the original owner is offline. One accelerator can carry many shares, and
-  can be driven remotely over a signed admin API.
-- **Throughput graphs.** The **Stats** tab plots download and upload speed over a
-  selectable window (1m / 5m / 15m / 1h) for this machine, or the outbound rate of any
-  connected remote accelerator.
-- **Simple by default, deep when you need it.** The GUI opens with just Transfers, Shares,
-  Stats and Settings. Flip **Settings → Advanced mode** on to unlock the Accelerator and
-  Logs tabs, the editable relay / rendezvous fields, and an **Update channel** (Stable /
-  Beta) dropdown that switches which release stream the launcher updates from. With
-  Advanced mode off, network
-  reachability is configured in one step: someone who has it set clicks **Copy as link**
-  to get a short `gagglenet1…` token, and you **Paste reachability link** on the other
-  device.
-- **Themes.** **Settings → Appearance** has a theme picker: `System` (follows the OS
-  light/dark setting) plus fixed palettes — the house Dark and Light, and Dracula, Nord,
-  Gruvbox, Tokyo Night, Catppuccin, Solarized (dark and light) and Rosé Pine Dawn. Each
-  entry shows a sun / moon / auto glyph so you can tell a light scheme from a dark one at
-  a glance.
-- **Cross-platform desktop GUI**, a headless accelerator daemon, and a self-updating
-  launcher — see "Getting started" below.
+The same URL enables the **seeder tracker**: every folder this node serves announces
+itself there, and every download asks who else has the share first. That's how a download
+fans out across a NAS replica and the origin even when the link only named the origin, and
+it powers **Browse public shares**. Private shares announce too (so invite holders fan out
+across replicas) but stay off the public list. No chunk data or share secret touches the
+tracker.
 
-## How it works, briefly
+</details>
 
-Gaggle splits the network into two independent planes:
+<details>
+<summary>Reaching a NAS behind NAT from outside its network</summary>
 
-- **Data plane** — peer-to-peer and peer-to-accelerator chunk transfer over QUIC
-  (via `rust-libp2p`), independently multiplexed so many chunks move concurrently with no
-  head-of-line blocking.
-- **Control plane** — plain HTTPS for the low-volume stuff: invite exchange, NAT
-  rendezvous, the seeder tracker (who else has a share), and the accelerator admin API.
+A standalone daemon hosts rendezvous/tracker endpoints for others but doesn't register
+itself. For a NAS reachable only over a VPN, point it at a public accelerator:
 
-Trust flows from the manifest: a share's manifest id is authenticated by a signed invite
-capability, and every chunk is verified against the manifest's Merkle root regardless of
-which peer or accelerator it came from — so chunk data itself never needs to be trusted,
-only counted.
+```bash
+./gaggle-accelerator run --role nas \
+  --rendezvous-url https://relay.example:8749 \
+  --public-relay /ip4/203.0.113.4/udp/4001/quic-v1/p2p/12D3Koo…relay
+```
 
-## Getting started
+`--rendezvous-url` (the same accelerator your downloaders use) makes the daemon answer NAT
+punches and announce to that tracker over HTTP. `--public-relay` makes each replica
+reserve a relay circuit on boot so it's dialable while `dcutr` upgrades to direct. Both
+persist to `config.toml`; pass an empty string to clear. A relay-role daemon only needs
+`--rendezvous-url`.
 
-### Install (recommended)
+</details>
 
-Grab `gaggle-launcher` for your platform from the [table above](#download-the-launcher)
-and run it. It installs itself natively:
-
-- **Linux** — adds a Gaggle entry to your applications menu.
-- **Windows** — adds a Start Menu entry.
-- **macOS** — installs `Gaggle.app` under `~/Applications`.
-
-A desktop shortcut is opt-in (a checkbox in the launcher window, or `--desktop-shortcut`
-on the command line). Every launch re-checks for updates; if you're already current (or
-the check fails and you're offline) it hands off straight to the app with no extra window.
-Open it again any time — from the shortcut it just created — to update or launch.
-
-Two release channels are available: **stable** (default) and **beta** (newer, less
-tested). Switch with the `CH` toggle in the launcher window, the **Update channel**
-dropdown in the GUI's **Settings → Advanced mode**, or `gaggle-launcher --channel beta`.
-Whichever you use, the change takes effect the next time the launcher runs.
-
-### Build from source
+## Build from source
 
 Requires a recent stable Rust toolchain.
 
@@ -178,173 +246,15 @@ cd Gaggle
 cargo build --release -p gui -p launcher -p accelerator -p accelerator-launcher
 ```
 
-The GUI needs the usual system libraries for a windowed GPU app on Linux
-(Vulkan, `libxkbcommon`, Wayland/X11, fontconfig); Windows and macOS need nothing extra.
+On Linux the GUI needs the usual libraries for a windowed GPU app (Vulkan,
+`libxkbcommon`, Wayland/X11, fontconfig); Windows and macOS need nothing extra.
 
 ```bash
-cargo run -p gui          # desktop app
-cargo run -p launcher     # installer / updater / launcher
-cargo run -p accelerator -- run --role relay   # headless accelerator daemon
+cargo run -p gui                              # desktop app
+cargo run -p accelerator -- run --role relay  # headless accelerator daemon
 ```
 
-## Quick usage guide
-
-### Share a folder
-
-1. Open the **Shares** tab and click **Add folder**.
-2. Pick a folder. Gaggle indexes it (streaming — it doesn't copy the folder anywhere) and
-   starts seeding.
-3. Click **Copy link** to get a share link for a *public* share (anyone with the link and
-   a route to you can pull it), or use **Add private folder** to mint a per-share identity
-   up front and require an invite for every connection.
-
-### Invite someone to a private share
-
-1. In the **Shares** tab, expand the private share's row (▸).
-2. Pick a scope — the whole share, or specific files — and optionally an expiry.
-3. Click **Mint invite** and send the resulting `gaggleshare1…` token to whoever you're
-   sharing with. Each invite is independently revocable by letting it expire; there's no
-   way to claw back a still-valid one, so mint tight scopes/expiries for anything sensitive.
-
-### Join a share
-
-1. Open the **Transfers** tab.
-2. Paste a share link or invite token into the field and confirm — **or**, if you've set a
-   **Settings → Rendezvous URL**, click **Browse public shares** to see every public share
-   that accelerator's seeder tracker knows about and hit **Download** on one. No link
-   needed, and the download swarms across every seed and replica the tracker lists, not
-   just one address. (Private shares never appear here — they still need their invite.)
-3. Watch progress in the transfer list — each active row shows transferred / total, live
-   speed, source count and a steady **time-left estimate**; pause/resume any time, and
-   expand a row (▸) to see the per-source chunk breakdown while it's swarming from
-   multiple peers.
-4. A transfer starts **seeding** the chunks it already has while it's still downloading
-   — the row shows a `seeding` chip mid-flight — and keeps serving the whole share once
-   it finishes, so you help everyone else who's downloading. Each row has a **Pause
-   seeding** / **Start seeding** button; two toggles under **Settings → Startup** turn it
-   off globally — *"Seed already-downloaded chunks while downloading"* and *"Keep seeding
-   after a download finishes"*.
-
-### Keep a synced copy up to date
-
-Once a transfer completes, its row offers:
-
-- **Check updates** — asks the source for its current version, no download yet.
-- **Resync** — pulls down only the changed chunks and applies them: new files arrive,
-  removed files are deleted, changed files are patched in place.
-
-The owner's side: **Rescan** on a seeded share re-indexes it and bumps its version so
-subscribers see an update is available. A rescanned *private* share needs a fresh invite,
-since the invite is pinned to a specific manifest.
-
-### Run an accelerator
-
-The **Accelerator** and **Logs** tabs are hidden until you turn on **Settings → Advanced
-mode**.
-
-The tab leads with **Remote accelerators** — the common case is driving a headless NAS or
-VPS daemon (see below) rather than opting this machine in.
-
-To run one locally: **Benchmark** measures your disk throughput and free
-space and suggests a role, then **Start relay** (bandwidth-heavy hot-chunk cache) or
-**Start NAS** (storage-heavy full replica) with one or more share links pasted in. The
-card that appears lists every share it's carrying — each row shows its size on disk and
-(NAS) the replica path, has a **Seed** checkbox to pause/resume uploading it without
-losing the local copy, and a **Remove** button. For a NAS it also shows the replica
-folder, free space on that disk, and usage against the **Settings → Storage cap** (a
-share whose size would exceed the cap is refused). Removing a NAS share **deletes its
-replica from disk** (you're asked to confirm first); use the Seed toggle instead if you
-only want to stop uploading. A NAS replica is stored compressed on disk (zstd) to save
-space.
-
-Headless, for something that should run unattended on its own machine:
-
-```bash
-cargo run -p accelerator -- run --role relay --cache-mib 4096
-cargo run -p accelerator -- run --role nas --no-compress-replica   # NAS, replica stored raw
-cargo run -p accelerator -- identity                # print its public key
-cargo run -p accelerator -- authorize <operator-key-hex>   # let yourself manage it remotely
-cargo run -p accelerator -- share add gaggleshare1…  # queue a share to carry, offline
-cargo run -p accelerator -- share rm <manifest-id>   # stop carrying it (deletes the NAS replica)
-```
-
-For a box that should stay current on its own with no manual redeploys, run it through
-`gaggle-accelerator-launcher` instead of the daemon directly — see
-["Auto-updating accelerator (systemd)"](#auto-updating-accelerator-systemd) above.
-
-Once authorized, add it as a **remote accelerator** from the GUI's Accelerator tab (label +
-its admin URL + the public key it printed) to manage its shares and watch its status from
-anywhere, without a `net`/libp2p connection between your machine and it — that traffic all
-goes over the signed HTTPS admin API. Each remote share gets the same **Seed** toggle and
-**Remove** button as a local one: the toggle pauses/resumes serving on the daemon while
-keeping its replica and its place in the config; Remove drops it (and deletes a NAS
-replica).
-
-For a **NAS** remote the row also shows where it stores replica chunks, how much space is
-free on that disk, and how much is used against an optional cap. Point the replica at a
-different disk by typing a new **Replica folder** and hitting **Apply storage settings** —
-the daemon moves the existing replicas across (renaming, or copying when it's another
-filesystem) and resumes serving. Set a **Storage cap (GiB)** in the same form to have the
-daemon refuse any share whose size would push the replica store over it (existing replicas
-are never evicted). A **Restart** button on each remote row tells the daemon to exit so its
-service manager brings it back — the way an auto-updating (`gaggle-accelerator-launcher` +
-systemd) daemon picks up a newer build. Shares stop serving for a few seconds while it
-comes back.
-
-Any running accelerator (relay or NAS) doubles as a lightweight **NAT rendezvous** point —
-put its `http://host:port` (the same `admin_listen` address) into **Settings → Reachability
-→ Rendezvous URL** on both ends of a transfer, and two peers that have never talked before
-can swap current addresses and punch straight through each side's NAT, with no chunk data
-ever routed through the accelerator. (That field, and the public-relay one next to it, are
-only shown with **Advanced mode** on; with it off, click **Copy as link** on a device
-that's already configured and **Paste reachability link** on the others to carry both
-values across in one `gagglenet1…` token.) It's a fallback of last resort's opposite: try this
-*before* reserving a full relay circuit above, since it costs the accelerator only a few KB
-of signaling instead of carrying the transfer.
-
-The same URL also enables the accelerator's **seeder tracker**: while it's set, every
-folder this node serves (and every replica a local or remote NAS holds) announces itself
-there, and every download asks it who else has the share before starting. That's what lets
-a download fan out across a NAS replica and the origin at the same time even though the
-share link only ever carried the origin's address. It also powers **Browse public shares**
-on the Transfers tab: every public folder announced to that tracker is listed by name and
-joinable in one click, so on a trusted accelerator you never have to pass links around at
-all. Private shares announce too (so invite holders still fan out across replicas) but are
-kept off that list. No chunk data or share secret touches
-the tracker — it only exchanges peer ids and addresses, and every chunk is still verified
-against the manifest.
-
-**Making a headless NAS reachable from outside its own network.** A standalone
-`accelerator` daemon *hosts* those rendezvous/tracker endpoints for others but, by
-default, never registers *itself* with any — so a NAS replica reachable only over a VPN
-(Tailscale, no port-forward) can't be downloaded from a device that isn't on that VPN,
-even with a public relay running. Give the daemon the other two flags so it acts as a
-*client* of a public accelerator too:
-
-```bash
-cargo run -p accelerator -- run --role nas \
-  --rendezvous-url https://relay.example:8749 \
-  --public-relay /ip4/203.0.113.4/udp/4001/quic-v1/p2p/12D3Koo…relay
-```
-
-`--rendezvous-url` (point it at the same accelerator your downloaders use as their
-Rendezvous URL — usually the public relay) makes the daemon answer NAT punches for its
-shares and announce them to that accelerator's tracker over HTTP, so a downloader pointed
-at the relay discovers the NAS. `--public-relay` makes each NAS replica reserve a relay
-circuit on boot and advertise it, so the replica is dialable through the relay while
-`dcutr` tries to upgrade to a direct connection. Both persist to `config.toml`; pass an
-empty string to clear either. A relay-role daemon only needs `--rendezvous-url` (it's
-already a relay server, assumed publicly reachable).
-
-### Watch throughput
-
-The **Stats** tab graphs download and upload speed over time. Pick a window with the
-1m / 5m / 15m / 1h chips, and the source with the dropdown: **Local** shows this
-machine's own two rates; picking a registered remote accelerator shows the rate it is
-serving to downloaders, polled over its admin API. History is sampled every couple of
-seconds and kept for about an hour.
-
-## Development
+### Development
 
 ```bash
 cargo build --workspace
@@ -352,8 +262,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
-See `CLAUDE.md` for the full architecture writeup, crate-by-crate breakdown, and the
-release/versioning process.
+See [`CLAUDE.md`](CLAUDE.md) for the full architecture, crate-by-crate breakdown, and the
+release process.
 
 ## License
 

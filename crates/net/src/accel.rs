@@ -6,9 +6,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Context;
-use gaggle_core::{ChunkList, ChunkStore, DiskChunkStore, Hash, Manifest, Scope};
+use gaggle_core::{
+    ChunkList, ChunkStore, DiskChunkStore, Hash, Manifest, Scope, SharedChunkStore,
+};
 
-use crate::{Catalog, Keypair, Node, RelayNode, ShareLink, SwarmConfig, SwarmProgress};
+use crate::{Catalog, Keypair, Node, PeerId, RelayNode, ShareLink, SwarmConfig, SwarmProgress};
 
 /// What a caller needs to show for an accelerated share.
 #[derive(Debug, Clone)]
@@ -90,6 +92,74 @@ fn replica_swarm_config(link: &ShareLink) -> SwarmConfig {
     }
 }
 
+/// Connect to every source `link` names through `downloader`, present the
+/// invite credential if it carries one, and — when `max_bytes` is `Some(n)` —
+/// fetch the share metadata and refuse (before any replica directory is
+/// created) if the share is larger than `n`. Returns the distinct upstream peer
+/// ids.
+///
+/// `max_bytes` lets a NAS never start a replication it cannot finish within its
+/// storage cap; a scoped invite is measured against its full manifest size, so
+/// the guard is conservative for that case.
+async fn connect_auth_budget(
+    downloader: &Node,
+    link: &ShareLink,
+    max_bytes: Option<u64>,
+) -> anyhow::Result<Vec<PeerId>> {
+    anyhow::ensure!(!link.sources.is_empty(), "share link names no sources");
+
+    let peers = downloader.connect_all(&link.sources).await?;
+    if let Some(cred) = link.credential() {
+        downloader.authenticate_all(&peers, cred).await?;
+    }
+
+    if let Some(budget) = max_bytes {
+        let (manifest, _) = fetch_meta_from_any(downloader, &peers, link.manifest_id).await?;
+        let size = manifest.total_size();
+        anyhow::ensure!(
+            size <= budget,
+            "share is {size} bytes but only {budget} bytes of the replica storage \
+             budget are free — raise or clear the storage cap to replicate it"
+        );
+    }
+    Ok(peers)
+}
+
+/// Fetch the share `want` from whichever of `peers` answers first.
+async fn fetch_meta_from_any(
+    downloader: &Node,
+    peers: &[PeerId],
+    want: Hash,
+) -> anyhow::Result<(Manifest, BTreeMap<String, ChunkList>)> {
+    let mut last_err = None;
+    for &peer in peers {
+        match downloader.fetch_share_meta(peer, Some(want)).await {
+            Ok(m) => return Ok(m),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no source returned the share metadata")))
+}
+
+/// A [`ShareMeta`] describing what *actually* lands on this replica — for a
+/// scoped invite that is the granted subset, not the origin's full share (see
+/// [`replica_swarm_config`]).
+fn share_meta(manifest: &Manifest, chunk_lists: &BTreeMap<String, ChunkList>, link: &ShareLink) -> ShareMeta {
+    ShareMeta {
+        manifest_id: link.manifest_id,
+        name: manifest.name.clone(),
+        files: chunk_lists.len(),
+        total_bytes: manifest
+            .files
+            .iter()
+            .filter(|f| chunk_lists.contains_key(&f.path))
+            .map(|f| f.size)
+            .sum(),
+        version: manifest.version,
+        private: link.invite.is_some(),
+    }
+}
+
 /// Pull `link`'s share into `dir_root/<manifest-id>` on disk through
 /// `downloader` (already spawned by the caller — so a caller that wants to try
 /// a NAT-rendezvous punch first can do it through this same node before
@@ -100,12 +170,9 @@ fn replica_swarm_config(link: &ShareLink) -> SwarmConfig {
 /// with zstd on-disk compression (see [`DiskChunkStore::open_with_opts`]).
 /// Reports [`SwarmProgress`] once per chunk via `on_progress`.
 ///
-/// `max_bytes` is an optional storage-budget guard: when `Some(n)`, the share's
-/// metadata is fetched first and the pull is refused (before any chunk file is
-/// written) if the share is larger than `n`. Callers pass the replica's
-/// remaining disk budget so a NAS never starts a replication it cannot finish
-/// within its cap. A scoped invite is measured against its full manifest size,
-/// so the guard is conservative for that case.
+/// This is the plain "pull, then serve separately" form. Prefer
+/// [`nas_seed_start`] + [`nas_seed_finish`] when you want the replica to upload
+/// what it already holds *while* it is still filling.
 pub async fn nas_pull_with_progress<P>(
     downloader: &Node,
     dir_root: &Path,
@@ -117,34 +184,7 @@ pub async fn nas_pull_with_progress<P>(
 where
     P: FnMut(SwarmProgress),
 {
-    anyhow::ensure!(!link.sources.is_empty(), "share link names no sources");
-
-    let peers = downloader.connect_all(&link.sources).await?;
-    if let Some(cred) = link.credential() {
-        downloader.authenticate_all(&peers, cred).await?;
-    }
-
-    if let Some(budget) = max_bytes {
-        let mut last_err = None;
-        let mut size = None;
-        for &peer in &peers {
-            match downloader.fetch_share_meta(peer, Some(link.manifest_id)).await {
-                Ok((manifest, _)) => {
-                    size = Some(manifest.total_size());
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        let size = size.ok_or_else(|| {
-            last_err.unwrap_or_else(|| anyhow::anyhow!("no source returned the share metadata"))
-        })?;
-        anyhow::ensure!(
-            size <= budget,
-            "share is {size} bytes but only {budget} bytes of the replica storage \
-             budget are free — raise or clear the storage cap to replicate it"
-        );
-    }
+    let peers = connect_auth_budget(downloader, link, max_bytes).await?;
 
     let dir = dir_root.join(link.manifest_id.to_hex());
     let open_dir = dir.clone();
@@ -170,28 +210,92 @@ pub async fn nas_serve(
     identity: Keypair,
     link: &ShareLink,
 ) -> anyhow::Result<(Node, ShareMeta, usize)> {
-    // Reflect what actually landed on disk, not the origin's full share — for
-    // a scoped invite these differ on purpose (see `replica_swarm_config`).
-    let info = ShareMeta {
-        manifest_id: link.manifest_id,
-        name: manifest.name.clone(),
-        files: chunk_lists.len(),
-        total_bytes: manifest
-            .files
-            .iter()
-            .filter(|f| chunk_lists.contains_key(&f.path))
-            .map(|f| f.size)
-            .sum(),
-        version: manifest.version,
-        private: link.invite.is_some(),
-    };
-
+    let info = share_meta(&manifest, &chunk_lists, link);
     let node = Node::spawn_serving_with_identity(Catalog::new(manifest, chunk_lists, disk), identity)
         .await?;
     if let Some(invite) = &link.invite {
         node.restrict_to_invite_holders(invite.share).await?;
     }
     Ok((node, info, chunks))
+}
+
+/// What [`nas_seed_start`] hands back: a [`Node`] that is *already serving* the
+/// share (over the still-filling replica), plus everything [`nas_seed_finish`]
+/// needs to drive the replication pull.
+pub struct NasSeedStart {
+    /// Spawned on the persistent `identity` and already answering chunk
+    /// requests for whatever is on disk so far. The caller keeps this — it
+    /// becomes the permanent seed once the pull finishes.
+    pub serving: Node,
+    /// The replica store, shared between `serving`'s catalog and the pull. Pass
+    /// it back to [`nas_seed_finish`].
+    pub store: SharedChunkStore<DiskChunkStore>,
+    /// Metadata for what this replica will hold (the granted subset for a
+    /// scoped invite).
+    pub meta: ShareMeta,
+    /// Upstream peers already connected/authenticated. Pass back to
+    /// [`nas_seed_finish`].
+    pub peers: Vec<PeerId>,
+}
+
+/// Phase one of a seed-while-replicating NAS add: connect + authenticate +
+/// storage-budget check, open the on-disk replica, learn the share, and stand a
+/// serving [`Node`] up over the (still mostly empty) replica **now** — so the
+/// NAS uploads the chunks it already has from the first one on, instead of only
+/// once the whole share has landed. `downloader` is the caller's throw-away
+/// pulling node (already NAT-punched if the caller wanted that); the serving
+/// node uses the persistent `identity`.
+pub async fn nas_seed_start(
+    downloader: &Node,
+    dir_root: &Path,
+    identity: Keypair,
+    link: &ShareLink,
+    compress: bool,
+    max_bytes: Option<u64>,
+) -> anyhow::Result<NasSeedStart> {
+    let peers = connect_auth_budget(downloader, link, max_bytes).await?;
+    let (manifest, chunk_lists) = fetch_meta_from_any(downloader, &peers, link.manifest_id).await?;
+
+    let dir = dir_root.join(link.manifest_id.to_hex());
+    let open_dir = dir.clone();
+    let disk =
+        tokio::task::spawn_blocking(move || DiskChunkStore::open_with_opts(&open_dir, compress))
+            .await?
+            .with_context(|| format!("opening {}", dir.display()))?;
+    let store = SharedChunkStore::new(disk);
+
+    let meta = share_meta(&manifest, &chunk_lists, link);
+    let serving = Node::spawn_serving_with_identity(
+        Catalog::new(manifest, chunk_lists, store.clone()),
+        identity,
+    )
+    .await?;
+    if let Some(invite) = &link.invite {
+        serving.restrict_to_invite_holders(invite.share).await?;
+    }
+
+    Ok(NasSeedStart { serving, store, meta, peers })
+}
+
+/// Phase two: drive the replication pull into the store [`nas_seed_start`]
+/// opened, reporting [`SwarmProgress`] once per chunk. The serving node from
+/// phase one sees every chunk the moment it lands (same backing store). Returns
+/// the chunk count now on disk.
+pub async fn nas_seed_finish<P>(
+    downloader: &Node,
+    store: &SharedChunkStore<DiskChunkStore>,
+    peers: &[PeerId],
+    link: &ShareLink,
+    on_progress: P,
+) -> anyhow::Result<usize>
+where
+    P: FnMut(SwarmProgress),
+{
+    let mut store = store.clone();
+    downloader
+        .download_share_multi_with_progress(peers, &mut store, replica_swarm_config(link), on_progress)
+        .await?;
+    Ok(store.len())
 }
 
 /// Replicate the linked share into `dir_root/<manifest-id>` on disk and start a
@@ -211,6 +315,12 @@ pub async fn nas_add_share(
 
 /// [`nas_add_share`] that also reports [`SwarmProgress`] once per chunk as it
 /// lands — for driving a progress bar.
+///
+/// The serving node is stood up over the replica *before* the pull runs (via
+/// [`nas_seed_start`] / [`nas_seed_finish`]), so the NAS is already uploading
+/// the chunks it holds while it fills; it is still returned only once the pull
+/// completes. A caller that wants the node handle earlier (to announce the
+/// replica to a tracker mid-fill) should drive the two phases itself.
 pub async fn nas_add_share_with_progress<P>(
     dir_root: &Path,
     identity: Keypair,
@@ -223,9 +333,15 @@ where
     P: FnMut(SwarmProgress),
 {
     let scratch = Node::spawn().await?;
-    let pulled =
-        nas_pull_with_progress(&scratch, dir_root, link, compress, max_bytes, on_progress).await;
+    let start = match nas_seed_start(&scratch, dir_root, identity, link, compress, max_bytes).await {
+        Ok(s) => s,
+        Err(e) => {
+            scratch.shutdown().await;
+            return Err(e);
+        }
+    };
+    let NasSeedStart { serving, store, meta, peers } = start;
+    let chunks = nas_seed_finish(&scratch, &store, &peers, link, on_progress).await;
     scratch.shutdown().await;
-    let (manifest, chunk_lists, disk, chunks) = pulled?;
-    nas_serve(manifest, chunk_lists, disk, chunks, identity, link).await
+    Ok((serving, meta, chunks?))
 }

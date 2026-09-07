@@ -12,7 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_state::{
     AcceleratorRequest, App, AppState, Hash, LauncherChannel, LogHandle, LogLevel, LogLine,
-    ReachLink, Scope, Settings, ShareLink, Theme, TransferId, TransferKind, TransferRow,
+    PreviewStatus, ReachLink, Scope, Settings, ShareLink, SubscribeRequest, Theme, TransferId,
+    TransferKind, TransferRow,
 };
 use gpui::prelude::*;
 use gpui::{ClipboardItem, Entity, FocusHandle, PathPromptOptions, SharedString, Timer, Window, div};
@@ -149,6 +150,18 @@ pub struct Gaggle {
     pub(crate) invite_sel: HashSet<String>,
     /// Expanded folders in the invite file tree.
     pub(crate) tree_expanded: HashSet<String>,
+    /// The pre-download picker modal is open (paired with
+    /// `state.share_preview`). Cleared on cancel / confirm.
+    pub(crate) sub_modal_open: bool,
+    /// Manifest paths ticked for download in the picker.
+    pub(crate) sub_sel: HashSet<String>,
+    /// Manifest id whose preview `sub_sel` was last initialized from — so the
+    /// 200 ms poll seeds the selection exactly once when a preview lands.
+    pub(crate) sub_sel_for: Option<Hash>,
+    /// Expanded folders in the picker's file tree.
+    pub(crate) sub_tree_expanded: HashSet<String>,
+    /// Destination directory field in the picker.
+    pub(crate) sub_dest: Entity<InputState>,
     /// A Remove button is awaiting confirmation.
     pub(crate) confirm: Option<Confirm>,
     /// Holds keyboard focus while [`Self::confirm`] is armed, so the modal's
@@ -261,6 +274,7 @@ impl Gaggle {
         };
 
         let set_dir = text(cx, window, s.download_dir.display().to_string());
+        let sub_dest = text(cx, window, s.download_dir.display().to_string());
         let set_dl = num(cx, window, fmt_rate_mib(s.download_cap_bps), decimal.clone());
         let set_ul = num(cx, window, fmt_rate_mib(s.upload_cap_bps), decimal.clone());
         let set_store = num(cx, window, fmt_size_gib(s.storage_cap_bytes), decimal);
@@ -299,6 +313,7 @@ impl Gaggle {
                         let mut changed = false;
                         if state_rx.has_changed().unwrap_or(false) {
                             this.state = state_rx.borrow_and_update().clone();
+                            this.sync_preview_selection();
                             changed = true;
                         }
                         if this.tab == Tab::Logs {
@@ -337,6 +352,11 @@ impl Gaggle {
             invite_for: None,
             invite_sel: HashSet::new(),
             tree_expanded: HashSet::new(),
+            sub_modal_open: false,
+            sub_sel: HashSet::new(),
+            sub_sel_for: None,
+            sub_tree_expanded: HashSet::new(),
+            sub_dest,
             confirm: None,
             confirm_focus: cx.focus_handle(),
             theme_menu_open: false,
@@ -661,18 +681,140 @@ impl Gaggle {
             .detach();
     }
 
-    pub(crate) fn paste_subscription(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn paste_subscription(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = cx.read_from_clipboard().and_then(|c| c.text());
         match text.as_deref().map(str::trim).map(ShareLink::parse) {
-            Some(Ok(link)) => {
-                let name = link.name.clone();
-                self.app.subscribe(link.into());
-                self.tab = Tab::Transfers;
-                self.set_notice(format!("Subscribed to “{name}”"), cx);
-            }
+            Some(Ok(link)) => self.begin_preview(link.into(), window, cx),
             Some(Err(e)) => self.set_notice(format!("Clipboard is not a share link: {e}"), cx),
             None => self.set_notice("Clipboard is empty — copy a share link first", cx),
         }
+    }
+
+    /// Kick off a share preview and open the pre-download picker modal.
+    pub(crate) fn begin_preview(
+        &mut self,
+        request: SubscribeRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sub_modal_open = true;
+        self.sub_sel.clear();
+        self.sub_sel_for = None;
+        self.sub_tree_expanded.clear();
+        let dest = self.state.settings.download_dir.display().to_string();
+        self.sub_dest.update(cx, |st, cx| st.set_value(dest, window, cx));
+        self.app.preview_share(request);
+        self.tab = Tab::Transfers;
+        cx.notify();
+    }
+
+    /// When a preview lands, tick every file by default (torrent-client style)
+    /// — done exactly once per preview, keyed by manifest id.
+    pub(crate) fn sync_preview_selection(&mut self) {
+        if let Some(PreviewStatus::Ready(p)) = &self.state.share_preview
+            && self.sub_sel_for != Some(p.manifest_id)
+        {
+            self.sub_sel = p.files.iter().map(|f| f.path.clone()).collect();
+            self.sub_sel_for = Some(p.manifest_id);
+        }
+    }
+
+    pub(crate) fn cancel_subscribe(&mut self, cx: &mut Context<Self>) {
+        self.sub_modal_open = false;
+        self.sub_sel.clear();
+        self.sub_sel_for = None;
+        self.app.clear_preview();
+        cx.notify();
+    }
+
+    /// Fire the real subscription from the picker's current selection + dest.
+    pub(crate) fn confirm_subscribe(&mut self, cx: &mut Context<Self>) {
+        let Some(PreviewStatus::Ready(p)) = self.state.share_preview.clone() else {
+            return;
+        };
+        if self.sub_sel.is_empty() {
+            self.set_notice("Pick at least one file to download", cx);
+            return;
+        }
+        let mut request = p.request.clone();
+        // Everything ticked ⇒ a plain whole-share download (which can seed back).
+        request.select = if self.sub_sel.len() == p.files.len() {
+            None
+        } else {
+            let mut sel: Vec<String> = self.sub_sel.iter().cloned().collect();
+            sel.sort();
+            Some(sel)
+        };
+        let dest = self.sub_dest.read(cx).value().trim().to_string();
+        let default_dest = self.state.settings.download_dir.display().to_string();
+        request.dest =
+            (!dest.is_empty() && dest != default_dest).then(|| PathBuf::from(&dest));
+
+        let name = p.name.clone();
+        self.app.subscribe(request);
+        self.app.clear_preview();
+        self.sub_modal_open = false;
+        self.sub_sel.clear();
+        self.sub_sel_for = None;
+        self.tab = Tab::Transfers;
+        self.set_notice(format!("Downloading “{name}”"), cx);
+    }
+
+    pub(crate) fn sub_select_all(&mut self, cx: &mut Context<Self>) {
+        if let Some(PreviewStatus::Ready(p)) = &self.state.share_preview {
+            self.sub_sel = p.files.iter().map(|f| f.path.clone()).collect();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn sub_select_none(&mut self, cx: &mut Context<Self>) {
+        self.sub_sel.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_sub_tree_dir(&mut self, dir: String, cx: &mut Context<Self>) {
+        if !self.sub_tree_expanded.remove(&dir) {
+            self.sub_tree_expanded.insert(dir);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_sub_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.sub_sel.remove(&path) {
+            self.sub_sel.insert(path);
+        }
+        cx.notify();
+    }
+
+    /// Tick / untick every file under `dir` (all-or-nothing).
+    pub(crate) fn toggle_sub_dir(&mut self, dir: String, cx: &mut Context<Self>) {
+        let Some(PreviewStatus::Ready(p)) = &self.state.share_preview else {
+            return;
+        };
+        let prefix = format!("{dir}/");
+        let under: Vec<String> =
+            p.files.iter().map(|f| f.path.clone()).filter(|x| x.starts_with(&prefix)).collect();
+        let all_on = !under.is_empty() && under.iter().all(|x| self.sub_sel.contains(x));
+        for x in under {
+            if all_on {
+                self.sub_sel.remove(&x);
+            } else {
+                self.sub_sel.insert(x);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Native folder picker for the pre-download picker's destination field.
+    pub(crate) fn browse_sub_dest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.sub_dest.clone();
+        self.browse_into(target, window, cx);
+    }
+
+    /// Run a verify-and-repair pass over a completed download.
+    pub(crate) fn verify_share(&mut self, id: TransferId, cx: &mut Context<Self>) {
+        self.app.verify_share(id);
+        self.set_notice("Verifying download…", cx);
     }
 
     /// Toggle the "Browse public shares" panel; opening it kicks a tracker
@@ -696,16 +838,15 @@ impl Gaggle {
         self.set_notice("Refreshing shared folders…", cx);
     }
 
-    /// Subscribe to a public share discovered on the tracker.
+    /// Preview a public share discovered on the tracker, then open the picker.
     pub(crate) fn join_discovered(
         &mut self,
         manifest_id: Hash,
         name: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.app.subscribe_discovered(manifest_id, name.clone());
-        self.tab = Tab::Transfers;
-        self.set_notice(format!("Joining “{name}”…"), cx);
+        self.begin_preview(SubscribeRequest::for_discovered(manifest_id, name), window, cx);
     }
 
     pub(crate) fn copy_text(&mut self, text: String, note: &str, cx: &mut Context<Self>) {
@@ -1195,5 +1336,6 @@ impl Render for Gaggle {
             })
             .child(ui::chrome::status_bar(self))
             .children(ui::views::confirm_modal(self, cx))
+            .children(ui::views::subscribe_modal(self, cx))
     }
 }

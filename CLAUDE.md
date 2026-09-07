@@ -33,7 +33,10 @@ on-disk copy.
 `snapshot::write_share` is `snapshot_dir`'s inverse: materialize a share's files from
 any store back onto disk. `snapshot::sync_share` is its delta form (milestone 10):
 given the old + new manifests it rebuilds only added/changed files, deletes removed
-ones, and prunes emptied dirs.
+ones, and prunes emptied dirs. `snapshot::write_files(root, manifest, lists, store,
+only: &BTreeSet<String>)` is the surgical form — rebuild just the named subset of
+`manifest.files` (returns the paths rebuilt), used by verify-and-repair to overwrite
+only the files that failed their integrity check.
 
 The scan (`snapshot::scan_tree`, behind `snapshot_dir` / `index_dir`) runs the
 CPU-bound work — FastCDC + BLAKE3 over every file — on the **rayon** pool: files
@@ -93,7 +96,11 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   to peers, so two UPnP-capable devices on plain home routers connect directly with
   **no relay involved at all**. It's opportunistic, not a replacement for relay/dcutr —
   it does nothing behind a router with UPnP disabled, double NAT, or CGNAT, so those
-  cases still need the relay fallback.
+  cases still need the relay fallback. `build_peer_swarm_with` / `build_relay_swarm_with`
+  set a 60s idle-connection timeout and drop libp2p's default QUIC handshake timeout
+  from 5s to 3s (`QUIC_HANDSHAKE_TIMEOUT`) — a stale share link often carries several
+  dead addresses (an old LAN IP, a lapsed relay circuit) and each one otherwise burns a
+  full handshake timeout before the live path is tried.
 - **Multi-peer swarming** (`swarm::fetch_share_from_swarm`, `Node::download_share_multi`)
   — pulls one share from several sources at once. Queries each source's inventory,
   builds a per-chunk availability map, and schedules chunk requests **rarest-first**
@@ -184,7 +191,33 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   `gaggleshare1…` token in `AppState::minted_invite`. `App::subscribe(SubscribeRequest)`
   pulls a remote share into a `DiskChunkStore` under the download dir (so pause = abort,
   resume = top up), then `write_share`s the tree out. Progress rides
-  `Node::download_share_multi_with_progress` (`SwarmProgress` per chunk). Each
+  `Node::download_share_multi_with_progress` (`SwarmProgress` per chunk).
+  `SubscribeRequest` also carries `select: Option<Vec<String>>` (a strict subset of
+  manifest paths chosen in the pre-download picker — `swarm_config_for` feeds it to
+  `SwarmConfig::allowed_paths`, intersected with any invite `Scope`, so only those
+  files' chunk lists / chunks are ever requested and only those are written) and
+  `dest: Option<PathBuf>` (a per-transfer download-dir override). A selective
+  download is leech-only: it never partial-seeds and never `start_completed_seed`s
+  (re-indexing its subset yields a different manifest id than the origin's) —
+  `TransferRow::selected_files` is `Some(n)` for such a row so the GUI hides its
+  seed control. `App::preview_share(SubscribeRequest)` fetches just the manifest
+  (connecting + authenticating, resolving sources from the tracker when the request
+  has none — a discovered share) and lands
+  `AppState::share_preview: Option<PreviewStatus>` (`Loading` → `Ready(Box<SharePreview>)`
+  / `Failed`); `SharePreview` carries the file list (`PreviewFile { path, size }`),
+  total size, version and the originating request. `App::clear_preview()` drops it.
+  `App::verify_share(id)` runs an integrity-and-repair pass over a completed
+  subscription: `run_verify` re-chunks the output tree into a `MemoryChunkStore`,
+  finds which of the stored chunk lists' chunks the tree can no longer produce
+  (a corrupt or deleted file), and — if any — pulls just those files' chunks
+  (pinned to the subscription's own manifest id, `narrow_manifest: false`) and
+  `write_files`s exactly the failed files. A clean tree touches no network. It
+  reports through `TransferRow::{verifying, verify_result: Option<VerifyReport>}`
+  (`VerifyReport { healthy, checked_files, checked_bytes, repaired: Vec<String>,
+  error }`); progress rides `Command::VerifyProgress` as `detail` text only (the
+  row stays `Complete`, so no Pause control appears that would stop its seed), and
+  a repair that changed bytes on a currently-seeding sub restarts its completed
+  seed (the old `SourceChunkStore` would refuse the now-changed source files). Each
   running download/resync also feeds a `stats::EtaEstimator` (a ~60 s rolling
   window of `(time, bytes)` marks, kept on `Manager::eta`) whose average rate
   drives `TransferRow::eta_secs` — a deliberately steady "time left" for the GUI
@@ -250,6 +283,27 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   zstd-compressed (`manager::COMPRESS_REPLICA`). `App::benchmark()` measures
   sequential write throughput to the download volume plus free space (`statvfs` on
   unix) and suggests a role.
+  A NAS accelerator now **seeds while it replicates** and starts its shares
+  **concurrently**: `start_nas_accel` only spawns one long-lived pulling `Node`
+  (`AccelHandle::meta`, reused for every add + retry — no per-add swarm/UPnP
+  spin-up) and returns immediately with a `replicating` placeholder row per
+  share; `AcceleratorReady` then fires `Manager::kick_off_nas_shares`, which
+  `spawn_nas_add`s each carried share in parallel. `nas_replicate_seeding`
+  prunes wildcard `0.0.0.0`/`::` sources, does a short `quick_probe`
+  (`connect` + `fetch_manifest`, `QUICK_PROBE_TIMEOUT` 3s) and only falls back
+  to a NAT-rendezvous punch when that fails (was: punch always, up front), then
+  `net::accel::nas_seed_start` stands the serving `Node` up over the
+  still-empty `SharedChunkStore<DiskChunkStore>` replica and reports it via
+  `Command::AccelShareServing` *before* `net::accel::nas_seed_finish` drives the
+  pull — so the replica uploads what it holds from chunk one and answers
+  tracker announces / rendezvous punches (`Manager::tick` now folds
+  `accel.nas_nodes` into the punch-answer loop too) mid-fill.
+  `Command::AccelShareReplicated` clears the row's progress on completion;
+  `Command::{AccelShareFailed, AccelRetryShare}` record the error on the row and
+  retry the add with `accel_retry_backoff` (5s → 15s → 30s → 60s cap,
+  indefinitely) instead of leaving a dead error row. `Manager::refresh_accel_replica_chunks`
+  keeps `AcceleratorState::replica_chunks` (and `listen_addrs`) current as
+  shares land, since the roll-up is no longer known up front.
 **Remote, multi-share accelerators** — accelerators are no longer bound to one
 share, and can be driven remotely:
 
@@ -262,7 +316,14 @@ share, and can be driven remotely:
   nas_add_share}` are the per-share start helpers shared by the daemon and `app-state`;
   the `nas_*` ones take a `max_bytes: Option<u64>` storage-budget guard — when set they
   fetch the manifest first and error (before opening the `DiskChunkStore`) if the share
-  exceeds it.
+  exceeds it. `nas_add_share[_with_progress]` is now `nas_seed_start` + `nas_seed_finish`
+  under the hood: phase one connects/authenticates/budget-checks, opens the replica as a
+  `SharedChunkStore<DiskChunkStore>`, and stands the serving `Node` up over it straight
+  away; phase two drives the pull into that same store — so the replica serves the chunks
+  it holds while it is still filling. `app-state` drives the two phases itself (to grab
+  the node handle mid-fill for tracker announces); the daemon still calls the combined
+  helper. `nas_pull_with_progress` (plain pull, serve separately) stays for the
+  storage-budget test.
 - **Persistent identity** — `net::load_or_create_identity(path)` +
   `Node::spawn_*_with_identity` / `RelayNode::spawn_with_opts` keep a stable
   `PeerId` across restarts. `net::{keypair_from_seed, identity_seed}` derive
@@ -467,9 +528,25 @@ share, and can be driven remotely:
   (`Gaggle::show_directory`) that renders the directory with a per-row Download
   button (or a "joined" chip for shares already in the transfer list).
 
+- **Pre-download picker** (`gui`) — "Paste subscription link" and the directory's
+  "Download" button both go through `Gaggle::begin_preview` → `App::preview_share`
+  rather than subscribing straight away. `ui::views::subscribe_modal` (a `deferred`
+  overlay, same pattern as `confirm_modal`, gated on `Gaggle::sub_modal_open` +
+  `AppState::share_preview`) shows the share's collapsible checkbox file tree
+  (`tree_rows` generalized over a `TreeKind::{Invite, Subscribe}` — same fn the
+  invite picker uses), Select all / none, and an editable "Download into" field
+  (`Gaggle::sub_dest` + Browse). `sync_preview_selection` ticks everything by
+  default when a preview lands. `confirm_subscribe` sends a real `subscribe` with
+  `select = None` when everything is ticked (a normal whole-share download that can
+  seed) or `Some(sorted subset)` otherwise, and `dest` when the field differs from
+  `Settings::download_dir`. `Gaggle::{sub_sel, sub_sel_for, sub_tree_expanded}` back it.
+
 - **`gui`** — a gpui shell over `App`: Shares (add public / private folder, copy link,
   rescan, per-row ▸ panel with the invite form), Transfers (progress bars,
-  pause/resume/remove, check-updates/resync, `update vN` badge, per-row ▸ swarm
+  pause/resume/remove, check-updates/resync, **Verify & repair** on a completed
+  download — `App::verify_share`, with a `verifying` chip + a result line
+  (`✓ verified` / `repaired N file(s)` / `verify failed`)), `update vN` badge,
+  `N file(s)` chip for a selective download, per-row ▸ swarm
   inspector = per-source chunk/byte breakdown, plus a "Browse public shares"
   toggle listing the tracker's open directory with per-row Download), Accelerator (benchmark → suggested role
   → start relay / NAS → live status), Stats (download/upload `gpui_component::chart::LineChart`s
@@ -511,7 +588,12 @@ running download seeds the chunks it already has — the row reports `seeding` o
 its own address while still mid-flight, then the completed seed takes over**, **a
 real
 loopback transfer leaves the seeder with a non-zero-`up_bps` `stats.local` history and
-both ends with a growing sample count**. `app-state` unit
+both ends with a growing sample count**, **`preview_share` lists every file without
+pulling data, then a `select`ed subscribe writes only the chosen file (unselected
+files/folders absent), reports `selected_files: Some(1)`, and never seeds**, and
+**Verify & repair — a clean tree reports `healthy` with no network; corrupting a
+file on disk then re-verifying refetches and rewrites exactly that file
+(`repaired == ["cfg/game.ini"]`, tree byte-exact again)**. `app-state` unit
 tests cover `Settings`
 persistence, `ShareLink` round trips, name sanitizing, and `stats::{SpeedHistory,
 rate_from_cumulative, resample, EtaEstimator}` (capping, windowing, counter/clock resets; and that
@@ -566,8 +648,10 @@ node to `127.0.0.1` (`Node::spawn_with`/`spawn_serving_with` + a loopback-only
 same-host relay/dcutr test races against (and loses to) mDNS finding the peer
 directly, which is correct behavior in production but starves the relay path this
 test exists to cover. `crates/core/tests/snapshot.rs` adds a
-`sync_share` delta-apply test and an `index_dir` test (locations cover every chunk; a
-`SourceChunkStore` over them rebuilds the tree byte-for-byte). `store.rs` unit-tests
+`sync_share` delta-apply test, an `index_dir` test (locations cover every chunk; a
+`SourceChunkStore` over them rebuilds the tree byte-for-byte), and a `write_files`
+test (rebuilds only the named subset; a damaged sibling not in the set is left
+untouched; `only` entries the manifest doesn't list are ignored). `store.rs` unit-tests
 `SourceChunkStore` read-through + caching, its no-op `put`, and its refusal to serve a
 source file that changed after the scan; and `DiskChunkStore` zstd compression —
 a compressible chunk is stored `.zst` (footprint shrinks) while an incompressible
@@ -622,10 +706,26 @@ by a `build.rs` in `crates/gui` and `crates/launcher` (falls back to `2.0.unknow
 no git history).
 
 **Two release channels**, both driven by `.github/workflows/release.yml` (push to
-`main` *or* `beta`). Each push builds + zips `gaggle-gui` + `gaggle-launcher` for
+`main` *or* `beta`). Each push builds `gaggle-gui` + `gaggle-launcher` for
 linux-x86_64 / windows-x86_64 / macos-aarch64 / macos-x86_64 (the Intel macOS
 build is cross-compiled on the Apple Silicon runner — no x86_64 macOS runners
-exist), runs
+exist). Linux/Windows zip the two binaries flat as `gaggle-<platform>.zip`.
+**macOS** (`.github/scripts/package_macos.sh`) instead assembles a `Gaggle.app`
+bundle (`Contents/MacOS/{gaggle-launcher,gaggle-gui}` + generated `Info.plist` +
+an `AppIcon.icns` built from `crates/launcher/assets/icon-1024.png` via
+`iconutil`), Developer-ID-signs it with a hardened runtime, notarizes + staples
+it, then emits **two** assets: `gaggle-<platform>.zip` (a `ditto` archive of the
+signed bundle — the auto-update payload, same name the descriptor expects) and
+`Gaggle-<platform>.dmg` (the human download — drag `Gaggle.app` to the
+`/Applications` symlink). Signing needs `MACOS_CERT_P12_BASE64` +
+`MACOS_CERT_PASSWORD` (Developer ID Application cert); notarization needs
+`APPLE_API_KEY_ID` + `APPLE_API_ISSUER_ID` + `APPLE_API_KEY_P8_BASE64` (App
+Store Connect API key). Both are **optional** — a missing cert falls back to
+ad-hoc `codesign -s -`, a missing key skips notarization (user does
+right-click → Open once); the release still ships. How to produce all five
+secrets on Linux (no Mac needed) is in `notes/macos-signing.md` (git-ignored,
+like `notes/plan.md` — read it, don't rely on it being present for others).
+Then runs
 `.github/scripts/make_latest.py <version> <tag> <channel> dist` to compose `latest.json`,
 then `.github/scripts/sign_latest.py dist/latest.json` to write `latest.json.sig`
 (a detached Ed25519 signature over `"gaggle-release-descriptor-v1\n" || latest.json`,
@@ -664,21 +764,41 @@ or `gaggle-launcher --channel beta` (remembered) / `$GAGGLE_UPDATE_CHANNEL`.
 records the installed version **and** channel, so flipping channels always shows an
 update. Branch setup: `git branch beta main && git push -u origin beta` once `main` exists.
 
-**Native install (`crates/launcher/src/desktop.rs`)** — on every install/update the
-launcher creates OS-native shortcuts that point at itself (`paths::installed_launcher()`),
-so opening the app from a shortcut always re-checks for updates first: a Linux
-`~/.local/share/applications/gaggle.desktop` apps-menu entry, a Windows Start Menu
-`.lnk` (built via PowerShell's `WScript.Shell` COM object, no extra crate), and a real
-`~/Applications/Gaggle.app` bundle on macOS (a small shim executable + `Info.plist` +
-`.icns`, so the bundle survives self-updates without re-bundling). The apps-menu / Start
-Menu entry is always created; a desktop shortcut is opt-in (`Updater::set_desktop_shortcut`,
-a checkbox in the launcher window, or `gaggle-launcher --desktop-shortcut`). Icons are the
-Gaggle goose mark under `crates/launcher/assets/` (`icon.{svg,png,ico,icns}`, traced from
-`logo.jpg`; `include_bytes!`'d so the *standalone* launcher binary can create shortcuts
-with no zip alongside it). `gaggle-launcher run` (the default, e.g. from a shortcut) silently hands off
-straight to the installed GUI — no window — when it's already the latest version, or when
-the update check fails but something is installed (`updater::wants_auto_launch`, pure and
-unit-tested); otherwise it opens the window as before.
+**Install shapes.** The launcher has two, picked at runtime by
+`paths::macos_bundle_root()` (is `current_exe()` inside a `*.app/Contents/MacOS`?):
+
+- **macOS `.dmg`** — the `Gaggle.app` from the DMG *is* the install. `gaggle-gui`
+  lives beside `gaggle-launcher` inside the bundle; `paths::gui_binary()` resolves
+  there. A self-update (`updater::install_macos_bundle`) downloads the
+  `gaggle-<platform>.zip` (a signed bundle), extracts it with `/usr/bin/ditto`
+  (structure + signature intact), and swaps `Gaggle.app` in place — move-aside,
+  move-in, delete-old (best-effort; a still-mapped old bundle is swept next
+  update). No data-dir install, no shortcuts. Needs write permission on the
+  bundle's folder — `/Applications` is fine for an admin user; otherwise the
+  update errors with a "move Gaggle somewhere you own" hint. On the silent
+  hand-off path `main::run` **execs** `gaggle-gui` in place (one PID, one dock
+  tile, the bundle's icon/name). Before the first self-update writes
+  `installed.json`, `installed_record()` falls back to the bundle's
+  `CFBundleShortVersionString` so a freshly-dragged app isn't treated as "not
+  installed".
+- **everything else** (Linux, Windows, or a bare `gaggle-launcher` binary run on
+  macOS) — `crates/launcher/src/desktop.rs`: the launcher downloads `gaggle-gui`
+  into `paths::install_dir()` and creates OS-native shortcuts pointing at its own
+  installed copy (`paths::installed_launcher()`) so every open re-checks for
+  updates: a Linux `~/.local/share/applications/gaggle.desktop` entry, a Windows
+  Start Menu `.lnk` (PowerShell `WScript.Shell` COM, no crate), and on bare-binary
+  macOS a small `~/Applications/Gaggle.app` shim around the standalone launcher.
+  The apps-menu / Start Menu entry is always created; a desktop shortcut is opt-in
+  (`Updater::set_desktop_shortcut`, a launcher-window checkbox, or
+  `--desktop-shortcut`).
+
+Icons: the Gaggle goose mark under `crates/launcher/assets/` — `icon.svg` is the
+source (warm-white goose on the brand rounded-square tile), `icon.{png,ico,icns}`
++ `icon-1024.png` rasterized from it, all `include_bytes!`'d so the standalone
+launcher works with no zip alongside it. `gaggle-launcher run` (the default)
+silently hands off to the GUI — no window — when already current, or when the
+check fails but something is installed (`updater::wants_auto_launch`, pure and
+unit-tested); otherwise it opens the window.
 
 **Headless accelerator auto-update (`crates/accelerator-launcher`, binary
 `gaggle-accelerator-launcher`)** — the headless, automatic counterpart of `launcher`, for

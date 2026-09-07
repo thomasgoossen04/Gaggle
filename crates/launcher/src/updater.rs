@@ -114,8 +114,33 @@ pub fn decide(
     }
 }
 
-/// The `installed.json` record, if the GUI has been installed.
+/// What version + channel is installed, if any.
+///
+/// Normally read from `installed.json` (written by the last install/update). On
+/// macOS a `.dmg` install ships the GUI *inside* `Gaggle.app` before any
+/// self-update has run, so fall back to the bundle's own `Info.plist` version —
+/// otherwise a freshly-dragged app would report "not installed" and make the
+/// user download a copy of what they already have.
 pub fn installed_record() -> Option<Installed> {
+    if let Some(rec) = read_installed_json() {
+        return Some(rec);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let app = paths::macos_bundle_root()?;
+        if app.join("Contents/MacOS/gaggle-gui").exists() {
+            return Some(Installed {
+                version: paths::macos_bundle_version()?,
+                // Align with the channel we're tracking so `decide` doesn't
+                // spuriously flag an update on first run.
+                channel: crate::channel::load().as_str().to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn read_installed_json() -> Option<Installed> {
     let raw = std::fs::read_to_string(paths::installed_json().ok()?).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some(Installed {
@@ -273,6 +298,18 @@ impl Updater {
 
         let archive = self.download_verify(&asset)?;
         self.set(Status::Installing);
+
+        // macOS `.dmg` install: the update payload is a signed `Gaggle.app`;
+        // swap our own bundle in place. No data-dir install, no shortcuts —
+        // the bundle *is* the install.
+        #[cfg(target_os = "macos")]
+        if let Some(app) = paths::macos_bundle_root() {
+            let res = install_macos_bundle(&archive, &app, &m.version, self.channel);
+            let _ = std::fs::remove_file(&archive);
+            res?;
+            return Ok(m.version);
+        }
+
         let res = install_archive(&archive, &m.version, self.channel);
         let _ = std::fs::remove_file(&archive);
         res?;
@@ -381,6 +418,119 @@ fn verify_sha(expected: &str, got: &str) -> Result<()> {
         bail!("sha256 mismatch: expected {expected}, got {got}");
     }
     Ok(())
+}
+
+/// Replace the running `Gaggle.app` with the one inside `zip_path` (the macOS
+/// auto-update payload — a `ditto` archive of a signed, stapled bundle).
+///
+/// Extraction is delegated to `/usr/bin/ditto` so the bundle's structure,
+/// permissions, symlinks and code signature come through byte-exact. The swap
+/// is a move-aside / move-in-place / delete-old dance on one volume; on failure
+/// the old bundle is put back so the user is never left with no app.
+#[cfg(target_os = "macos")]
+fn install_macos_bundle(
+    zip_path: &Path,
+    current_app: &Path,
+    version: &str,
+    channel: Channel,
+) -> Result<()> {
+    use std::process::Command;
+
+    let parent = current_app
+        .parent()
+        .context("the running Gaggle.app has no parent directory")?;
+
+    // Sweep any orphaned backups from a previous update whose old bundle
+    // couldn't be deleted while this launcher was still mapped from it.
+    if let Ok(rd) = std::fs::read_dir(parent) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with("Gaggle.app.old-") {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+
+    let staging = parent.join(".gaggle-update-staging");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("create {}", staging.display()))?;
+
+    let extracted = Command::new("/usr/bin/ditto")
+        .arg("-x")
+        .arg("-k")
+        .arg(zip_path)
+        .arg(&staging)
+        .status()
+        .context("run /usr/bin/ditto")?
+        .success();
+    if !extracted {
+        let _ = std::fs::remove_dir_all(&staging);
+        bail!("ditto could not extract the update archive");
+    }
+
+    let new_app = find_app_bundle(&staging).ok_or_else(|| {
+        let _ = std::fs::remove_dir_all(&staging);
+        anyhow!("the update archive did not contain a .app bundle")
+    })?;
+
+    // An update we fetched over TLS and checked against a signed SHA-256 must
+    // not trip Gatekeeper on relaunch.
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&new_app)
+        .status();
+
+    let backup = parent.join(format!("Gaggle.app.old-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&backup);
+    std::fs::rename(current_app, &backup).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        writable_hint(current_app, e)
+    })?;
+    if let Err(e) = std::fs::rename(&new_app, current_app) {
+        let _ = std::fs::rename(&backup, current_app); // roll back
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(anyhow!(
+            "move the new bundle into {}: {e}",
+            current_app.display()
+        ));
+    }
+
+    // Best-effort: our own binary may still be mapped from `backup`; a leftover
+    // is swept on the next update.
+    let _ = std::fs::remove_dir_all(&backup);
+    let _ = std::fs::remove_dir_all(&staging);
+
+    write_installed_json(version, channel)?;
+    Ok(())
+}
+
+/// Turn a bare `EPERM`/`EACCES` from the bundle swap into something actionable.
+#[cfg(target_os = "macos")]
+fn writable_hint(app: &Path, e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow!(
+            "can't update {} without permission to write its folder — move Gaggle \
+             to a location you own (or re-download it) and try again",
+            app.display()
+        )
+    } else {
+        anyhow!("move {} aside: {e}", app.display())
+    }
+}
+
+/// The first `*.app` directory at the top level of `dir` (a `ditto`-extracted
+/// update archive holds exactly one, normally `Gaggle.app`).
+#[cfg(target_os = "macos")]
+fn find_app_bundle(dir: &Path) -> Option<PathBuf> {
+    let direct = dir.join("Gaggle.app");
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let p = e.path();
+        (p.is_dir() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("app")))
+            .then_some(p)
+    })
 }
 
 /// Install `zip_path` into [`paths::install_dir`] and record version + channel.
@@ -655,5 +805,18 @@ mod tests {
         assert_eq!(m.channel, "beta");
         let back = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<Manifest>(&back).unwrap(), m);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_app_bundle_picks_the_dot_app_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(find_app_bundle(tmp.path()).is_none());
+        std::fs::create_dir_all(tmp.path().join("Gaggle.app/Contents/MacOS")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("__MACOSX")).unwrap();
+        assert_eq!(
+            find_app_bundle(tmp.path()),
+            Some(tmp.path().join("Gaggle.app"))
+        );
     }
 }

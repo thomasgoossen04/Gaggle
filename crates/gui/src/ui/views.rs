@@ -7,7 +7,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use app_state::{
     AccelShareRow, AcceleratorRole, AcceleratorState, DiscoveredShare, LauncherChannel, LogLevel,
-    RemoteAccelState, SourceStats, SpeedSample, Theme, TransferKind, TransferRow, TransferStatus,
+    PreviewStatus, RemoteAccelState, SourceStats, SpeedSample, Theme, TransferKind, TransferRow,
+    TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -213,6 +214,31 @@ fn seed_detail(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> Any
     panel.into_any_element()
 }
 
+/// Which checkbox tree is being drawn — selects the backing selection /
+/// expansion sets and the click handlers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TreeKind {
+    /// A private seed's invite file-picker (`app.invite_sel` / `tree_expanded`).
+    Invite,
+    /// The pre-download picker (`app.sub_sel` / `sub_tree_expanded`).
+    Subscribe,
+}
+
+impl TreeKind {
+    fn selected(self, app: &Gaggle) -> &std::collections::HashSet<String> {
+        match self {
+            TreeKind::Invite => &app.invite_sel,
+            TreeKind::Subscribe => &app.sub_sel,
+        }
+    }
+    fn expanded(self, app: &Gaggle) -> &std::collections::HashSet<String> {
+        match self {
+            TreeKind::Invite => &app.tree_expanded,
+            TreeKind::Subscribe => &app.sub_tree_expanded,
+        }
+    }
+}
+
 /// The invite's file/folder picker: a collapsible tree of checkboxes over the
 /// seed's manifest paths.
 fn invite_tree(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> AnyElement {
@@ -238,21 +264,24 @@ fn invite_tree(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> Any
         .border_color(t.line)
         .flex()
         .flex_col()
-        .children(tree_rows(&row.file_paths, "", 0, app, cx))
+        .children(tree_rows(&row.file_paths, "", 0, TreeKind::Invite, app, cx))
         .into_any_element()
 }
 
 /// Rows for the children of `prefix` (`""` = root), recursing into expanded
-/// folders. `files` is the sorted manifest path list.
+/// folders. `files` is the sorted manifest path list; `kind` picks which
+/// selection set and handlers to wire.
 fn tree_rows(
     files: &[String],
     prefix: &str,
     depth: usize,
+    kind: TreeKind,
     app: &Gaggle,
     cx: &mut Context<Gaggle>,
 ) -> Vec<AnyElement> {
     let t = theme::active();
     let indent = px(depth as f32 * 14.0);
+    let selected = kind.selected(app);
 
     let mut dirs: Vec<String> = Vec::new();
     let mut here: Vec<&String> = Vec::new();
@@ -281,7 +310,7 @@ fn tree_rows(
             .iter()
             .filter(|p| p.starts_with(&child_prefix))
             .fold((0usize, 0usize), |(s, n), p| {
-                (s + usize::from(app.invite_sel.contains(p)), n + 1)
+                (s + usize::from(selected.contains(p)), n + 1)
             });
         let state = if total == 0 || sel == 0 {
             Tri::Off
@@ -290,7 +319,7 @@ fn tree_rows(
         } else {
             Tri::Partial
         };
-        let open = app.tree_expanded.contains(&dir);
+        let open = kind.expanded(app).contains(&dir);
         let name = dir.rsplit('/').next().unwrap_or(&dir).to_string();
 
         out.push(
@@ -310,7 +339,10 @@ fn tree_rows(
                         .child(if open { "▾" } else { "▸" })
                         .on_click(cx.listener({
                             let d = dir.clone();
-                            move |this, _: &ClickEvent, _, cx| this.toggle_tree_dir(d.clone(), cx)
+                            move |this, _: &ClickEvent, _, cx| match kind {
+                                TreeKind::Invite => this.toggle_tree_dir(d.clone(), cx),
+                                TreeKind::Subscribe => this.toggle_sub_tree_dir(d.clone(), cx),
+                            }
                         })),
                 )
                 .child(
@@ -320,7 +352,10 @@ fn tree_rows(
                         .child(checkmark(state))
                         .on_click(cx.listener({
                             let d = dir.clone();
-                            move |this, _: &ClickEvent, _, cx| this.toggle_invite_dir(d.clone(), cx)
+                            move |this, _: &ClickEvent, _, cx| match kind {
+                                TreeKind::Invite => this.toggle_invite_dir(d.clone(), cx),
+                                TreeKind::Subscribe => this.toggle_sub_dir(d.clone(), cx),
+                            }
                         })),
                 )
                 .child(
@@ -334,12 +369,12 @@ fn tree_rows(
         );
 
         if open {
-            out.extend(tree_rows(files, &child_prefix, depth + 1, app, cx));
+            out.extend(tree_rows(files, &child_prefix, depth + 1, kind, app, cx));
         }
     }
 
     for f in here {
-        let on = app.invite_sel.contains(f);
+        let on = selected.contains(f);
         let name = f.rsplit('/').next().unwrap_or(f).to_string();
         out.push(
             div()
@@ -356,7 +391,10 @@ fn tree_rows(
                         .child(checkmark(if on { Tri::On } else { Tri::Off }))
                         .on_click(cx.listener({
                             let p = f.clone();
-                            move |this, _: &ClickEvent, _, cx| this.toggle_invite_file(p.clone(), cx)
+                            move |this, _: &ClickEvent, _, cx| match kind {
+                                TreeKind::Invite => this.toggle_invite_file(p.clone(), cx),
+                                TreeKind::Subscribe => this.toggle_sub_file(p.clone(), cx),
+                            }
                         })),
                 )
                 .child(
@@ -382,7 +420,9 @@ pub fn transfers(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
             .gap_2()
             .child(
                 btn("paste-sub", "Paste subscription link").on_click(
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.paste_subscription(cx)),
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.paste_subscription(window, cx)
+                    }),
                 ),
             )
             .child(
@@ -474,8 +514,8 @@ fn directory_panel(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                     chip("joined", t.good).into_any_element()
                 } else {
                     btn(("dir-join", i), "Download")
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.join_discovered(id, name.clone(), cx)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.join_discovered(id, name.clone(), window, cx)
                         }))
                         .into_any_element()
                 }),
@@ -535,7 +575,11 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                         .child(expand_caret(id, open, cx))
                         .child(div().font_weight(FontWeight::SEMIBOLD).child(row.name.clone()))
                         .child(chip(&format!("v{}", row.version.max(1)), t.muted))
+                        .when_some(row.selected_files, |el, n| {
+                            el.child(chip(&format!("{n} file(s)"), t.info))
+                        })
                         .when(row.seeding, |el| el.child(chip("seeding", t.good)))
+                        .when(row.verifying, |el| el.child(chip("verifying", t.info)))
                         .when_some(row.update_available, |el, v| {
                             el.child(chip(&format!("update v{v}"), t.info))
                         }),
@@ -543,7 +587,7 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                 .child(status_pill(row.status)),
         )
         .when_some(
-            (row.status == TransferStatus::Connecting)
+            (row.status == TransferStatus::Connecting || row.verifying)
                 .then(|| row.detail.clone())
                 .flatten(),
             |el, detail| {
@@ -566,6 +610,16 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                     .text_color(t.bad)
                     .child(format!("!! {e}")),
             )
+        })
+        .when_some(row.verify_result.clone(), |el, r| {
+            let (color, text) = if let Some(e) = &r.error {
+                (t.bad, format!("verify failed: {e}"))
+            } else if r.repaired.is_empty() {
+                (t.good, format!("✓ verified — {} file(s), {} OK", r.checked_files, human_bytes(r.checked_bytes)))
+            } else {
+                (t.info, format!("repaired {} file(s): {}", r.repaired.len(), r.repaired.join(", ")))
+            };
+            el.child(div().text_xs().font_family(theme::MONO).text_color(color).child(text))
         })
         .child(
             div()
@@ -603,7 +657,8 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                 })
                 .when(
                     row.status == TransferStatus::Complete
-                        && row.kind == TransferKind::Downloading,
+                        && row.kind == TransferKind::Downloading
+                        && row.selected_files.is_none(),
                     |el| {
                         let label = if row.seeding { "Pause seeding" } else { "Start seeding" };
                         el.child(btn(("seedtog", id as usize), label).on_click(cx.listener(
@@ -623,6 +678,21 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                         move |this, _: &ClickEvent, _, cx| this.check_updates(id, cx),
                     )))
                 })
+                .when(
+                    row.kind == TransferKind::Downloading
+                        && (row.status == TransferStatus::Complete || row.verifying),
+                    |el| {
+                        if row.verifying {
+                            el.child(btn(("vrf", id as usize), "Verifying…"))
+                        } else {
+                            el.child(btn(("vrf", id as usize), "Verify & repair").on_click(
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.verify_share(id, cx)
+                                }),
+                            ))
+                        }
+                    },
+                )
                 .when(row.update_available.is_some(), |el| {
                     el.child(primary_btn(("resync", id as usize), "Resync").on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| this.resync(id, cx),
@@ -1768,6 +1838,164 @@ pub fn confirm_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElemen
                 this.confirm_go(false, cx);
             }
         }))
+        .child(card);
+
+    Some(deferred(overlay).into_any_element())
+}
+
+/// The pre-download picker: choose which files to pull and where to put them,
+/// shown on top of everything while `app.sub_modal_open` and a
+/// `state.share_preview` are both set. Modelled on [`confirm_modal`].
+pub fn subscribe_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElement> {
+    if !app.sub_modal_open {
+        return None;
+    }
+    let t = theme::active();
+    let preview = app.state.share_preview.as_ref()?;
+
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_4()
+        .w(px(560.0))
+        .max_w(relative(0.94))
+        .max_h(relative(0.9))
+        .bg(t.panel)
+        .border_1()
+        .border_color(t.accent)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+    match preview {
+        PreviewStatus::Loading { name } => {
+            card = card
+                .child(section_title(&format!("Download “{name}”")))
+                .child(hint("Fetching the share's file list…"))
+                .child(
+                    div().flex().w_full().gap_2().justify_end().child(
+                        btn("sub-cancel", "Cancel").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_subscribe(cx)),
+                        ),
+                    ),
+                );
+        }
+        PreviewStatus::Failed { name, error } => {
+            card = card
+                .child(section_title(&format!("Download “{name}”")))
+                .child(
+                    div()
+                        .w_full()
+                        .text_xs()
+                        .font_family(theme::MONO)
+                        .text_color(t.bad)
+                        .child(format!("Couldn't read this share: {error}")),
+                )
+                .child(
+                    div().flex().w_full().gap_2().justify_end().child(
+                        btn("sub-cancel", "Close").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_subscribe(cx)),
+                        ),
+                    ),
+                );
+        }
+        PreviewStatus::Ready(p) => {
+            let paths: Vec<String> = p.files.iter().map(|f| f.path.clone()).collect();
+            let sel_count = app.sub_sel.len();
+            let sel_bytes: u64 =
+                p.files.iter().filter(|f| app.sub_sel.contains(&f.path)).map(|f| f.size).sum();
+            let all = sel_count == p.files.len();
+            let summary = format!(
+                "{} of {} files · {} of {}",
+                sel_count,
+                p.files.len(),
+                human_bytes(sel_bytes),
+                human_bytes(p.total_bytes),
+            );
+
+            let tree: AnyElement = if p.files.is_empty() {
+                hint("This share has no files.").into_any_element()
+            } else if p.files.len() > 4000 {
+                hint(&format!(
+                    "{} files — too many to list; the whole share will be downloaded.",
+                    p.files.len()
+                ))
+                .into_any_element()
+            } else {
+                div()
+                    .id("sub-tree")
+                    .max_h(px(300.0))
+                    .overflow_y_scroll()
+                    .p_1()
+                    .border_1()
+                    .border_color(t.line)
+                    .flex()
+                    .flex_col()
+                    .children(tree_rows(&paths, "", 0, TreeKind::Subscribe, app, cx))
+                    .into_any_element()
+            };
+
+            card = card
+                .child(section_title(&format!("Download “{}”", p.name)))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family(theme::MONO)
+                        .text_color(t.muted)
+                        .child(summary),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(btn("sub-all", "Select all").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.sub_select_all(cx)),
+                        ))
+                        .child(btn("sub-none", "Select none").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.sub_select_none(cx)),
+                        )),
+                )
+                .child(tree)
+                .child(field_suffixed(
+                    "Download into",
+                    &app.sub_dest,
+                    suffix_btn("browse-sub-dest", "Browse").on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.browse_sub_dest(window, cx),
+                    )),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .gap_2()
+                        .justify_end()
+                        .child(btn("sub-cancel", "Cancel").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_subscribe(cx)),
+                        ))
+                        .child(
+                            primary_btn(
+                                "sub-go",
+                                if all { "Download all" } else { "Download selected" },
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.confirm_subscribe(cx)
+                            })),
+                        ),
+                );
+        }
+    }
+
+    let overlay = div()
+        .id("subscribe-overlay")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(hsla(0.0, 0.0, 0.0, 0.55))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.cancel_subscribe(cx)),
+        )
         .child(card);
 
     Some(deferred(overlay).into_any_element())

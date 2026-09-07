@@ -128,6 +128,35 @@ pub struct TransferRow {
     /// steady enough to show as a countdown. `None` before there is enough
     /// history, or whenever the row is not actively downloading.
     pub eta_secs: Option<u64>,
+    /// Download only: `Some(n)` when the subscription pulls a *strict subset* of
+    /// `n` files chosen in the pre-download picker, `None` for a whole-share
+    /// download. A partial download never seeds back (its file set hashes to a
+    /// different manifest id than the origin's), so the row's seed control is
+    /// hidden.
+    pub selected_files: Option<usize>,
+    /// Completed download only: `true` while a
+    /// [`verify_share`](crate::App::verify_share) integrity pass is running.
+    pub verifying: bool,
+    /// Completed download only: the outcome of the last
+    /// [`verify_share`](crate::App::verify_share).
+    pub verify_result: Option<VerifyReport>,
+}
+
+/// Outcome of a [`verify_share`](crate::App::verify_share) integrity pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// `true` when every checked file already matched the manifest and nothing
+    /// had to be refetched.
+    pub healthy: bool,
+    /// Files whose bytes were checked against the manifest.
+    pub checked_files: usize,
+    /// Total size of the checked files, bytes.
+    pub checked_bytes: u64,
+    /// Manifest paths that failed the check and were rebuilt from the swarm.
+    pub repaired: Vec<String>,
+    /// Set when the pass could not finish (e.g. a damaged file but no source
+    /// still serving this version). The on-disk tree is left as it was found.
+    pub error: Option<String>,
 }
 
 impl TransferRow {
@@ -308,6 +337,46 @@ pub struct MintedInvite {
     pub token: String,
 }
 
+/// One file offered in the pre-download picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewFile {
+    /// `/`-separated manifest path.
+    pub path: String,
+    pub size: u64,
+}
+
+/// A remote share's contents, fetched by
+/// [`App::preview_share`](crate::App::preview_share) so the GUI can show a
+/// file/destination picker before the download starts. Carries the originating
+/// [`SubscribeRequest`](crate::SubscribeRequest) so the picker can complete it
+/// with a file selection and destination.
+#[derive(Debug, Clone)]
+pub struct SharePreview {
+    pub name: String,
+    pub manifest_id: Hash,
+    pub version: u64,
+    /// Sum of every file's size — the whole-share download size.
+    pub total_bytes: u64,
+    /// Every file in the share, manifest order.
+    pub files: Vec<PreviewFile>,
+    /// Every directory in the share (so empty ones show in the tree).
+    pub dirs: Vec<String>,
+    /// The request this preview was fetched for, minus any selection.
+    pub request: crate::SubscribeRequest,
+}
+
+/// State of the pre-download share preview — see
+/// [`AppState::share_preview`].
+#[derive(Debug, Clone)]
+pub enum PreviewStatus {
+    /// A preview fetch is in flight for a share displayed as `name`.
+    Loading { name: String },
+    /// The share's contents are ready to show in the picker.
+    Ready(Box<SharePreview>),
+    /// The preview fetch failed (no reachable source, auth rejected, …).
+    Failed { name: String, error: String },
+}
+
 /// The whole observable app state. The GUI holds one of these and replaces it
 /// wholesale whenever [`App`](crate::App) signals a change.
 #[derive(Debug, Clone, Default)]
@@ -334,6 +403,10 @@ pub struct AppState {
     /// [`App::refresh_directory`](crate::App::refresh_directory). Empty until
     /// asked for, and when no `rendezvous_url` is set.
     pub discovered_shares: Vec<DiscoveredShare>,
+    /// The pending pre-download share preview, if any — set by
+    /// [`App::preview_share`](crate::App::preview_share), cleared by
+    /// [`App::clear_preview`](crate::App::clear_preview).
+    pub share_preview: Option<PreviewStatus>,
 }
 
 impl AppState {

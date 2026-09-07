@@ -62,8 +62,8 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} -p gui -p launcher -p accelerator -p accelerator-launcher
 
-      - name: Package (unix)
-        if: matrix.os != 'windows-latest'
+      - name: Package (linux)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           set -euo pipefail
           BIN="target/${{ matrix.target }}/release"
@@ -89,6 +89,42 @@ jobs:
           ACCEL_LAUNCHER="dist/gaggle-accelerator-launcher-${{ matrix.name }}"
           cp "$BIN/gaggle-accelerator-launcher" "$ACCEL_LAUNCHER"
           shasum -a 256 "$ACCEL_LAUNCHER" | awk '{print $1}' > "$ACCEL_LAUNCHER.sha256"
+
+      - name: Package (macOS) — Gaggle.app + .dmg + auto-update zip
+        if: startsWith(matrix.name, 'macos')
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          # The release descriptor's `version` string (2.0.<hash>, +`-beta` on
+          # the beta branch) — CFBundleShortVersionString must match it so a
+          # fresh .dmg install compares equal in `updater::decide`.
+          HASH="$(git rev-parse --short=7 HEAD)"
+          if [ "${{ github.ref_name }}" = "beta" ]; then
+            VERSION="2.0.${HASH}-beta"
+          else
+            VERSION="2.0.${HASH}"
+          fi
+
+          chmod +x .github/scripts/package_macos.sh
+          .github/scripts/package_macos.sh \
+            "${{ matrix.target }}" "${{ matrix.name }}" "$VERSION" "${{ github.run_number }}"
+
+          # Standalone binaries, same as the other platforms: the launcher on
+          # its own (the "no .dmg" path), the headless accelerator daemon, and
+          # its auto-updating launcher.
+          BIN="target/${{ matrix.target }}/release"
+          for pair in "gaggle-launcher:gaggle-launcher-${{ matrix.name }}" \
+                      "accelerator:gaggle-accelerator-${{ matrix.name }}" \
+                      "gaggle-accelerator-launcher:gaggle-accelerator-launcher-${{ matrix.name }}"; do
+            src="${pair%%:*}"; dst="dist/${pair##*:}"
+            cp "$BIN/$src" "$dst"
+            shasum -a 256 "$dst" | awk '{print $1}' > "$dst.sha256"
+          done
 
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
@@ -195,6 +231,8 @@ jobs:
           files: |
             dist/*.zip
             dist/*.zip.sha256
+            dist/*.dmg
+            dist/*.dmg.sha256
             dist/gaggle-launcher-*
             dist/gaggle-accelerator-*
             dist/latest.json

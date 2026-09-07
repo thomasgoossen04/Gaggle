@@ -28,7 +28,8 @@ pub use reach::ReachLink;
 pub use settings::{RemoteAccelerator, Settings, Theme};
 pub use state::{
     AccelStatsRow, AcceleratorRole, AcceleratorState, AccelShareRow, AppState, BenchmarkResult,
-    DiscoveredShare, MintedInvite, RemoteAccelState, SourceStats, StatsSnapshot, SwarmStatus,
-    TransferId, TransferKind, TransferRow, TransferStatus,
+    DiscoveredShare, MintedInvite, PreviewFile, PreviewStatus, RemoteAccelState, SharePreview,
+    SourceStats, StatsSnapshot, SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
+    VerifyReport,
 };
 pub use stats::{EtaEstimator, SpeedHistory, SpeedSample, resample};

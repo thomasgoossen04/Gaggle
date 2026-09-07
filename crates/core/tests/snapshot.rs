@@ -1,12 +1,13 @@
 //! End-to-end: folder on disk -> chunks -> Merkle roots -> manifest,
 //! with a deduping store underneath.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
 use gaggle_core::{
     DiskChunkStore, Manifest, MemoryChunkStore, ScanProgress, SourceChunkStore, index_dir,
-    index_dir_with_progress, snapshot_dir, sync_share, write_share,
+    index_dir_with_progress, snapshot_dir, sync_share, write_files, write_share,
 };
 
 /// Deterministic pseudo-random bytes (splitmix64).
@@ -288,4 +289,44 @@ fn index_dir_with_progress_reports_stable_totals_and_ends_complete() {
     assert_eq!(last.files_done, 3);
     assert_eq!(last.bytes_done, bytes_total);
     assert_eq!(last.bytes_done, idx.manifest.files.iter().map(|f| f.size).sum::<u64>());
+}
+
+#[test]
+fn write_files_rebuilds_only_the_named_subset() {
+    let src = tempfile::tempdir().unwrap();
+    write(src.path(), "keep.bin", &pattern(400 * 1024, 10));
+    write(src.path(), "sub/dir/a.bin", &pattern(300 * 1024, 11));
+    write(src.path(), "sub/dir/b.bin", &pattern(250 * 1024, 12));
+
+    let mut store = MemoryChunkStore::new();
+    let snap = snapshot_dir(src.path(), "share", 1, &mut store).unwrap();
+
+    // Fully materialize, then damage two files: one truncated, one deleted.
+    let out = tempfile::tempdir().unwrap();
+    write_share(out.path(), &snap.manifest, &snap.chunk_lists, &store).unwrap();
+    fs::write(out.path().join("sub/dir/a.bin"), b"corrupt").unwrap();
+    fs::remove_file(out.path().join("keep.bin")).unwrap();
+
+    // Repair only "sub/dir/a.bin".
+    let only: BTreeSet<String> = ["sub/dir/a.bin".to_string()].into_iter().collect();
+    let rebuilt = write_files(out.path(), &snap.manifest, &snap.chunk_lists, &store, &only).unwrap();
+    assert_eq!(rebuilt, vec!["sub/dir/a.bin".to_string()]);
+
+    // The named file is byte-exact again; the other damaged file is left as-is.
+    assert_eq!(
+        fs::read(out.path().join("sub/dir/a.bin")).unwrap(),
+        fs::read(src.path().join("sub/dir/a.bin")).unwrap()
+    );
+    assert!(!out.path().join("keep.bin").exists(), "a file not in `only` is not touched");
+    // An untouched-and-intact sibling is still fine.
+    assert_eq!(
+        fs::read(out.path().join("sub/dir/b.bin")).unwrap(),
+        fs::read(src.path().join("sub/dir/b.bin")).unwrap()
+    );
+
+    // Entries of `only` the manifest doesn't list are silently ignored.
+    let bogus: BTreeSet<String> = ["nope.bin".to_string()].into_iter().collect();
+    assert!(
+        write_files(out.path(), &snap.manifest, &snap.chunk_lists, &store, &bogus).unwrap().is_empty()
+    );
 }

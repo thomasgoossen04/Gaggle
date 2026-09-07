@@ -7,7 +7,7 @@
 //! [`App::snapshot`], and optionally listens on [`App::events`]. All the async
 //! lives here.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,11 +15,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use control_plane::{AdminClient, PeerInfo, RendezvousClient, TrackerClient};
 use gaggle_core::{
-    AgentId, AgentKeypair, ChunkList, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
+    AgentId, AgentKeypair, ChunkList, ChunkStore, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
     ScanProgress, SharedChunkStore, SignedCapability, SourceChunkStore, SyncOutcome,
-    index_dir_with_progress, snapshot_dir, sync_share, write_share,
+    index_dir_with_progress, snapshot_dir, sync_share, write_files, write_share,
 };
-use net::accel::{nas_pull_with_progress, nas_serve, relay_add_share};
+use net::accel::{NasSeedStart, nas_seed_finish, nas_seed_start, relay_add_share};
 use net::{
     CacheStats, Capability, Catalog, Invite, Keypair, Multiaddr, Node, PeerId, RelayConfig,
     RelayNode, Scope, ShareKeypair, ShareLink, SharePublicKey, SwarmConfig, SwarmProgress,
@@ -70,6 +70,18 @@ pub struct SubscribeRequest {
     pub sources: Vec<Multiaddr>,
     /// Capability token for a private share.
     pub credential: Option<SignedCapability>,
+    /// `/`-separated manifest paths to pull, chosen in the pre-download picker.
+    /// `None` downloads the whole share; `Some(paths)` a strict subset — only
+    /// those files' chunk lists and chunks are ever requested, and only those
+    /// files are written to disk. Intersected with any invite [`Scope`].
+    #[serde(default)]
+    pub select: Option<Vec<String>>,
+    /// Parent directory to download into, overriding
+    /// [`Settings::download_dir`](crate::Settings::download_dir). The share's
+    /// folder is created as `<dest>/<name>`. `None` uses the configured
+    /// download directory.
+    #[serde(default)]
+    pub dest: Option<PathBuf>,
 }
 
 impl SubscribeRequest {
@@ -81,6 +93,21 @@ impl SubscribeRequest {
             manifest_id: invite.manifest_id,
             sources,
             credential: Some(invite.credential.clone()),
+            select: None,
+            dest: None,
+        }
+    }
+
+    /// A whole-share request for a public share discovered on the tracker — no
+    /// link, no credential, sources resolved later from the tracker.
+    pub fn for_discovered(manifest_id: Hash, name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            manifest_id,
+            sources: Vec::new(),
+            credential: None,
+            select: None,
+            dest: None,
         }
     }
 }
@@ -92,6 +119,8 @@ impl From<ShareLink> for SubscribeRequest {
             manifest_id: link.manifest_id,
             sources: link.sources,
             credential: link.invite.map(|i| i.credential),
+            select: None,
+            dest: None,
         }
     }
 }
@@ -113,6 +142,13 @@ pub enum AcceleratorRequest {
 enum Command {
     AddLocalShare { dir: PathBuf, private: bool },
     Subscribe(SubscribeRequest),
+    /// Fetch a remote share's manifest so the GUI can show a file/destination
+    /// picker before committing to the download.
+    PreviewShare(Box<SubscribeRequest>),
+    /// Discard [`AppState::share_preview`].
+    ClearPreview,
+    /// Run an integrity check (and repair) over a completed download.
+    VerifyShare(TransferId),
     /// Fetch the seeder tracker's public-share directory into
     /// [`AppState::discovered_shares`].
     RefreshDirectory,
@@ -183,6 +219,12 @@ enum Command {
     UpdateSeen { id: TransferId, version: u64 },
     ResyncProgress { id: TransferId, p: SwarmProgress },
     ResyncDone { id: TransferId, outcome: Box<ResyncOutcome> },
+    /// A [`Command::PreviewShare`] fetch finished (with contents or an error).
+    PreviewReady(Box<crate::state::PreviewStatus>),
+    /// A verify-and-repair pass fetched a repair chunk.
+    VerifyProgress { id: TransferId, p: SwarmProgress },
+    VerifyDone { id: TransferId, outcome: Box<VerifyOutcome> },
+    VerifyFailed { id: TransferId, error: String },
     BenchmarkDone(BenchmarkResult),
     AcceleratorReady {
         handle: Box<AccelHandle>,
@@ -195,6 +237,22 @@ enum Command {
     AccelShareAdded { node: Option<Box<Node>>, row: Box<AccelShareRow>, token: String },
     /// A NAS share added to an already-running local accelerator made progress.
     AccelShareProgress { manifest_id: String, progress: ReplicaProgress },
+    /// A NAS share's serving node is up over its still-filling replica — register
+    /// and announce it now, before replication finishes, so the accelerator
+    /// uploads the chunks it already holds from the first one on.
+    AccelShareServing {
+        manifest_id: String,
+        row: Box<AccelShareRow>,
+        node: Arc<Node>,
+        token: String,
+    },
+    /// A NAS share finished replicating: clear its progress, record the final
+    /// on-disk chunk count.
+    AccelShareReplicated { manifest_id: String, chunks: u64 },
+    /// A NAS share add failed — record the error on its row and schedule a retry.
+    AccelShareFailed { link: Box<ShareLink>, token: String, attempt: u32, error: String },
+    /// The backoff after [`Command::AccelShareFailed`] elapsed — re-attempt the add.
+    AccelRetryShare { link: Box<ShareLink>, token: String, attempt: u32 },
     /// Off-thread walk of each local NAS replica dir: per-share (manifest-id
     /// hex, bytes) plus free space on the replica volume.
     AccelDiskUsage { sizes: Vec<(String, u64)>, free_bytes: Option<u64> },
@@ -242,6 +300,14 @@ struct ResyncOutcome {
     synced: SyncOutcome,
     files: usize,
     total_bytes: u64,
+}
+
+struct VerifyOutcome {
+    healthy: bool,
+    checked_files: usize,
+    checked_bytes: u64,
+    /// Manifest paths that failed the local check and were rebuilt.
+    repaired: Vec<String>,
 }
 
 /// Handle to the running transfer manager. Sync, safe to call from any thread
@@ -305,6 +371,7 @@ impl App {
             operator_key: operator.public().to_hex(),
             stats: StatsSnapshot::default(),
             discovered_shares: Vec::new(),
+            share_preview: None,
         };
 
         let (commands_tx, commands_rx) = mpsc::channel(128);
@@ -326,6 +393,7 @@ impl App {
             downloads: HashMap::new(),
             paused_seeds: HashSet::new(),
             resync_samples: HashMap::new(),
+            verify_samples: HashMap::new(),
             eta: HashMap::new(),
             accel: None,
             remotes,
@@ -393,6 +461,30 @@ impl App {
     /// Start pulling a remote share.
     pub fn subscribe(&self, request: SubscribeRequest) {
         self.send(Command::Subscribe(request));
+    }
+
+    /// Fetch `request`'s share manifest (no chunk data) so a frontend can show a
+    /// file/destination picker before committing. The result lands in
+    /// [`AppState::share_preview`](crate::AppState::share_preview) as
+    /// `Loading` → `Ready` / `Failed`. When `request.sources` is empty the
+    /// sources are resolved from the configured tracker, so a discovered public
+    /// share can be previewed with just its manifest id.
+    pub fn preview_share(&self, request: SubscribeRequest) {
+        self.send(Command::PreviewShare(Box::new(request)));
+    }
+
+    /// Clear [`AppState::share_preview`](crate::AppState::share_preview) — call
+    /// when the picker is dismissed.
+    pub fn clear_preview(&self) {
+        self.send(Command::ClearPreview);
+    }
+
+    /// Re-check a completed download against its manifest and refetch any file
+    /// whose bytes no longer match. A clean tree needs no network. Progress and
+    /// the outcome ride [`TransferRow::verifying`](crate::TransferRow::verifying)
+    /// / [`TransferRow::verify_result`](crate::TransferRow::verify_result).
+    pub fn verify_share(&self, id: TransferId) {
+        self.send(Command::VerifyShare(id));
     }
 
     /// Refresh [`AppState::discovered_shares`] from the seeder tracker at
@@ -653,6 +745,9 @@ struct Manager {
     /// re-completion) skips them. Persisted in `shares.json`.
     paused_seeds: HashSet<Hash>,
     resync_samples: HashMap<TransferId, Option<(Instant, u64)>>,
+    /// Speed-sample slot per running verify-and-repair pass — doubles as the
+    /// "this id is busy verifying" marker.
+    verify_samples: HashMap<TransferId, Option<(Instant, u64)>>,
     /// Rolling-average time-left estimator per running download / resync — feeds
     /// [`TransferRow::eta_secs`]. Kept off the reactive `speed_bps` EMA on
     /// purpose: a countdown needs to be steady, not responsive.
@@ -828,6 +923,13 @@ impl Manager {
         // NAT rendezvous: check whether some subscriber is waiting to punch
         // through to one of our served shares, and answer if so.
         if let Some(url) = self.state.settings.rendezvous_url.clone() {
+            // In-process NAS replicas too — one behind NAT needs to answer
+            // punches to be reachable, including while it is still replicating.
+            let accel_nodes: Vec<Arc<Node>> = self
+                .accel
+                .as_ref()
+                .map(|a| a.nas_nodes.iter().map(|(_, n)| Arc::clone(n)).collect())
+                .unwrap_or_default();
             let seed_nodes = self
                 .seeds
                 .values()
@@ -835,7 +937,8 @@ impl Manager {
                 .chain(
                     self.subs.values().filter_map(|s| s.seed.as_ref().map(|c| Arc::clone(&c.node))),
                 )
-                .chain(self.downloads.values().filter_map(|j| j.partial_seed.clone()));
+                .chain(self.downloads.values().filter_map(|j| j.partial_seed.clone()))
+                .chain(accel_nodes);
             for node in seed_nodes {
                 let url = url.clone();
                 tokio::spawn(async move { answer_rendezvous_requests(&node, &url).await });
@@ -1080,6 +1183,14 @@ impl Manager {
         match command {
             Command::AddLocalShare { dir, private } => self.add_share(dir, private),
             Command::Subscribe(req) => self.subscribe(req),
+            Command::PreviewShare(req) => self.preview_share(*req),
+            Command::ClearPreview => {
+                if self.state.share_preview.is_some() {
+                    self.state.share_preview = None;
+                    self.publish();
+                }
+            }
+            Command::VerifyShare(id) => self.verify_share(id),
             Command::RefreshDirectory => self.refresh_directory(),
             Command::SubscribeDiscovered { manifest_id, name } => {
                 self.subscribe_discovered(manifest_id, name)
@@ -1512,6 +1623,96 @@ impl Manager {
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
             }
+            Command::PreviewReady(status) => {
+                self.state.share_preview = Some(*status);
+                self.publish();
+            }
+            Command::VerifyProgress { id, p } => {
+                // Deliberately does not touch `row.status` (stays `Complete`) or
+                // the progress bar — a repair only refetches a handful of
+                // chunks, and flipping the row to `Active` would expose a Pause
+                // control that, on a completed sub, would stop its seed. The
+                // repair shows as `detail` text while `row.verifying` holds.
+                if self.verify_samples.contains_key(&id)
+                    && let Some(row) = self.state.transfers.get_mut(&id)
+                {
+                    row.detail =
+                        Some(format!("repairing… {}/{} chunks", p.chunks_done, p.chunks_total));
+                    self.publish();
+                    let _ = self.events.send(AppEvent::TransferProgress(id));
+                }
+            }
+            Command::VerifyDone { id, outcome } => {
+                self.verify_samples.remove(&id);
+                self.eta.remove(&id);
+                let seeding = self.subs.get(&id).is_some_and(|s| s.seed.is_some());
+                if let Some(sub) = self.subs.get(&id) {
+                    let total = sub.manifest.total_size();
+                    if let Some(row) = self.state.transfers.get_mut(&id) {
+                        row.status = TransferStatus::Complete;
+                        row.detail = None;
+                        row.verifying = false;
+                        row.speed_bps = 0;
+                        row.eta_secs = None;
+                        row.total_bytes = total;
+                        row.done_bytes = total;
+                        row.verify_result = Some(crate::state::VerifyReport {
+                            healthy: outcome.healthy,
+                            checked_files: outcome.checked_files,
+                            checked_bytes: outcome.checked_bytes,
+                            repaired: outcome.repaired.clone(),
+                            error: None,
+                        });
+                    }
+                }
+                tracing::info!(
+                    id,
+                    healthy = outcome.healthy,
+                    repaired = outcome.repaired.len(),
+                    "verify pass finished"
+                );
+                // A repaired file's bytes on disk changed after the seed's
+                // `SourceChunkStore` was indexed — it would now refuse those
+                // chunks. Re-stand-up the completed seed over the fixed tree.
+                if !outcome.repaired.is_empty() && seeding {
+                    if let Some(sub) = self.subs.get_mut(&id) {
+                        sub.seed = None;
+                    }
+                    if let Some(row) = self.state.transfers.get_mut(&id) {
+                        row.seeding = false;
+                    }
+                    self.start_completed_seed(id);
+                }
+                self.recount();
+                self.publish();
+                let _ = self.events.send(AppEvent::TransferCompleted(id));
+            }
+            Command::VerifyFailed { id, error } => {
+                self.verify_samples.remove(&id);
+                self.eta.remove(&id);
+                if let Some(sub) = self.subs.get(&id) {
+                    let total = sub.manifest.total_size();
+                    if let Some(row) = self.state.transfers.get_mut(&id) {
+                        row.status = TransferStatus::Complete;
+                        row.detail = None;
+                        row.verifying = false;
+                        row.speed_bps = 0;
+                        row.eta_secs = None;
+                        row.done_bytes = total;
+                        row.total_bytes = total;
+                        row.verify_result = Some(crate::state::VerifyReport {
+                            healthy: false,
+                            checked_files: 0,
+                            checked_bytes: 0,
+                            repaired: Vec::new(),
+                            error: Some(error.clone()),
+                        });
+                    }
+                }
+                tracing::warn!(id, error = %error, "verify pass failed");
+                self.recount();
+                self.publish();
+            }
             Command::BenchmarkDone(result) => {
                 self.state.benchmark = Some(result);
                 self.publish();
@@ -1523,6 +1724,11 @@ impl Manager {
                 self.save_accelerator_settings(Some(&request));
                 self.publish();
                 let _ = self.events.send(AppEvent::AcceleratorChanged);
+                // A NAS accelerator now replicates each carried share
+                // concurrently, in the background — the daemon is "ready" the
+                // moment its node is up, not after every 100 GB share has
+                // landed. Each share seeds the chunks it holds while it fills.
+                self.kick_off_nas_shares();
             }
             Command::AcceleratorStartFailed(error) => {
                 self.accel = None;
@@ -1584,6 +1790,90 @@ impl Manager {
                         a.shares = h.rows.clone();
                     }
                     self.publish();
+                }
+            }
+            Command::AccelShareServing { manifest_id, row, node, token } => {
+                if let Some(h) = &mut self.accel {
+                    if let Ok(mid) = Hash::from_hex(&manifest_id) {
+                        // A retry can race a not-yet-dropped earlier node — keep
+                        // one entry per share.
+                        h.nas_nodes.retain(|(m, _)| *m != mid);
+                        h.nas_nodes.push((mid, node));
+                    }
+                    // Preserve a pause the operator applied while it was starting.
+                    let paused = h
+                        .rows
+                        .iter()
+                        .find(|r| r.manifest_id == manifest_id)
+                        .map(|r| !r.seeding)
+                        .unwrap_or(false);
+                    let mut row = *row;
+                    if paused {
+                        row.seeding = false;
+                    }
+                    h.rows.retain(|r| r.manifest_id != manifest_id);
+                    h.rows.push(row);
+                    h.tokens.retain(|t| {
+                        ShareLink::parse(t)
+                            .map(|l| l.manifest_id.to_hex() != manifest_id)
+                            .unwrap_or(true)
+                    });
+                    h.tokens.push(token);
+                    let rows = h.rows.clone();
+                    let addr = rows
+                        .iter()
+                        .find(|r| r.manifest_id == manifest_id)
+                        .and_then(|r| r.listen_addr.as_deref())
+                        .and_then(|s| s.parse::<Multiaddr>().ok());
+                    if let Some(a) = &mut self.state.accelerator {
+                        a.shares = rows.clone();
+                        a.detail = accel_detail(a.role, &rows);
+                        if a.listen_addrs.is_empty()
+                            && let Some(addr) = addr
+                        {
+                            a.listen_addrs = vec![addr];
+                        }
+                    }
+                    self.refresh_accel_replica_chunks();
+                    self.sync_accelerator_shares();
+                    self.publish();
+                    let _ = self.events.send(AppEvent::AcceleratorChanged);
+                }
+            }
+            Command::AccelShareReplicated { manifest_id, chunks } => {
+                if let Some(h) = &mut self.accel
+                    && let Some(row) = h.rows.iter_mut().find(|r| r.manifest_id == manifest_id)
+                {
+                    row.replicating = None;
+                    row.replica_chunks = Some(chunks);
+                    row.error = None;
+                    if let Some(a) = &mut self.state.accelerator {
+                        a.shares = h.rows.clone();
+                        a.detail = accel_detail(a.role, &a.shares);
+                    }
+                    self.refresh_accel_replica_chunks();
+                    self.publish();
+                    let _ = self.events.send(AppEvent::AcceleratorChanged);
+                }
+            }
+            Command::AccelShareFailed { link, token, attempt, error } => self
+                .accel_share_failed(*link, token, attempt, error),
+            Command::AccelRetryShare { link, token, attempt } => {
+                let id = link.manifest_id.to_hex();
+                let still_wanted = self.accel.as_ref().is_some_and(|h| {
+                    h.role == AcceleratorRole::Nas
+                        && (h.tokens.iter().any(|t| {
+                            ShareLink::parse(t)
+                                .map(|l| l.manifest_id.to_hex() == id)
+                                .unwrap_or(false)
+                        }) || h.rows.iter().any(|r| r.manifest_id == id))
+                        // Already replicated fine on an earlier attempt.
+                        && !h.rows.iter().any(|r| {
+                            r.manifest_id == id && r.error.is_none() && r.replicating.is_none()
+                        })
+                });
+                if still_wanted {
+                    self.spawn_nas_add(*link, token, attempt);
                 }
             }
             Command::AccelDiskUsage { sizes, free_bytes } => {
@@ -1657,90 +1947,40 @@ impl Manager {
         self.spawn_accel_add(link, token);
     }
 
-    /// Start carrying `link` on the running local accelerator — relay-cache it,
-    /// or (NAS) replicate it to disk and serve it — reporting the result as
-    /// `Command::AccelShareAdded`. Shared by [`accel_add_share`](Self::accel_add_share)
-    /// (a brand-new share) and [`accel_set_seeding`](Self::accel_set_seeding)
-    /// resuming a paused one (its row is already present; the handler replaces
-    /// it and de-dups the token).
+    /// Start carrying `link` on the running local accelerator. Shared by
+    /// [`accel_add_share`](Self::accel_add_share) (a brand-new share) and
+    /// [`accel_set_seeding`](Self::accel_set_seeding) resuming a paused one.
     fn spawn_accel_add(&self, link: ShareLink, token: String) {
         let Some(h) = &self.accel else { return };
-        let role = h.role;
+        match h.role {
+            AcceleratorRole::Relay => self.spawn_relay_add(link, token),
+            AcceleratorRole::Nas => self.spawn_nas_add(link, token, 0),
+        }
+    }
+
+    /// Relay role: point the shared metadata node at the linked seeds, learn the
+    /// share, and register it for read-through caching. Metadata-only, so this
+    /// stays a single quick task reporting `Command::AccelShareAdded`.
+    fn spawn_relay_add(&self, link: ShareLink, token: String) {
+        let Some(h) = &self.accel else { return };
         let relay = h.relay.clone();
         let meta = h.meta.clone();
-        let dir_root = h.nas_dir.clone();
-        let operator_seed = self.operator.to_seed();
-        let rendezvous_url = self.state.settings.rendezvous_url.clone();
-        // Storage-cap guard: budget left = cap − what the replicas already use.
-        let max_bytes = self.state.settings.storage_cap_bytes.map(|cap| {
-            let used: u64 = h.rows.iter().filter_map(|r| r.disk_bytes).sum();
-            cap.saturating_sub(used)
-        });
         let tx = self.self_tx.clone();
         let existing = h.rows.clone();
         let token_owned = token.trim().to_string();
 
         tokio::spawn(async move {
-            let added = match role {
-                AcceleratorRole::Relay => match (relay, meta) {
-                    (Some(relay), Some(meta)) => relay_add_share(&relay, &meta, &link)
-                        .await
-                        .map(|m| (None, row_from_meta(&m, None, None, None))),
-                    _ => Err(anyhow::anyhow!("relay accelerator is not available")),
-                },
-                AcceleratorRole::Nas => match dir_root {
-                    Some(dir) => {
-                        let seed = derive_share_seed(&operator_seed, link.manifest_id);
-                        let manifest_id = link.manifest_id.to_hex();
-                        let progress_tx = tx.clone();
-                        let mut last_sent = Instant::now()
-                            .checked_sub(Duration::from_millis(500))
-                            .unwrap_or_else(Instant::now);
-                        let on_progress = move |p: SwarmProgress| {
-                            let done = p.chunks_done >= p.chunks_total;
-                            if done || last_sent.elapsed() >= Duration::from_millis(500) {
-                                last_sent = Instant::now();
-                                let _ = progress_tx.try_send(Command::AccelShareProgress {
-                                    manifest_id: manifest_id.clone(),
-                                    progress: ReplicaProgress {
-                                        chunks_done: p.chunks_done,
-                                        chunks_total: p.chunks_total,
-                                        bytes_done: p.bytes_done,
-                                        bytes_total: p.bytes_total,
-                                    },
-                                });
-                            }
-                        };
-                        let replica_path = dir.join(link.manifest_id.to_hex());
-                        match nas_replicate(
-                            &dir,
-                            net::keypair_from_seed(seed),
-                            &link,
-                            rendezvous_url.as_deref(),
-                            COMPRESS_REPLICA,
-                            max_bytes,
-                            on_progress,
-                        )
-                        .await
-                        {
-                            Ok((node, m, chunks)) => {
-                                let addr = node.listen_addr().await.ok().map(|a| a.to_string());
-                                Ok((
-                                    Some(Box::new(node)),
-                                    row_from_meta(&m, Some(chunks as u64), addr, Some(replica_path)),
-                                ))
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    None => Err(anyhow::anyhow!("nas accelerator is not available")),
-                },
+            let added = match (relay, meta) {
+                (Some(relay), Some(meta)) => relay_add_share(&relay, &meta, &link)
+                    .await
+                    .map(|m| row_from_meta(&m, None, None, None)),
+                _ => Err(anyhow::anyhow!("relay accelerator is not available")),
             };
             match added {
-                Ok((node, row)) => {
+                Ok(row) => {
                     let _ = tx
                         .send(Command::AccelShareAdded {
-                            node,
+                            node: None,
                             row: Box::new(row),
                             token: token_owned,
                         })
@@ -1749,12 +1989,179 @@ impl Manager {
                 Err(e) => {
                     let id = link.manifest_id.to_hex();
                     let mut rows = existing;
-                    // A resume failure: the paused row is already in `existing`.
                     rows.retain(|r| r.manifest_id != id);
                     rows.push(err_row(&link.name, &id, format!("{e:#}")));
                     let _ = tx.send(Command::AccelSharesRefresh(rows)).await;
                 }
             }
+        });
+    }
+
+    /// NAS role: replicate `link` to disk while serving the chunks already
+    /// present. Stands the serving node up over the still-filling replica
+    /// straight away (`Command::AccelShareServing`), streams progress, and on
+    /// failure fires `Command::AccelShareFailed` so the add is retried with
+    /// backoff rather than left stuck. `attempt` is the retry counter (0 =
+    /// first try).
+    fn spawn_nas_add(&self, link: ShareLink, token: String, attempt: u32) {
+        let Some(h) = &self.accel else { return };
+        let Some(dir_root) = h.nas_dir.clone() else {
+            let _ = self
+                .events
+                .send(AppEvent::AcceleratorFailed("nas accelerator is not available".into()));
+            return;
+        };
+        let Some(scratch) = h.meta.clone() else {
+            let _ = self
+                .events
+                .send(AppEvent::AcceleratorFailed("nas accelerator has no pulling node".into()));
+            return;
+        };
+        let operator_seed = self.operator.to_seed();
+        let rendezvous_url = self.state.settings.rendezvous_url.clone();
+        // Storage-cap guard: budget left = cap − what the replicas use (or, for
+        // one still filling, its expected full size — conservative, so
+        // concurrent boot-time adds don't collectively blow the cap).
+        let max_bytes = self.state.settings.storage_cap_bytes.map(|cap| {
+            let used: u64 = h
+                .rows
+                .iter()
+                .map(|r| {
+                    let filling = if r.replicating.is_some() { r.total_bytes } else { 0 };
+                    r.disk_bytes.unwrap_or(0).max(filling)
+                })
+                .sum();
+            cap.saturating_sub(used)
+        });
+        let tx = self.self_tx.clone();
+        let token = token.trim().to_string();
+        let manifest_id_hex = link.manifest_id.to_hex();
+        let replica_path = dir_root.join(&manifest_id_hex);
+
+        tokio::spawn(async move {
+            let identity =
+                net::keypair_from_seed(derive_share_seed(&operator_seed, link.manifest_id));
+
+            let progress_tx = tx.clone();
+            let progress_id = manifest_id_hex.clone();
+            let mut last_sent = Instant::now()
+                .checked_sub(Duration::from_millis(500))
+                .unwrap_or_else(Instant::now);
+            let on_progress = move |p: SwarmProgress| {
+                let done = p.chunks_done >= p.chunks_total;
+                if done || last_sent.elapsed() >= Duration::from_millis(500) {
+                    last_sent = Instant::now();
+                    let _ = progress_tx.try_send(Command::AccelShareProgress {
+                        manifest_id: progress_id.clone(),
+                        progress: ReplicaProgress {
+                            chunks_done: p.chunks_done,
+                            chunks_total: p.chunks_total,
+                            bytes_done: p.bytes_done,
+                            bytes_total: p.bytes_total,
+                        },
+                    });
+                }
+            };
+
+            let result = nas_replicate_seeding(
+                &scratch,
+                &dir_root,
+                identity,
+                &link,
+                rendezvous_url.as_deref(),
+                COMPRESS_REPLICA,
+                max_bytes,
+                replica_path,
+                &tx,
+                manifest_id_hex.clone(),
+                token.clone(),
+                on_progress,
+            )
+            .await;
+
+            match result {
+                Ok(chunks) => {
+                    let _ = tx
+                        .send(Command::AccelShareReplicated {
+                            manifest_id: manifest_id_hex,
+                            chunks: chunks as u64,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Command::AccelShareFailed {
+                            link: Box::new(link),
+                            token,
+                            attempt,
+                            error: format!("{e:#}"),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// Kick off a background replicate-and-seed task for every share a
+    /// just-started NAS accelerator carries — concurrently, so one big share
+    /// never blocks the rest.
+    fn kick_off_nas_shares(&self) {
+        let Some(h) = &self.accel else { return };
+        if h.role != AcceleratorRole::Nas {
+            return;
+        }
+        for token in h.tokens.clone() {
+            let Ok(link) = ShareLink::parse(&token) else { continue };
+            // A share the operator has paused stays on disk but isn't served.
+            let paused = h
+                .rows
+                .iter()
+                .any(|r| r.manifest_id == link.manifest_id.to_hex() && !r.seeding);
+            if !paused {
+                self.spawn_nas_add(link, token, 0);
+            }
+        }
+    }
+
+    /// Record a NAS share add failure on its row and schedule a backoff retry —
+    /// so a restart against a not-yet-reachable origin recovers on its own
+    /// instead of sitting on a dead error row.
+    fn accel_share_failed(&mut self, link: ShareLink, token: String, attempt: u32, error: String) {
+        let id = link.manifest_id.to_hex();
+        let Some(h) = &mut self.accel else { return };
+        let known = h.tokens.iter().any(|t| {
+            ShareLink::parse(t).map(|l| l.manifest_id.to_hex() == id).unwrap_or(false)
+        }) || h.rows.iter().any(|r| r.manifest_id == id);
+        if !known {
+            return; // removed while the add was in flight
+        }
+        let serving = h.nas_nodes.iter().any(|(m, _)| m.to_hex() == id);
+        let delay = accel_retry_backoff(attempt);
+        let secs = delay.as_secs();
+        let msg = if serving {
+            format!("{error} — retrying in {secs}s (still serving what's on disk)")
+        } else {
+            format!("{error} — retrying in {secs}s")
+        };
+        if let Some(row) = h.rows.iter_mut().find(|r| r.manifest_id == id) {
+            row.error = Some(msg);
+        } else {
+            h.rows.push(err_row(&link.name, &id, msg));
+        }
+        let rows = h.rows.clone();
+        if let Some(a) = &mut self.state.accelerator {
+            a.shares = rows.clone();
+            a.detail = accel_detail(a.role, &rows);
+        }
+        self.publish();
+        let _ = self.events.send(AppEvent::AcceleratorChanged);
+
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx
+                .send(Command::AccelRetryShare { link: Box::new(link), token, attempt: attempt + 1 })
+                .await;
         });
     }
 
@@ -1807,6 +2214,7 @@ impl Manager {
             a.shares = rows.clone();
             a.detail = accel_detail(a.role, &rows);
         }
+        self.refresh_accel_replica_chunks();
         self.sync_accelerator_shares();
         self.publish();
         let _ = self.events.send(AppEvent::AcceleratorChanged);
@@ -1892,6 +2300,18 @@ impl Manager {
         });
         if let Some(path) = &self.config_path {
             let _ = self.state.settings.save(path);
+        }
+    }
+
+    /// Recompute the accelerator's roll-up replica chunk count from its
+    /// per-share rows. The rows fill in as each share finishes replicating, so
+    /// the daemon-level total is no longer known up front (the accelerator is
+    /// "ready" before any share has landed).
+    fn refresh_accel_replica_chunks(&mut self) {
+        let Some(h) = &self.accel else { return };
+        let chunks: u64 = h.rows.iter().filter_map(|r| r.replica_chunks).sum();
+        if let Some(a) = &mut self.state.accelerator {
+            a.replica_chunks = Some(chunks as usize);
         }
     }
 
@@ -2119,6 +2539,16 @@ impl Manager {
     fn start_completed_seed(&mut self, id: TransferId) {
         let Some(sub) = self.subs.get(&id) else { return };
         if sub.seed.is_some() {
+            return;
+        }
+        // A partial (file-selected) download holds only a subset of the share —
+        // re-indexing it would produce a different manifest id, so it can't
+        // seed back under the origin's id.
+        if sub.request.select.is_some() {
+            tracing::info!(id, "seed-after-download: skipped for a partial download");
+            if let Some(row) = self.state.transfers.get_mut(&id) {
+                row.seeding = false;
+            }
             return;
         }
         let output_dir = sub.output_dir.clone();
@@ -2430,6 +2860,77 @@ impl Manager {
         });
     }
 
+    fn preview_share(&mut self, mut request: SubscribeRequest) {
+        // Whatever the picker last chose is not part of a fresh preview.
+        request.select = None;
+        let name = if request.name.is_empty() {
+            hex(&request.manifest_id)
+        } else {
+            request.name.clone()
+        };
+        self.state.share_preview = Some(crate::state::PreviewStatus::Loading { name: name.clone() });
+        self.publish();
+
+        let node = Arc::clone(&self.download_node);
+        let tracker = self.state.settings.rendezvous_url.clone();
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let status = match run_preview(node.as_ref(), request, tracker.as_deref()).await {
+                Ok(preview) => crate::state::PreviewStatus::Ready(Box::new(preview)),
+                Err(e) => crate::state::PreviewStatus::Failed { name, error: format!("{e:#}") },
+            };
+            let _ = tx.send(Command::PreviewReady(Box::new(status))).await;
+        });
+    }
+
+    fn verify_share(&mut self, id: TransferId) {
+        if self.downloads.contains_key(&id)
+            || self.resync_samples.contains_key(&id)
+            || self.verify_samples.contains_key(&id)
+        {
+            return; // already busy
+        }
+        let Some(sub) = self.subs.get(&id) else {
+            tracing::warn!(id, "verify: no such subscription");
+            return;
+        };
+        let node = Arc::clone(&self.download_node);
+        let req = sub.request.clone();
+        let output_dir = sub.output_dir.clone();
+        let manifest = sub.manifest.clone();
+        let chunk_lists = sub.chunk_lists.clone();
+
+        if let Some(row) = self.state.transfers.get_mut(&id) {
+            row.verifying = true;
+            row.verify_result = None;
+            row.error = None;
+            row.speed_bps = 0;
+            row.detail = Some("verifying…".into());
+        }
+        self.eta.remove(&id);
+        self.verify_samples.insert(id, None);
+        self.publish();
+
+        let tx = self.self_tx.clone();
+        let rendezvous_url = self.state.settings.rendezvous_url.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_verify(
+                node.as_ref(),
+                id,
+                req,
+                output_dir,
+                manifest,
+                chunk_lists,
+                tx.clone(),
+                rendezvous_url,
+            )
+            .await
+            {
+                let _ = tx.send(Command::VerifyFailed { id, error: format!("{e:#}") }).await;
+            }
+        });
+    }
+
     fn benchmark(&mut self) {
         let dir = self.state.settings.download_dir.clone();
         let tx = self.self_tx.clone();
@@ -2453,7 +2954,6 @@ impl Manager {
         }
         let tx = self.self_tx.clone();
         let operator_seed = self.operator.to_seed();
-        let rendezvous_url = self.state.settings.rendezvous_url.clone();
         let storage_cap = self.state.settings.storage_cap_bytes;
         let request_saved = request.clone();
         tokio::spawn(async move {
@@ -2462,8 +2962,7 @@ impl Manager {
                     start_relay_accel(cache_bytes, shares).await
                 }
                 AcceleratorRequest::Nas { dir, shares, paused } => {
-                    start_nas_accel(dir, shares, paused, operator_seed, rendezvous_url, storage_cap)
-                        .await
+                    start_nas_accel(dir, shares, paused, operator_seed, storage_cap).await
                 }
             };
             match result {
@@ -2531,6 +3030,8 @@ impl Manager {
                     manifest_id,
                     sources,
                     credential: None,
+                    select: None,
+                    dest: None,
                 }))
                 .await;
         });
@@ -2540,6 +3041,7 @@ impl Manager {
         let id = self.alloc_id();
         let mut row = new_row(id, request.name.clone(), TransferKind::Downloading);
         row.manifest_id = request.manifest_id;
+        row.selected_files = request.select.as_ref().map(|s| s.len());
         self.insert_row(row);
         let chunk_dir = self.partial_dir(request.manifest_id);
         self.spawn_download(id, request, chunk_dir);
@@ -2552,7 +3054,10 @@ impl Manager {
     fn spawn_download(&mut self, id: TransferId, request: SubscribeRequest, chunk_dir: PathBuf) {
         let tx = self.self_tx.clone();
         let node = Arc::clone(&self.download_node);
-        let out_root = self.state.settings.download_dir.clone();
+        let out_root = request
+            .dest
+            .clone()
+            .unwrap_or_else(|| self.state.settings.download_dir.clone());
         let name = sanitize(&request.name).unwrap_or_else(|| hex(&request.manifest_id));
         let req = request.clone();
         let dir = chunk_dir.clone();
@@ -2712,6 +3217,7 @@ impl Manager {
             }
         }
         self.resync_samples.remove(&id);
+        self.verify_samples.remove(&id);
         self.eta.remove(&id);
         if let Some(job) = self.downloads.remove(&id) {
             job.task.abort();
@@ -2927,6 +3433,9 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
         seeding: false,
         detail: None,
         eta_secs: None,
+        selected_files: None,
+        verifying: false,
+        verify_result: None,
     }
 }
 
@@ -3146,27 +3655,82 @@ async fn answer_rendezvous_requests(node: &Node, rendezvous_url: &str) {
     }
 }
 
-/// Replicate `link` onto `dir_root` under a NAS replica's persistent
-/// `identity`, trying a NAT-rendezvous punch first when `rendezvous_url` is
-/// set and the link names a peer id (same idea as [`run_download`]'s: the
-/// punch has to happen on the very node that then does the real connect/pull,
-/// since that's the node whose NAT mapping it opens a hole in — so this
-/// spawns its own scratch node rather than reusing [`nas_add_share`]'s).
-/// Reports [`SwarmProgress`] once per chunk via `on_progress`.
-async fn nas_replicate(
+/// Backoff before re-attempting a failed NAS accelerator share add: 5s, 15s,
+/// 30s, then 60s for every later try. Keeps retrying indefinitely — a NAS is a
+/// standing service; the operator stops it by removing the share.
+fn accel_retry_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(match attempt {
+        0 => 5,
+        1 => 15,
+        2 => 30,
+        _ => 60,
+    })
+}
+
+/// Short connectivity check: can `link`'s existing addresses reach a source and
+/// return its (small) manifest within a few seconds? Used to skip the up-front
+/// NAT-rendezvous punch entirely when the origin is directly reachable — the
+/// common LAN / public-origin case, where the punch is pure latency.
+const QUICK_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn quick_probe(node: &Node, link: &ShareLink) -> bool {
+    let Ok(peers) = node.connect_all(&link.sources).await else { return false };
+    if peers.is_empty() {
+        return false;
+    }
+    if let Some(cred) = link.credential()
+        && node.authenticate_all(&peers, cred).await.is_err()
+    {
+        return false;
+    }
+    for peer in peers {
+        let probe =
+            tokio::time::timeout(QUICK_PROBE_TIMEOUT, node.fetch_manifest(peer, Some(link.manifest_id)))
+                .await;
+        if matches!(probe, Ok(Ok(_))) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Replicate `link` onto `dir_root` under a NAS replica's persistent `identity`
+/// while serving what is already on disk. `scratch` is the accelerator's
+/// long-lived pulling node (reused across shares and retries — the NAT punch,
+/// if any, opens a hole in *its* mapping, which is also the node that then
+/// pulls). Emits `Command::AccelShareServing` as soon as the serving node is up
+/// — before the pull runs — then streams progress and returns the on-disk chunk
+/// count.
+#[allow(clippy::too_many_arguments)]
+async fn nas_replicate_seeding(
+    scratch: &Node,
     dir_root: &std::path::Path,
     identity: Keypair,
     link: &ShareLink,
     rendezvous_url: Option<&str>,
     compress: bool,
     max_bytes: Option<u64>,
+    replica_path: PathBuf,
+    tx: &mpsc::Sender<Command>,
+    manifest_id_hex: String,
+    token: String,
     on_progress: impl FnMut(SwarmProgress),
-) -> anyhow::Result<(Node, net::accel::ShareMeta, usize)> {
-    let scratch = Node::spawn().await?;
+) -> anyhow::Result<usize> {
     let mut link = link.clone();
-    if let Some(url) = rendezvous_url
+    // A wildcard `0.0.0.0`/`::` entry in a stale link is never dialable and just
+    // burns a handshake timeout — drop it, but never end up with nothing to try.
+    let pruned: Vec<_> =
+        link.sources.iter().filter(|a| !net::addr_is_unspecified(a)).cloned().collect();
+    if !pruned.is_empty() {
+        link.sources = pruned;
+    }
+
+    // Try the addresses we already have first; only fall back to a rendezvous
+    // punch (up to `RENDEZVOUS_TIMEOUT`) when they can't reach a source.
+    if !quick_probe(scratch, &link).await
+        && let Some(url) = rendezvous_url
         && let Some(origin) = link.sources.iter().find_map(peer_id_of)
-        && let Ok(extra) = punch_via_rendezvous(&scratch, url, origin).await
+        && let Ok(extra) = punch_via_rendezvous(scratch, url, origin).await
     {
         for addr in extra {
             if !link.sources.contains(&addr) {
@@ -3174,11 +3738,25 @@ async fn nas_replicate(
             }
         }
     }
-    let pulled =
-        nas_pull_with_progress(&scratch, dir_root, &link, compress, max_bytes, on_progress).await;
-    scratch.shutdown().await;
-    let (manifest, chunk_lists, disk, chunks) = pulled?;
-    nas_serve(manifest, chunk_lists, disk, chunks, identity, &link).await
+
+    let NasSeedStart { serving, store, meta, peers } =
+        nas_seed_start(scratch, dir_root, identity, &link, compress, max_bytes).await?;
+    let addr = serving.listen_addr().await.ok().map(|a| a.to_string());
+    let serving = Arc::new(serving);
+
+    let mut row = row_from_meta(&meta, None, addr, Some(replica_path));
+    row.replicating =
+        Some(ReplicaProgress { chunks_done: 0, chunks_total: 0, bytes_done: 0, bytes_total: 0 });
+    let _ = tx
+        .send(Command::AccelShareServing {
+            manifest_id: manifest_id_hex,
+            row: Box::new(row),
+            node: Arc::clone(&serving),
+            token,
+        })
+        .await;
+
+    nas_seed_finish(scratch, &store, &peers, &link, on_progress).await
 }
 
 /// A throttled [`index_dir_with_progress`] callback that forwards
@@ -3344,10 +3922,12 @@ async fn run_download(
         report_stage(&tx, &work_activity, id, "fetching share metadata…");
 
         // Seed-while-downloading: stand up a serving node over the partial
-        // store. Skipped for a file-scoped invite — its narrowed catalog only
-        // exists once the granted files have actually been written.
-        let scoped =
-            matches!(req.credential.as_ref().map(|c| &c.capability.scope), Some(Scope::Files(_)));
+        // store. Skipped for a file-scoped invite (its narrowed catalog only
+        // exists once the granted files are written) and for a user-selected
+        // subset (its file set hashes to a different manifest id than the
+        // origin's, so it can't seed back under the shared id).
+        let scoped = req.select.is_some()
+            || matches!(req.credential.as_ref().map(|c| &c.capability.scope), Some(Scope::Files(_)));
         if seed_partial && !scoped {
             let setup = start_partial_seed(
                 node,
@@ -3592,18 +4172,200 @@ async fn check_remote_version(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no sources to ask")))
 }
 
-/// A [`SwarmConfig`] honouring the subscription's per-file scope, if any.
+/// A [`SwarmConfig`] honouring both the subscription's per-file invite scope and
+/// the user's pre-download file selection — the download is restricted to the
+/// intersection of the two (an empty intersection means "nothing to fetch").
 ///
 /// We deliberately leave `manifest_id` unset: sources are origins/replicas that
 /// each serve one share, and a rescan changes a share's id, so pinning it would
 /// break resync. A multi-share relay only ever appears as a *supplementary*
 /// source next to an origin that answers the metadata request.
 fn swarm_config_for(req: &SubscribeRequest) -> SwarmConfig {
-    let allowed_paths = req.credential.as_ref().and_then(|c| match &c.capability.scope {
+    let scope_paths = req.credential.as_ref().and_then(|c| match &c.capability.scope {
         Scope::All => None,
         Scope::Files(paths) => Some(paths.clone()),
     });
+    let allowed_paths = match (scope_paths, req.select.clone()) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (Some(scope), Some(select)) => {
+            let scope: HashSet<String> = scope.into_iter().collect();
+            Some(select.into_iter().filter(|p| scope.contains(p)).collect())
+        }
+    };
     SwarmConfig { allowed_paths, ..SwarmConfig::default() }
+}
+
+/// Fetch just `req`'s manifest so the GUI can show a file/destination picker.
+/// Resolves sources from the tracker when `req.sources` is empty (a discovered
+/// public share), authenticates for a private one, and returns the share's file
+/// list without pulling any chunk data.
+async fn run_preview(
+    node: &Node,
+    mut req: SubscribeRequest,
+    tracker_url: Option<&str>,
+) -> anyhow::Result<crate::state::SharePreview> {
+    if let Some(url) = tracker_url {
+        merge_tracked_sources(url, req.manifest_id, &mut req.sources).await;
+    }
+    anyhow::ensure!(
+        !req.sources.is_empty(),
+        "no sources — paste a share link, or set a tracker URL for a discovered share"
+    );
+
+    let mut last_err = None;
+    for addr in req.sources.clone() {
+        let attempt = async {
+            let peer = node.connect(addr.clone()).await?;
+            if let Some(cred) = &req.credential {
+                node.authenticate(peer, cred).await?;
+            }
+            anyhow::Ok(node.fetch_manifest(peer, Some(req.manifest_id)).await?)
+        };
+        match attempt.await {
+            Ok(m) => {
+                let name = if req.name.is_empty() { m.name.clone() } else { req.name.clone() };
+                let files = m
+                    .files
+                    .iter()
+                    .map(|f| crate::state::PreviewFile { path: f.path.clone(), size: f.size })
+                    .collect();
+                return Ok(crate::state::SharePreview {
+                    name,
+                    manifest_id: req.manifest_id,
+                    version: m.version,
+                    total_bytes: m.total_size(),
+                    files,
+                    dirs: m.dirs.clone(),
+                    request: SubscribeRequest { select: None, ..req },
+                });
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no source answered the manifest request")))
+}
+
+/// Re-check a completed download against `manifest` and repair any file whose
+/// bytes on disk no longer match. The check is local: re-chunk the output tree,
+/// see which chunks the stored [`ChunkList`]s need that the tree can't supply.
+/// If none are missing, no network is touched. Otherwise pull just the damaged
+/// files' chunks from the swarm (pinned to this subscription's own manifest id)
+/// and rewrite exactly those files.
+#[allow(clippy::too_many_arguments)]
+async fn run_verify(
+    node: &Node,
+    id: TransferId,
+    req: SubscribeRequest,
+    output_dir: PathBuf,
+    manifest: Manifest,
+    chunk_lists: BTreeMap<String, ChunkList>,
+    tx: mpsc::Sender<Command>,
+    rendezvous_url: Option<String>,
+) -> anyhow::Result<()> {
+    let name = sanitize(&req.name).unwrap_or_else(|| hex(&req.manifest_id));
+    let pinned_id = manifest.id();
+
+    // 1. Re-chunk what's on disk and find the chunks the manifest needs that the
+    //    tree can no longer produce (a corrupt or deleted file).
+    let scan_dir = output_dir.clone();
+    let scan_name = name.clone();
+    let scan_version = manifest.version;
+    let lists = chunk_lists.clone();
+    let files: Vec<(String, u64)> =
+        manifest.files.iter().map(|f| (f.path.clone(), f.size)).collect();
+    let (mut mem, bad_files, checked_files, checked_bytes) =
+        tokio::task::spawn_blocking(move || {
+            let mut mem = MemoryChunkStore::new();
+            let _ = snapshot_dir(&scan_dir, scan_name, scan_version, &mut mem);
+            let mut bad = BTreeSet::new();
+            let mut checked_files = 0usize;
+            let mut checked_bytes = 0u64;
+            for (path, size) in &files {
+                checked_files += 1;
+                checked_bytes += *size;
+                let Some(list) = lists.get(path) else {
+                    bad.insert(path.clone());
+                    continue;
+                };
+                if list.chunks.iter().any(|c| !mem.contains(&c.hash)) {
+                    bad.insert(path.clone());
+                }
+            }
+            (mem, bad, checked_files, checked_bytes)
+        })
+        .await?;
+
+    if bad_files.is_empty() {
+        let _ = tx
+            .send(Command::VerifyDone {
+                id,
+                outcome: Box::new(VerifyOutcome {
+                    healthy: true,
+                    checked_files,
+                    checked_bytes,
+                    repaired: Vec::new(),
+                }),
+            })
+            .await;
+        return Ok(());
+    }
+
+    tracing::info!(id, bad = bad_files.len(), "verify: files need repair, fetching from the swarm");
+
+    // 2. Pull only the damaged files' chunks, pinned to our own manifest id so a
+    //    source that has moved on to a newer version can't feed us a mismatch.
+    let mut sources = req.sources.clone();
+    if let Some(url) = rendezvous_url.as_deref() {
+        merge_tracked_sources(url, req.manifest_id, &mut sources).await;
+    }
+    anyhow::ensure!(!sources.is_empty(), "a file needs repair but the subscription has no sources");
+    let peers = node.connect_all(&sources).await?;
+    if let Some(cred) = &req.credential {
+        node.authenticate_all(&peers, cred).await?;
+    }
+
+    let base = swarm_config_for(&req);
+    let allowed = match base.allowed_paths {
+        Some(scoped) => {
+            let scoped: HashSet<String> = scoped.into_iter().collect();
+            bad_files.iter().filter(|p| scoped.contains(*p)).cloned().collect()
+        }
+        None => bad_files.iter().cloned().collect::<Vec<_>>(),
+    };
+    let config = SwarmConfig {
+        allowed_paths: Some(allowed),
+        narrow_manifest: false,
+        manifest_id: Some(pinned_id),
+        ..SwarmConfig::default()
+    };
+
+    let progress_tx = tx.clone();
+    node.download_share_multi_with_progress(&peers, &mut mem, config, move |p: SwarmProgress| {
+        let _ = progress_tx.try_send(Command::VerifyProgress { id, p });
+    })
+    .await?;
+
+    // 3. Overwrite exactly the files that failed the check.
+    let out = output_dir.clone();
+    let m2 = manifest.clone();
+    let l2 = chunk_lists.clone();
+    let bad2 = bad_files.clone();
+    let rebuilt =
+        tokio::task::spawn_blocking(move || write_files(&out, &m2, &l2, &mem, &bad2)).await??;
+
+    let _ = tx
+        .send(Command::VerifyDone {
+            id,
+            outcome: Box::new(VerifyOutcome {
+                healthy: false,
+                checked_files,
+                checked_bytes,
+                repaired: rebuilt,
+            }),
+        })
+        .await;
+    Ok(())
 }
 
 fn row_from_meta(
@@ -3736,95 +4498,80 @@ async fn start_nas_accel(
     shares: Vec<ShareLink>,
     paused: Vec<String>,
     operator_seed: [u8; 32],
-    rendezvous_url: Option<String>,
     storage_cap_bytes: Option<u64>,
 ) -> anyhow::Result<(AccelHandle, AcceleratorState)> {
     anyhow::ensure!(!shares.is_empty(), "a NAS accelerator needs at least one share");
     tokio::fs::create_dir_all(&dir).await.ok();
 
-    let mut rows = Vec::new();
-    let mut tokens = Vec::new();
-    let mut nas_nodes: Vec<(Hash, Arc<Node>)> = Vec::new();
-    let mut first_seed: Option<[u8; 32]> = None;
-    // Running total of committed share bytes, so the storage cap is enforced
-    // across the whole boot batch, not just per share.
-    let mut committed: u64 = 0;
-    for link in &shares {
-        let seed = derive_share_seed(&operator_seed, link.manifest_id);
-        let is_paused = paused.iter().any(|p| p == &link.manifest_id.to_hex());
-        let max_bytes = storage_cap_bytes.map(|c| c.saturating_sub(committed));
-        match nas_replicate(
-            &dir,
-            net::keypair_from_seed(seed),
-            link,
-            rendezvous_url.as_deref(),
-            COMPRESS_REPLICA,
-            max_bytes,
-            |_| {},
-        )
-        .await
-        {
-            Ok((node, m, chunks)) => {
-                committed += m.total_bytes;
-                first_seed.get_or_insert(seed);
-                let replica_path = Some(dir.join(m.manifest_id.to_hex()));
-                if is_paused {
-                    // Keep the replica current on disk, but don't serve it.
-                    node.shutdown().await;
-                    let mut row = row_from_meta(&m, Some(chunks as u64), None, replica_path);
-                    row.seeding = false;
-                    rows.push(row);
-                } else {
-                    let addr = node.listen_addr().await.ok().map(|a| a.to_string());
-                    nas_nodes.push((m.manifest_id, Arc::new(node)));
-                    rows.push(row_from_meta(&m, Some(chunks as u64), addr, replica_path));
-                }
-                tokens.push(link.clone().encode());
-            }
-            Err(e) => {
-                tracing::warn!(name = %link.name, error = %format!("{e:#}"), "nas could not replicate share");
-                rows.push(err_row(&link.name, &link.manifest_id.to_hex(), format!("{e:#}")));
-            }
-        }
-    }
+    // One long-lived pulling node, reused for every share's replication and
+    // every retry — spawning a fresh swarm (with its UPnP probe) per add was a
+    // recurring few-second cost.
+    let scratch = Arc::new(Node::spawn().await?);
 
-    let peer_id = match nas_nodes.first() {
-        Some((_, n)) => n.peer_id(),
-        None => net::keypair_from_seed(
-            first_seed.ok_or_else(|| anyhow::anyhow!("no share could be replicated"))?,
-        )
+    // Build the handle immediately with a placeholder row per share; the actual
+    // replicate-and-seed work is kicked off (concurrently) by
+    // `Manager::kick_off_nas_shares` once `AcceleratorReady` installs this.
+    let rows: Vec<AccelShareRow> = shares
+        .iter()
+        .map(|link| {
+            let id = link.manifest_id.to_hex();
+            let served = !paused.iter().any(|p| p == &id);
+            replicating_row(&link.name, &id, served)
+        })
+        .collect();
+    let tokens: Vec<String> = shares.iter().map(|l| l.clone().encode()).collect();
+
+    let peer_id = net::keypair_from_seed(derive_share_seed(&operator_seed, shares[0].manifest_id))
         .public()
-        .to_peer_id(),
-    };
-    let listen_addrs = match nas_nodes.first() {
-        Some((_, n)) => n.listen_addr().await.ok().into_iter().collect(),
-        None => Vec::new(),
-    };
-    let replica_chunks = rows.iter().filter_map(|r| r.replica_chunks).sum::<u64>() as usize;
-    let replica_used_bytes = rows.iter().filter_map(|r| r.disk_bytes).sum::<u64>();
+        .to_peer_id();
     let state = AcceleratorState {
         role: AcceleratorRole::Nas,
         peer_id,
-        listen_addrs,
+        listen_addrs: Vec::new(),
         detail: accel_detail(AcceleratorRole::Nas, &rows),
         cache: None,
-        replica_chunks: Some(replica_chunks),
+        replica_chunks: Some(0),
         replica_dir: Some(dir.clone()),
         replica_free_bytes: free_space(&dir).ok(),
-        replica_used_bytes: Some(replica_used_bytes),
+        replica_used_bytes: Some(0),
         storage_cap_bytes,
         shares: rows.clone(),
     };
     let handle = AccelHandle {
         role: AcceleratorRole::Nas,
         relay: None,
-        meta: None,
+        meta: Some(scratch),
         nas_dir: Some(dir),
-        nas_nodes,
+        nas_nodes: Vec::new(),
         rows,
         tokens,
     };
     Ok((handle, state))
+}
+
+/// A NAS share row before its replica exists: no metadata yet, marked
+/// `replicating` while it is served (`seeding`), plain while paused.
+fn replicating_row(name: &str, manifest_id: &str, seeding: bool) -> AccelShareRow {
+    AccelShareRow {
+        manifest_id: manifest_id.to_string(),
+        name: name.to_string(),
+        files: 0,
+        total_bytes: 0,
+        version: 0,
+        private: false,
+        replica_chunks: None,
+        disk_bytes: None,
+        replica_path: None,
+        seeding,
+        listen_addr: None,
+        replicating: seeding.then_some(ReplicaProgress {
+            chunks_done: 0,
+            chunks_total: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+        }),
+        error: None,
+    }
 }
 
 /// Bytes on disk for one NAS replica: the sum of every chunk file across the

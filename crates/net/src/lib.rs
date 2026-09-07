@@ -38,7 +38,7 @@ pub use catalog::{Catalog, ServeStats};
 pub use link::ShareLink;
 pub use gaggle_core::{
     CacheStats, Capability, DiskChunkStore, Invite, LruChunkCache, Scope, ShareKeypair,
-    SharePublicKey, SignedCapability, manifest,
+    SharePublicKey, SharedChunkStore, SignedCapability, manifest,
 };
 pub use libp2p::identity::Keypair;
 pub use libp2p::{Multiaddr, PeerId};
@@ -139,10 +139,23 @@ impl ShareKey {
     }
 }
 
+/// A dead candidate address should fail fast so the next one — or a rendezvous
+/// punch — gets its turn. libp2p's default QUIC handshake timeout is 5s, and a
+/// share link that carries several stale addresses (an old LAN IP, a relay
+/// circuit whose reservation lapsed after a restart) stacks those up before the
+/// live path is even tried; 3s keeps a genuine slow-network handshake working
+/// while cutting the wait on a batch of dead addresses roughly in half.
+const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn tuned_quic(mut cfg: libp2p::quic::Config) -> libp2p::quic::Config {
+    cfg.handshake_timeout = QUIC_HANDSHAKE_TIMEOUT;
+    cfg
+}
+
 pub(crate) fn build_peer_swarm_with(keypair: Keypair) -> anyhow::Result<Swarm<PeerBehaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_quic()
+        .with_quic_config(tuned_quic)
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(PeerBehaviour::new)?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -153,7 +166,7 @@ pub(crate) fn build_peer_swarm_with(keypair: Keypair) -> anyhow::Result<Swarm<Pe
 pub(crate) fn build_relay_swarm_with(keypair: Keypair) -> anyhow::Result<Swarm<RelayBehaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_quic()
+        .with_quic_config(tuned_quic)
         .with_behaviour(RelayBehaviour::new)?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();

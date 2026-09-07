@@ -43,7 +43,7 @@ pub use manifest::{FileEntry, Manifest, ManifestDiff};
 pub use merkle::{MerkleProof, MerkleTree, Side, merkle_root};
 pub use snapshot::{
     IndexedSnapshot, ScanProgress, Snapshot, SyncOutcome, index_dir, index_dir_with_progress,
-    snapshot_dir, sync_share, write_share,
+    snapshot_dir, sync_share, write_files, write_share,
 };
 pub use store::{
     CacheStats, ChunkLocation, ChunkStore, DedupStats, DISK_ZSTD_LEVEL, DiskChunkStore,

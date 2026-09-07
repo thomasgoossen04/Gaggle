@@ -124,10 +124,22 @@ fn run(up: Updater) -> anyhow::Result<()> {
         .ok()
         .map(|m| updater::decide(installed.as_ref(), &m.version, up.channel()));
 
-    if updater::wants_auto_launch(installed.is_some(), gui_present, fetched)
-        && updater::launch_installed().is_ok()
-    {
-        return Ok(());
+    if updater::wants_auto_launch(installed.is_some(), gui_present, fetched) {
+        // macOS `.dmg` install: the GUI lives in this same bundle. Replace this
+        // process with it in place — one PID, one dock tile, the bundle's icon
+        // and name, no launcher window flash.
+        #[cfg(target_os = "macos")]
+        if paths::macos_bundle_root().is_some()
+            && let Ok(bin) = paths::gui_binary()
+            && bin.exists()
+        {
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&bin).exec(); // returns only on failure
+            eprintln!("warning: could not exec {}: {err}", bin.display());
+        }
+        if updater::launch_installed().is_ok() {
+            return Ok(());
+        }
     }
 
     run_window(up);

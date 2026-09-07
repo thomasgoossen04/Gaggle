@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app_state::{
-    AcceleratorRequest, AcceleratorRole, App, AppEvent, AppState, Multiaddr, Scope, Settings,
-    ShareLink, SubscribeRequest, TransferStatus,
+    AcceleratorRequest, AcceleratorRole, App, AppEvent, AppState, Multiaddr, PreviewStatus, Scope,
+    Settings, ShareLink, SubscribeRequest, TransferStatus,
 };
 use net::RelayNode;
 use tempfile::TempDir;
@@ -126,6 +126,8 @@ async fn share_a_folder_then_subscribe_and_complete() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     let done = wait_for(&leech, 60, |s| {
@@ -168,6 +170,8 @@ async fn a_finished_download_seeds_and_can_be_paused() {
         manifest_id,
         sources: vec![origin_addr],
         credential: None,
+        select: None,
+        dest: None,
     });
     let done = wait_for(&leech, 60, |s| {
         s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete && r.seeding)
@@ -185,6 +189,8 @@ async fn a_finished_download_seeds_and_can_be_paused() {
         manifest_id,
         sources: vec![leech_seed_addr],
         credential: None,
+        select: None,
+        dest: None,
     });
     let done2 = wait_for(&leech2, 60, |s| {
         s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
@@ -233,6 +239,8 @@ async fn a_running_download_seeds_the_chunks_it_already_has() {
         manifest_id,
         sources: vec![origin_addr.clone()],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     // Mid-flight: the partial store is already being served from a node of its
@@ -336,6 +344,8 @@ async fn a_seed_streams_from_disk_under_a_small_ram_budget() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     // Generous margin: every chunk now also runs through wire_crypto (compress
@@ -371,6 +381,8 @@ async fn completing_a_download_removes_its_partial_dir() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     wait_for(&leech, 60, |s| {
@@ -412,6 +424,8 @@ async fn progress_is_reported_before_completion() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     // We must observe at least one progress tick with 0 < done < total.
@@ -458,6 +472,8 @@ async fn pause_keeps_partial_progress_and_resume_completes() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     // Let a little data flow, then pause.
@@ -562,6 +578,8 @@ async fn a_download_is_restored_after_a_restart() {
             manifest_id,
             sources: vec![addr],
             credential: None,
+            select: None,
+            dest: None,
         });
         wait_for(&leech, 120, |s| {
             s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
@@ -625,6 +643,8 @@ async fn removing_a_seed_makes_later_subscribers_fail() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     let failed = wait_for(&leech, 30, |s| {
@@ -657,6 +677,8 @@ async fn rescan_then_resync_pulls_only_the_delta() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
     let done = wait_for(&leech, 60, |s| {
         s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
@@ -727,6 +749,8 @@ async fn private_share_needs_a_minted_invite() {
         manifest_id,
         sources: vec![addr.clone()],
         credential: None,
+        select: None,
+        dest: None,
     });
     let refused = wait_for(&stranger, 30, |s| {
         s.downloads().next().is_some_and(|r| r.status == TransferStatus::Failed)
@@ -773,6 +797,8 @@ async fn remove_and_delete_wipes_the_output_folder() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
     let done = wait_for(&leech, 60, |s| {
         s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
@@ -1101,6 +1127,8 @@ async fn a_share_reachable_only_through_a_public_relay_still_completes() {
         manifest_id,
         sources: vec![circuit],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     let done = wait_for(&leech, 60, |s| {
@@ -1203,6 +1231,8 @@ async fn a_share_reachable_only_through_nat_rendezvous_still_completes() {
         manifest_id,
         sources: vec![bogus_addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     let done = wait_for(&leech, 60, |s| {
@@ -1304,6 +1334,8 @@ async fn a_download_swarms_across_tracker_discovered_replicas() {
         manifest_id,
         sources: vec![origin_addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     let done = wait_for(&leech, 60, |s| {
@@ -1461,6 +1493,8 @@ async fn stats_history_accumulates_local_download_and_upload_rates() {
         manifest_id,
         sources: vec![addr],
         credential: None,
+        select: None,
+        dest: None,
     });
 
     wait_for(&leech, 60, |s| {
@@ -1494,4 +1528,130 @@ async fn stats_history_accumulates_local_download_and_upload_rates() {
     // …and the sampler keeps running: the history grows over the next few ticks.
     let after = wait_for(&leech, 15, |s| s.stats.local.len() > before.stats.local.len()).await;
     assert!(after.stats.local.len() > before.stats.local.len());
+}
+
+/// `preview_share` fetches the file list without downloading, and a subscription
+/// with a `select` only materializes the chosen files — and does not seed back.
+#[tokio::test]
+async fn preview_then_selective_subscribe_only_pulls_the_chosen_files() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let addr = seed.share_addr.clone().unwrap();
+    let (manifest_id, seed_bytes) = (seed.manifest_id, seed.total_bytes);
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.preview_share(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![addr],
+        credential: None,
+        select: None,
+        dest: None,
+    });
+
+    // The preview lands with every file listed, no chunk data pulled.
+    let previewed = wait_for(&leech, 30, |s| {
+        matches!(s.share_preview, Some(PreviewStatus::Ready(_)))
+    })
+    .await;
+    let PreviewStatus::Ready(preview) = previewed.share_preview.clone().unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(preview.files.len(), 3);
+    assert_eq!(preview.total_bytes, seed_bytes);
+    assert!(preview.files.iter().any(|f| f.path == "pack.bin"));
+
+    // Download only the small text file.
+    leech.subscribe(SubscribeRequest {
+        select: Some(vec!["readme.txt".into()]),
+        ..preview.request.clone()
+    });
+    leech.clear_preview();
+
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    let id = row.id;
+    assert_eq!(row.selected_files, Some(1));
+
+    let output = row.output_dir.clone().unwrap();
+    assert!(output.join("readme.txt").is_file());
+    assert!(!output.join("pack.bin").exists(), "an unselected file must not be written");
+    assert!(!output.join("cfg").exists(), "an unselected folder must not be written");
+    assert_eq!(
+        fs::read(output.join("readme.txt")).unwrap(),
+        fs::read(folder.path().join("readme.txt")).unwrap()
+    );
+
+    // A partial download never seeds back — its file set has a different id.
+    let after = wait_for(&leech, 10, |s| s.get(id).is_some_and(|r| r.status == TransferStatus::Complete))
+        .await;
+    assert!(!after.get(id).unwrap().seeding, "a selective download must not seed");
+}
+
+/// "Verify & repair" restores a file whose bytes were corrupted on disk after a
+/// completed download, and reports a clean tree as healthy with no repair.
+#[tokio::test]
+async fn verify_and_repair_fixes_a_corrupted_file() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_local_share(folder.path());
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    let addr = seed.share_addr.clone().unwrap();
+    let manifest_id = seed.manifest_id;
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![addr],
+        credential: None,
+        select: None,
+        dest: None,
+    });
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    let id = row.id;
+    let output = row.output_dir.clone().unwrap();
+
+    // A clean tree verifies healthy without any repair.
+    leech.verify_share(id);
+    let ok = wait_for(&leech, 30, |s| s.get(id).is_some_and(|r| r.verify_result.is_some())).await;
+    let report = ok.get(id).unwrap().verify_result.clone().unwrap();
+    assert!(report.healthy && report.repaired.is_empty() && report.error.is_none());
+    assert_eq!(report.checked_files, 3);
+
+    // Corrupt a file on disk, then verify again — it is refetched and rewritten.
+    fs::write(output.join("cfg/game.ini"), b"tampered").unwrap();
+    leech.verify_share(id);
+    let repaired = wait_for(&leech, 60, |s| {
+        s.get(id).is_some_and(|r| {
+            r.verify_result.as_ref().is_some_and(|v| !v.healthy && v.error.is_none())
+        })
+    })
+    .await;
+    let report = repaired.get(id).unwrap().verify_result.clone().unwrap();
+    assert_eq!(report.repaired, vec!["cfg/game.ini".to_string()]);
+    dir_matches(folder.path(), &output);
+
+    let final_row = repaired.get(id).unwrap();
+    assert_eq!(final_row.status, TransferStatus::Complete);
+    assert!(!final_row.verifying);
 }

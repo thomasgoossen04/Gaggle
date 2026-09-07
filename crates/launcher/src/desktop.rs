@@ -1,7 +1,12 @@
 //! Native OS integration: an apps-menu / Start Menu entry (always created on
 //! install) and an optional desktop shortcut, both pointing at the installed
-//! `gaggle-launcher` so every open re-checks for updates. macOS additionally
-//! gets a real `Gaggle.app` bundle.
+//! `gaggle-launcher` so every open re-checks for updates.
+//!
+//! macOS: this only runs on the **non-bundle** path — someone who grabbed the
+//! bare `gaggle-launcher` binary instead of the `.dmg`. It builds a small
+//! `~/Applications/Gaggle.app` shim around that binary. The normal `.dmg`
+//! install is already an `.app`, updates itself in place
+//! ([`crate::updater::install_macos_bundle`]), and never reaches here.
 //!
 //! Best-effort throughout: a shortcut failure is logged by the caller but
 //! never fails the install (see [`crate::updater::install_archive`]).
@@ -10,8 +15,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// The Gaggle goose mark, traced from `assets/logo.jpg` into `assets/icon.svg`
-/// and rasterized from there.
+/// The Gaggle app icon: the goose mark (traced from `assets/logo.jpg`) in warm
+/// white on the brand rounded-square tile, so it stays legible on light or dark
+/// docks. `assets/icon.svg` is the source; the png/ico/icns are rasterized from
+/// it.
 #[cfg(target_os = "linux")]
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 #[cfg(windows)]

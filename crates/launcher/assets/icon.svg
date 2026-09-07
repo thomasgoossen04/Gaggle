@@ -3,10 +3,14 @@
  width="1119" height="1119" viewBox="0 0 1119 1119"
  preserveAspectRatio="xMidYMid meet">
 <metadata>
-Created by potrace 1.16, written by Peter Selinger 2001-2019
+Gaggle app icon. Goose mark traced by potrace 1.16 (Peter Selinger), set in
+warm white on the brand rounded-square tile so it stays legible on light or
+dark docks. icon.png / icon.ico / icon.icns are rasterized from this file.
 </metadata>
+<rect x="0" y="0" width="1119" height="1119" rx="196" ry="196" fill="#37342f"/>
+<g transform="translate(559.5,559.5) scale(0.83) translate(-559.5,-559.5)">
 <g transform="translate(0.000000,1119.000000) scale(0.100000,-0.100000)"
-fill="#37342f" stroke="none">
+fill="#f2eee6" stroke="none">
 <path d="M956 8370 c13 -51 93 -210 147 -291 80 -120 201 -255 322 -358 57
 -50 116 -98 130 -107 47 -30 19 -25 -80 16 -186 78 -418 201 -650 345 -55 35
 -111 66 -124 70 l-23 7 18 -32 c55 -95 275 -293 477 -429 98 -66 292 -180 331
@@ -57,5 +61,6 @@ fill="#37342f" stroke="none">
 m-4024 -1445 c0 -3 -39 -16 -87 -31 -446 -132 -845 -347 -1158 -624 -44 -39
 -83 -71 -88 -71 -12 0 28 71 77 137 176 234 641 465 1155 573 98 21 101 22
 101 16z"/>
+</g>
 </g>
 </svg>
