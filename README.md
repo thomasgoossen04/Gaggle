@@ -56,9 +56,12 @@ window's `CH` toggle, or `gaggle-launcher --channel beta`.
 
 ### Share a folder
 
-1. **Shares** tab → **Add folder**. Gaggle indexes it in place (no copy) and starts seeding.
-2. **Copy link** for a public share, or **Add private folder** to require an invite for
-   every connection.
+1. **Shares** tab → **Add folder** (or **Add private folder** to require an invite for
+   every connection). A short form opens: give the share a display name, version and
+   description, and add **launch entries** — a game's `.exe`, a server's `start.sh`, a
+   `.bat` — each tagged with the OS it's built for. All optional; leave it blank to skip.
+2. Gaggle writes what you entered into the folder as `.gaggle-meta.toml`, indexes the
+   folder in place (no copy) and starts seeding. **Copy link** to share it.
 3. For a private share, expand its row, pick a scope (whole share or specific files) and
    an optional expiry, and **Mint invite**. Send the `gaggleshare1…` token to the other
    person. An invite can only be revoked by letting it expire, so keep scopes and expiries
@@ -80,6 +83,9 @@ window's `CH` toggle, or `gaggle-launcher --channel beta`.
 5. **Verify & repair** on a finished download re-checks every file against the manifest
    and refetches only the parts that no longer match (a local check when the tree is
    intact — nothing is pulled).
+6. If the share carries launch entries, each row gets a **▶ Run** button. A Windows
+   entry on Linux/macOS runs through Wine (set a Proton wrapper under
+   **Settings → Wine/Proton command** if you have one).
 
 ### Keep a copy up to date
 
@@ -100,6 +106,10 @@ A rescanned private share needs a fresh invite, since invites pin one manifest.
   the whole thing or just the files you want, into a folder you choose.
 - **Verify & repair.** Re-check a finished download against the manifest and refetch only
   the pieces that don't match — Gaggle's equivalent of "verify integrity".
+- **Share metadata & launch.** Attach a name, version, description and per-OS launch
+  entries to a share; they travel with it as `.gaggle-meta.toml` and give every
+  downloader a **▶ Run** button — with a Wine/Proton path for a Windows game on
+  Linux/macOS.
 - **Seeds while downloading.** A transfer uploads the chunks it already holds and keeps
   serving after it finishes.
 - **NAT traversal.** mDNS on the LAN, UPnP for a direct port, accelerator-assisted

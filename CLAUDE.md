@@ -87,7 +87,16 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   **UPnP**, a **relay client** and **dcutr**. mDNS (`libp2p::mdns::tokio`, deliberately
   skips loopback interfaces) finds same-LAN peers within milliseconds with zero DHT
   round trip and no NAT/relay concerns — the fastest and most reliable path when it
-  applies. It resolves a route to a discovered peer (routing
+  applies. mDNS is a `Toggle` in `PeerBehaviour`: `PeerBehaviour::new_with(_, _,
+  enable_mdns)` / `build_peer_swarm_with_opts` / `Node::spawn_inner`'s `enable_mdns`
+  arg. It's **on** for every normal peer and **off** for an accelerator's nodes
+  (`Node::spawn_accelerator` / `spawn_serving_with_identity_accelerator`, used by
+  `net::accel` and both the standalone daemon's relay meta node and the GUI's
+  in-process accelerator) — an always-on accelerator is reached via the tracker /
+  rendezvous / DHT / relay and never needs LAN discovery, and running mDNS on a
+  server with a WireGuard / Tailscale / other multicast-refusing interface makes
+  `libp2p_mdns` log a steady stream of `error`s ("error sending packet on iface
+  address … Required key not available" — `ENOKEY`). It resolves a route to a discovered peer (routing
   table → learned addresses → `get_closest_peers`) before requesting, and reaches
   NAT'd peers through a relay circuit, upgrading to a direct connection when dcutr's
   hole-punch lands. The UPnP behaviour (`libp2p::upnp::tokio`) tries to map the QUIC
@@ -171,7 +180,16 @@ that would make the swarm swallow the identify address candidates dcutr needs.
 (`net::addr_is_unspecified`) — a node listening on `/ip4/0.0.0.0/...` can surface
 the bind address itself on kernels where `if-watch` doesn't enumerate concrete
 interfaces (containers, some NAS boxes), and libp2p-quic rejects a dial to it with
-`MultiaddrNotSupported`. The accelerator daemon additionally strips loopback
+`MultiaddrNotSupported` — **and** any link-local / `ip6zone`-scoped entry
+(`net::addr_is_link_local`: `169.254/16`, `fe80::/10`, `/ip6zone/<iface>/…`),
+which only resolves on the box it was minted on and off-box is just one more dead
+dial. Those dead candidates are why a subscriber used to see a wall-of-text error
+when a source was unreachable: `libp2p::swarm::DialError::Transport`'s `Display`
+expands every candidate address with its full source chain
+("Multiaddr is not supported: …" ×N). `net::node::summarize_dial_error` collapses
+that variant to a one-line "no reachable address (N candidates tried…)" for the
+caller / GUI; the per-address detail is still logged at `debug` in the swarm loop.
+The accelerator daemon additionally strips loopback
 (`net::addr_is_loopback`) from what it announces to an *external* tracker /
 publishes in a rendezvous answer (kept only for its own in-process tracker, which
 a same-machine downloader may use); `app-state::merge_tracked_sources` also skips
@@ -188,7 +206,21 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   files on demand, capped by `Settings::seed_cache_bytes` (default 256 MiB, floor 32 MiB)
   of hot-chunk cache; `App::add_private_share` also mints a per-share `ShareKeypair` and calls
   `restrict_to_invite_holders`, and `App::mint_invite(id, Scope, expiry)` hands back a
-  `gaggleshare1…` token in `AppState::minted_invite`. `App::subscribe(SubscribeRequest)`
+  `gaggleshare1…` token in `AppState::minted_invite`.
+  `App::add_share_with_meta(dir, private, Option<ShareMeta>)` is the metadata-aware
+  create path: it `normalized()`s the meta and writes `<dir>/.gaggle-meta.toml`
+  **before** indexing (an empty value deletes any stale file), so the metadata is
+  part of the snapshot. `TransferRow::{meta, run_targets}` are populated wherever a
+  share's files first land — `LocalShareReady`, `RescanDone`, `DownloadDone`,
+  `CompletedSubRestored`, `ResyncDone` — by `load_share_meta` (a malformed file is
+  logged and treated as absent, never blocking a transfer). `App::run_target(id,
+  index)` re-reads the meta from disk (honouring hand edits) and `spawn_launch`es
+  entry `index` as a detached child: native entries run directly (`.sh` via `sh`,
+  `.bat`/`.cmd` via `cmd /c`, `+x` added best-effort on unix), a Windows entry on a
+  non-Windows host with `compat` set is handed to `Settings::compat_command()`
+  (`compat_command` → `$GAGGLE_COMPAT_CMD` → `"wine"`); a launch failure lands in
+  `TransferRow::run_error`. The GUI's per-row "▶ Run" button(s) come straight from
+  `run_targets`. `App::subscribe(SubscribeRequest)`
   pulls a remote share into a `DiskChunkStore` under the download dir (so pause = abort,
   resume = top up), then `write_share`s the tree out. Progress rides
   `Node::download_share_multi_with_progress` (`SwarmProgress` per chunk).
@@ -237,8 +269,17 @@ Milestones 8–10 (GUI v1/v2 + delta sync) are implemented and tested:
   `App::resume(id)` re-serves. Flipping `seed_after_download` off stops every completed
   seed; flipping it on starts every one not individually paused. The GUI Transfers tab
   gets a per-row Start/Pause-seeding button and a `seeding` chip; Settings → Startup gets
-  the global toggle. A restart re-runs the subscription, which re-completes and re-seeds
-  (unless paused) — no separate persisted seed record needed.
+  the global toggle. A *finished* download is persisted separately from an in-flight one
+  (`PersistedState::completed_subscriptions: Vec<PersistedSub>` — request + `output_dir` +
+  origin `name` + `version`) and restored by `Manager::restore_completed_sub`: the row is
+  created straight as `Complete` and a single **offline** re-index of the output tree
+  (`index_dir`, no network) rebuilds `SubEntry`'s manifest + chunk lists (the pinned
+  `name`/`version` reproduce the origin's manifest id), then `serve_completed_tree` — the
+  shared serving-node helper `start_completed_seed` also uses — re-seeds it (unless paused).
+  So a done-and-seeding share no longer flashes back to "Connecting" with an empty progress
+  bar on every launch, and comes back fine even with the origin offline. Only an unfinished
+  download re-runs `subscribe` (resuming from its partial chunks); a re-index failure
+  (files deleted/unreadable) falls back to that path via `Command::CompletedSubRestoreFailed`.
 - **Seed-while-downloading** — when `Settings::seed_while_downloading` is set (default
   true), a subscription doesn't wait for completion to give back: `run_download`
   wraps the download's `DiskChunkStore` in `gaggle_core::SharedChunkStore` (a
@@ -421,15 +462,16 @@ share, and can be driven remotely:
   `AppState.stats: StatsSnapshot { local: Vec<SpeedSample>, accelerators: Vec<AccelStatsRow
   { label, history }> }`. `stats::rate_from_cumulative` is the pure diff helper (unit-tested).
   `stats::resample` (also pure/unit-tested) monotone-cubic-interpolates the raw ~2 s
-  samples onto a fixed 90-point grid anchored to a live `now` — the Stats graphs call it
-  every 200 ms redraw so the line glides between readings instead of freezing then
+  samples onto a fixed 60-point grid anchored to a live `now` — the Stats graphs (a
+  Steam-style `gpui_component::chart::BarChart`, one bar per grid point) call it
+  every 200 ms redraw so the bars glide between readings instead of freezing then
   jumping once per sample, and the fixed point count keeps the categorical x-axis from
   folding a wide window's repeated labels onto one position. The graphs pass a `now`
   held `SMOOTH_DELAY` (~3 s, ≈ one reading interval) in the past and `slice_window`
   keeps one sample from *before* the window, so the whole grid — both edges — stays
   bracketed by real samples and slides smoothly rather than flat-holding the newest
   reading and snapping when the next lands. On top of that, `speed_chart_card` eases
-  the *drawn* curve toward each fresh resample per redraw (`Gaggle::stats_ease`, an
+  the *drawn* bar heights toward each fresh resample per redraw (`Gaggle::stats_ease`, an
   `EasedCurve` per graph, time constant `EASE_TAU` ≈ 0.45 s; snaps on a window switch
   or a long tab-away gap) so a reshaped resample morphs over a few frames instead of
   re-jumping every ~2 s — the "wiggle". Readouts (NOW/PEAK) stay on the raw samples.
@@ -548,8 +590,21 @@ share, and can be driven remotely:
   (`✓ verified` / `repaired N file(s)` / `verify failed`)), `update vN` badge,
   `N file(s)` chip for a selective download, per-row ▸ swarm
   inspector = per-source chunk/byte breakdown, plus a "Browse public shares"
-  toggle listing the tracker's open directory with per-row Download), Accelerator (benchmark → suggested role
-  → start relay / NAS → live status), Stats (download/upload `gpui_component::chart::LineChart`s
+  toggle listing the tracker's open directory with per-row Download).
+  Adding a folder opens the **share-metadata form** (`views::share_meta_modal`,
+  `deferred` overlay built lazily from `Gaggle::pending_share` in
+  `sync_share_meta_draft` because `InputState`s need a `&mut Window`): display
+  name / version / description plus repeatable launch entries (label, executable,
+  args, an OS chip row, a "via Wine/Proton" checkbox shown only for a **Windows**
+  target — `TargetOs::supports_compat`, since that is all Wine/Proton run), then
+  "Create share" / "Create private share" →
+  `App::add_share_with_meta`. A row with metadata shows a `ver / description`
+  line and, once its files are on disk, one **"▶ Run"** button per `run_targets`
+  entry (`views::run_buttons` → `App::run_target`); `run_error` renders as a red
+  line. Settings → Downloads & limits has a "Wine/Proton command" field
+  (`Settings::compat_command`).
+  Accelerator (benchmark → suggested role
+  → start relay / NAS → live status), Stats (download/upload `gpui_component::chart::BarChart`s
   over a 1m/5m/15m/1h window — ephemeral `Gaggle::stats_window`; a "Local" / per-remote
   source dropdown — `Gaggle::stats_source: StatsSource`; reads `AppState.stats`, no polling
   of its own), and an editable Settings form. It polls
@@ -574,7 +629,9 @@ share, and can be driven remotely:
 
 Tests: `app-state/tests/transfer_manager.rs` runs real loopback transfers through two
 `App`s — share→subscribe→complete with byte-exact output, incremental progress events,
-pause keeps partial + resume finishes, settings survive a restart, removing a seed makes
+pause keeps partial + resume finishes, settings survive a restart, **a finished download
+restores across a restart with the origin gone — re-indexed offline, straight back to
+`Complete` + seeding, byte-exact tree, no re-download**, removing a seed makes
 later subscribers fail, **rescan→check_updates→resync applies only the delta** (added
 file arrives, removed file is deleted, `version` bumps), **a private share refuses a
 strangers then admits a minted invite**, **benchmark reports throughput + free space**,
@@ -593,8 +650,14 @@ pulling data, then a `select`ed subscribe writes only the chosen file (unselecte
 files/folders absent), reports `selected_files: Some(1)`, and never seeds**, and
 **Verify & repair — a clean tree reports `healthy` with no network; corrupting a
 file on disk then re-verifying refetches and rewrites exactly that file
-(`repaired == ["cfg/game.ini"]`, tree byte-exact again)**. `app-state` unit
-tests cover `Settings`
+(`repaired == ["cfg/game.ini"]`, tree byte-exact again)**, and
+**`share_metadata_travels_and_drives_run_targets` — `add_share_with_meta` writes
+`.gaggle-meta.toml` into the folder, it rides the transfer into the downloaded
+tree, and both the seed and the download row surface `meta` +
+`run_targets` (a `TargetOs::Windows` entry off Windows reports `via_compat`)**.
+`gaggle-core`'s `meta` unit tests cover the TOML round-trip, `is_empty`,
+launch-path validation, `normalized`, and `launchable_on_host`.
+`app-state` unit tests cover `Settings`
 persistence, `ShareLink` round trips, name sanitizing, and `stats::{SpeedHistory,
 rate_from_cumulative, resample, EtaEstimator}` (capping, windowing, counter/clock resets; and that
 `resample` holds a fixed point count, stays within the sample range, and advances the
@@ -940,6 +1003,21 @@ reads. Module layout and how the pieces chain:
   by `ShareKeypair::issue` into a `SignedCapability` (`verify` / `verify_for` check sig,
   expiry, share, manifest). `Invite` wraps it with the manifest id + name and encodes
   to a `gaggle1<base64url>` token. Signing bytes are domain-tagged canonical JSON.
+- **`meta`** — optional, human-editable share metadata, stored **as a real file
+  in the share folder** (`META_FILENAME` = `.gaggle-meta.toml`), so it is
+  chunked / transferred / verified like any other file and lands in every
+  downloader's copy with no manifest or wire-protocol change. `ShareMeta`
+  (`name` / `version` / `description` — all `Option<String>` — plus
+  `launch: Vec<LaunchTarget>`); `LaunchTarget { label, os: TargetOs
+  (Any|Windows|Linux|Macos), path (share-relative), args, workdir, compat }`.
+  `from_toml_str` / `to_toml_string` / `is_empty` / `normalized` (trim, drop
+  blank launch entries, strip leading slashes); `LaunchTarget::{checked_path,
+  checked_workdir}` reuse `manifest::check_rel_path` so a launch path can't
+  escape the share root, `launchable_on_host` says whether the current OS can
+  run it (natively, or a Windows target through Wine/Proton when `compat`).
+  A change to the metadata changes the manifest id — a share with a different
+  launch config *is* a different snapshot; delta sync picks up an edited meta
+  file for free.
 
 Trust flow: the manifest id is authenticated by the `Invite`'s signed `Capability`
 (milestone 7); everything else — chunk lists, chunk bytes — is verified against the
@@ -985,6 +1063,13 @@ header by `WindowOptions::titlebar` — a bare `titlebar: None` there silently d
 can't be resized or closed/minimized/maximized at all on macOS; it must stay
 `Some(TitlebarOptions { title: None, appears_transparent: true, traffic_light_position })`.
 The launcher's splash window (`launcher/src/main.rs`, `ui.rs`) follows the same pattern.
+`main.rs` also has to make the app quittable itself: a unit `Quit` action
+(`gpui::actions!`) wired in the `Application::run` callback via `cx.on_action` →
+`cx.quit()`, `cx.bind_keys` for `cmd-q` / `ctrl-q`, `cx.set_menus` with a single
+"Quit Gaggle" item (this is also what fills the otherwise-empty macOS app menu),
+and `cx.on_window_closed` → `cx.quit()` once no windows remain (the tokio runtime
+is `mem::forget`ed, so nothing else would end the process). Without all of that a
+gpui app on macOS can't be quit at all — Cmd-Q and the app menu do nothing.
 
 ## GUI dependency note
 

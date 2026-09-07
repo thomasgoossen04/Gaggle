@@ -107,18 +107,18 @@ pub struct Node {
 impl Node {
     /// Start a peer that only downloads.
     pub async fn spawn() -> anyhow::Result<Self> {
-        Self::spawn_inner(None, None, None).await
+        Self::spawn_inner(None, None, None, true).await
     }
 
     /// Start a peer that also serves `catalog` over the chunk-exchange protocol.
     pub async fn spawn_serving(catalog: Catalog) -> anyhow::Result<Self> {
-        Self::spawn_inner(Some(catalog), None, None).await
+        Self::spawn_inner(Some(catalog), None, None, true).await
     }
 
     /// [`spawn`](Self::spawn) with a persistent libp2p identity, so the peer
     /// keeps the same [`PeerId`] across restarts.
     pub async fn spawn_with_identity(keypair: crate::Keypair) -> anyhow::Result<Self> {
-        Self::spawn_inner(None, Some(keypair), None).await
+        Self::spawn_inner(None, Some(keypair), None, true).await
     }
 
     /// [`spawn_serving`](Self::spawn_serving) with a persistent libp2p identity.
@@ -126,7 +126,26 @@ impl Node {
         catalog: Catalog,
         keypair: crate::Keypair,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(Some(catalog), Some(keypair), None).await
+        Self::spawn_inner(Some(catalog), Some(keypair), None, true).await
+    }
+
+    /// [`spawn`](Self::spawn) with mDNS LAN discovery **off** — for an
+    /// always-on accelerator, which finds peers through the tracker /
+    /// rendezvous / DHT / relay and never needs same-LAN discovery. On a server
+    /// with a WireGuard / Tailscale / other multicast-refusing interface,
+    /// running mDNS otherwise spews `error`s ("error sending packet on iface
+    /// address … Required key not available").
+    pub async fn spawn_accelerator() -> anyhow::Result<Self> {
+        Self::spawn_inner(None, None, None, false).await
+    }
+
+    /// [`spawn_serving_with_identity`](Self::spawn_serving_with_identity) with
+    /// mDNS LAN discovery **off** — see [`spawn_accelerator`](Self::spawn_accelerator).
+    pub async fn spawn_serving_with_identity_accelerator(
+        catalog: Catalog,
+        keypair: crate::Keypair,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(Some(catalog), Some(keypair), None, false).await
     }
 
     /// [`spawn`](Self::spawn) with an optional persistent identity and an
@@ -137,7 +156,7 @@ impl Node {
         keypair: Option<crate::Keypair>,
         listen: Option<Multiaddr>,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(None, keypair, listen).await
+        Self::spawn_inner(None, keypair, listen, true).await
     }
 
     /// [`spawn_serving`](Self::spawn_serving) with an optional persistent
@@ -149,18 +168,19 @@ impl Node {
         keypair: Option<crate::Keypair>,
         listen: Option<Multiaddr>,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(Some(catalog), keypair, listen).await
+        Self::spawn_inner(Some(catalog), keypair, listen, true).await
     }
 
     async fn spawn_inner(
         catalog: Option<Catalog>,
         keypair: Option<crate::Keypair>,
         listen: Option<Multiaddr>,
+        enable_mdns: bool,
     ) -> anyhow::Result<Self> {
         let keypair = keypair.unwrap_or_else(crate::Keypair::generate_ed25519);
         let identity_seed = crate::identity_seed(&keypair)
             .map_err(|_| anyhow::anyhow!("a Gaggle node needs an Ed25519 identity"))?;
-        let mut swarm = crate::build_peer_swarm_with(keypair)?;
+        let mut swarm = crate::build_peer_swarm_with_opts(keypair, enable_mdns)?;
         let peer_id = *swarm.local_peer_id();
         match listen {
             Some(addr) => swarm.listen_on(addr)?,
@@ -238,8 +258,13 @@ impl Node {
         // A node listening on `/ip4/0.0.0.0/udp/0/quic-v1` can surface the
         // wildcard entry itself (some container/NAS kernels don't enumerate
         // concrete interfaces via `if-watch`); handing that to a peer just
-        // earns a `MultiaddrNotSupported` when they try to dial it.
-        addrs.retain(|a| !crate::addr_is_unspecified(a));
+        // earns a `MultiaddrNotSupported` when they try to dial it. Same for a
+        // link-local (`169.254/16`, `fe80::/10`) or `/ip6zone/`-scoped address:
+        // it only resolves on the interface it was minted on, so to a remote
+        // subscriber it is a dead dial that only lengthens the aggregated
+        // "Multiaddr is not supported" failure. (A same-LAN peer reaches this
+        // node via its private address or mDNS, never its link-local one.)
+        addrs.retain(|a| !crate::addr_is_unspecified(a) && !crate::addr_is_link_local(a));
         crate::prefer_reachable(&mut addrs);
         Ok(addrs.into_iter().map(|a| a.with(Protocol::P2p(self.peer_id))).collect())
     }
@@ -867,10 +892,11 @@ impl EventLoop {
                 // one failed, which is what actually tells a LAN-firewall
                 // failure apart from a dead relay circuit.
                 tracing::debug!(%peer, error = %error, detail = ?error, "outgoing connection failed");
+                let summary = summarize_dial_error(&error);
                 if let Some(reply) = self.pending_connect.remove(&peer) {
-                    let _ = reply.send(Err(anyhow::anyhow!("connecting to {peer}: {error}")));
+                    let _ = reply.send(Err(anyhow::anyhow!("connecting to {peer}: {summary}")));
                 }
-                self.fail_awaiting(peer, format!("could not connect to {peer}: {error}"));
+                self.fail_awaiting(peer, format!("could not connect to {peer}: {summary}"));
             }
             SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
                 self.peer_addrs.entry(peer_id).or_default().insert(address);
@@ -1051,6 +1077,25 @@ pub fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
 
 fn strip_p2p(addr: Multiaddr) -> Multiaddr {
     addr.into_iter().filter(|p| !matches!(p, Protocol::P2p(_))).collect()
+}
+
+/// A short, user-facing reason for a failed outgoing connection.
+///
+/// [`libp2p::swarm::DialError`]'s own `Display` for the common
+/// `Transport(Vec<(Multiaddr, _)>)` variant expands to *every* candidate
+/// address that was tried, each with its full error-source chain — a wall of
+/// text (worse the more interfaces the other peer listens on, so worst for a
+/// macOS origin) that ends up verbatim in a GUI error line. Collapse that to a
+/// count; the per-address detail is still logged at `debug` right above the
+/// call site. Every other variant is already a single line, so pass it through.
+fn summarize_dial_error(error: &libp2p::swarm::DialError) -> String {
+    match error {
+        libp2p::swarm::DialError::Transport(addrs) => {
+            let n = addrs.len();
+            format!("no reachable address ({n} candidate{} tried, none usable)", if n == 1 { "" } else { "s" })
+        }
+        other => other.to_string(),
+    }
 }
 
 /// If `addr` is a circuit address, return `Some(relay_peer_id)` (or `Some(None)`

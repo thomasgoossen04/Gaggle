@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gaggle_core::Hash;
+use gaggle_core::{Hash, ShareMeta};
 use net::{CacheStats, Multiaddr, PeerId};
 
 use crate::settings::Settings;
@@ -68,6 +68,26 @@ pub struct SourceStats {
     pub peer: PeerId,
     pub chunks: usize,
     pub bytes: u64,
+}
+
+/// One entry from a share's `.gaggle-meta.toml`, surfaced to the GUI's "Run"
+/// control. The full launch spec (args, working dir, compat flag) stays in the
+/// manager and is re-read from disk at launch time; this is only what the button
+/// needs to render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunTarget {
+    /// Index into the meta file's `launch` array — passed back to
+    /// [`App::run_target`](crate::App::run_target).
+    pub index: usize,
+    pub label: String,
+    /// The target's OS family label (`"Windows"`, `"Any"`, …).
+    pub os: String,
+    /// `true` when the entry targets a non-host OS and would be launched through
+    /// a compatibility layer (Wine / Proton).
+    pub via_compat: bool,
+    /// `false` when this entry cannot run on the current host at all (a
+    /// non-host native target with no compat) — the GUI shows it disabled.
+    pub runnable: bool,
 }
 
 /// One row in the share list / transfer manager.
@@ -140,6 +160,20 @@ pub struct TransferRow {
     /// Completed download only: the outcome of the last
     /// [`verify_share`](crate::App::verify_share).
     pub verify_result: Option<VerifyReport>,
+    /// The share's `.gaggle-meta.toml`, if it carries one — the display
+    /// name / version / description the GUI shows, and the source the launch
+    /// entries are derived from. `None` when the share has no metadata (or its
+    /// files are not on disk yet).
+    pub meta: Option<ShareMeta>,
+    /// Launchable entries from [`meta`](Self::meta), ready for the GUI's "Run"
+    /// control. Empty when there is no metadata or it defines no `launch`
+    /// entries. Only populated once the share's files are on disk (a completed
+    /// download, or a local seed's source folder).
+    pub run_targets: Vec<RunTarget>,
+    /// Set when the last [`run_target`](crate::App::run_target) failed to launch
+    /// (executable missing, no compat layer, spawn error). Cleared by a
+    /// successful launch.
+    pub run_error: Option<String>,
 }
 
 /// Outcome of a [`verify_share`](crate::App::verify_share) integrity pass.

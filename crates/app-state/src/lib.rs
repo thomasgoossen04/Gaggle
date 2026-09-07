@@ -18,7 +18,7 @@ mod settings;
 mod state;
 mod stats;
 
-pub use gaggle_core::{Hash, Invite};
+pub use gaggle_core::{Hash, Invite, LaunchTarget, ShareMeta, TargetOs};
 pub use launcher_channel::LauncherChannel;
 pub use logs::{LogHandle, LogLevel, LogLine, init as init_logging};
 pub use manager::{App, AppEvent, AcceleratorRequest, SubscribeRequest};
@@ -28,8 +28,8 @@ pub use reach::ReachLink;
 pub use settings::{RemoteAccelerator, Settings, Theme};
 pub use state::{
     AccelStatsRow, AcceleratorRole, AcceleratorState, AccelShareRow, AppState, BenchmarkResult,
-    DiscoveredShare, MintedInvite, PreviewFile, PreviewStatus, RemoteAccelState, SharePreview,
-    SourceStats, StatsSnapshot, SwarmStatus, TransferId, TransferKind, TransferRow, TransferStatus,
-    VerifyReport,
+    DiscoveredShare, MintedInvite, PreviewFile, PreviewStatus, RemoteAccelState, RunTarget,
+    SharePreview, SourceStats, StatsSnapshot, SwarmStatus, TransferId, TransferKind, TransferRow,
+    TransferStatus, VerifyReport,
 };
 pub use stats::{EtaEstimator, SpeedHistory, SpeedSample, resample};

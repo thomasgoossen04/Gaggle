@@ -188,8 +188,10 @@ impl RelayNode {
     pub async fn reachable_addrs(&self) -> anyhow::Result<Vec<Multiaddr>> {
         let mut addrs = self.listen_addrs().await?;
         // Drop a wildcard `0.0.0.0`/`::` entry — undialable, and libp2p-quic
-        // rejects it with `MultiaddrNotSupported` (see `Node::reachable_addrs`).
-        addrs.retain(|a| !crate::addr_is_unspecified(a));
+        // rejects it with `MultiaddrNotSupported` (see `Node::reachable_addrs`) —
+        // and link-local / `ip6zone`-scoped entries, which mean nothing off the
+        // box they were minted on.
+        addrs.retain(|a| !crate::addr_is_unspecified(a) && !crate::addr_is_link_local(a));
         crate::prefer_reachable(&mut addrs);
         Ok(addrs.into_iter().map(|a| a.with(Protocol::P2p(self.peer_id))).collect())
     }

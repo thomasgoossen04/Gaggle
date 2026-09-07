@@ -178,7 +178,7 @@ impl ManifestDiff<'_> {
 
 /// Reject anything that could escape the share root or is not a clean relative
 /// path.
-fn check_rel_path(p: &str) -> Result<()> {
+pub(crate) fn check_rel_path(p: &str) -> Result<()> {
     if p.is_empty() {
         return Err(Error::Manifest("empty path".into()));
     }

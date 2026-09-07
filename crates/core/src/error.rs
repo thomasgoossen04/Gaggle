@@ -29,4 +29,7 @@ pub enum Error {
 
     #[error("auth: {0}")]
     Auth(String),
+
+    #[error("share metadata: {0}")]
+    Meta(String),
 }

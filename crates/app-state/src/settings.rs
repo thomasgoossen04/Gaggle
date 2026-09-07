@@ -167,6 +167,14 @@ pub struct Settings {
     /// already offers. `None` skips all of this.
     #[serde(default)]
     pub rendezvous_url: Option<String>,
+    /// Command used to run a non-native executable from a share's
+    /// `.gaggle-meta.toml` launch entry — a Windows game launched on Linux/macOS
+    /// (via Proton/Wine). The share's executable path is appended as the first
+    /// argument. `None` ⇒ `"wine"` (also overridable per run with
+    /// `$GAGGLE_COMPAT_CMD`). Set this to a Proton / `proton-ge` wrapper script
+    /// if you have one.
+    #[serde(default)]
+    pub compat_command: Option<String>,
     /// A local accelerator (relay or NAS) to restart on the next launch,
     /// mirroring the standalone `accelerator` daemon's own restart-on-boot
     /// behavior — otherwise the "always-on" NAS/relay this node was running
@@ -238,8 +246,24 @@ impl Default for Settings {
             persist_shares: default_persist_shares(),
             public_relay: None,
             rendezvous_url: None,
+            compat_command: None,
             accelerator: None,
         }
+    }
+}
+
+impl Settings {
+    /// The compatibility-layer command to run a non-native launch entry with —
+    /// [`compat_command`](Self::compat_command), else `$GAGGLE_COMPAT_CMD`, else
+    /// `"wine"`.
+    pub fn compat_command(&self) -> String {
+        self.compat_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| std::env::var("GAGGLE_COMPAT_CMD").ok().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| "wine".to_string())
     }
 }
 

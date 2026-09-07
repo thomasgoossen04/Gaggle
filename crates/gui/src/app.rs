@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_state::{
-    AcceleratorRequest, App, AppState, Hash, LauncherChannel, LogHandle, LogLevel, LogLine,
-    PreviewStatus, ReachLink, Scope, Settings, ShareLink, SubscribeRequest, Theme, TransferId,
-    TransferKind, TransferRow,
+    AcceleratorRequest, App, AppState, Hash, LaunchTarget, LauncherChannel, LogHandle, LogLevel,
+    LogLine, PreviewStatus, ReachLink, Scope, Settings, ShareLink, ShareMeta, SubscribeRequest,
+    TargetOs, Theme, TransferId, TransferKind, TransferRow,
 };
 use gpui::prelude::*;
 use gpui::{ClipboardItem, Entity, FocusHandle, PathPromptOptions, SharedString, Timer, Window, div};
@@ -219,6 +219,9 @@ pub struct Gaggle {
     pub(crate) set_relay: Entity<InputState>,
     /// An accelerator's HTTP base URL — see [`Settings::rendezvous_url`].
     pub(crate) set_rendezvous: Entity<InputState>,
+    /// Wine/Proton command for non-native launch entries — see
+    /// [`Settings::compat_command`].
+    pub(crate) set_compat: Entity<InputState>,
     // Accelerator form.
     pub(crate) accel_cache: Entity<InputState>,
     pub(crate) accel_link: Entity<InputState>,
@@ -238,6 +241,37 @@ pub struct Gaggle {
     /// by label. Pre-filled with the daemon's current values on the first poll
     /// that carries them (`seeded`). Also synced by [`Self::sync_remote_inputs`].
     pub(crate) remote_storage_inputs: HashMap<String, RemoteStorageInputs>,
+    /// A folder was chosen in the Shares tab and is waiting for `render` (which
+    /// has the `&mut Window` an `InputState` needs) to open the metadata form.
+    /// `(folder, private)`.
+    pub(crate) pending_share: Option<(PathBuf, bool)>,
+    /// The "add a share" metadata form, while it is open. Built lazily from
+    /// [`Self::pending_share`] in [`Self::sync_share_meta_draft`].
+    pub(crate) share_meta_draft: Option<ShareMetaDraft>,
+}
+
+/// The Shares-tab "describe this folder" form: display metadata plus repeatable
+/// launch entries, collected before the share is created so a `.gaggle-meta.toml`
+/// can be written into the folder.
+pub struct ShareMetaDraft {
+    pub dir: PathBuf,
+    pub private: bool,
+    pub name: Entity<InputState>,
+    pub version: Entity<InputState>,
+    pub description: Entity<InputState>,
+    pub launches: Vec<LaunchDraft>,
+}
+
+/// One launch-entry row in [`ShareMetaDraft`].
+pub struct LaunchDraft {
+    pub label: Entity<InputState>,
+    /// Executable path relative to the folder root.
+    pub path: Entity<InputState>,
+    /// Space-separated extra arguments.
+    pub args: Entity<InputState>,
+    pub os: TargetOs,
+    /// Run through Wine/Proton when the host OS isn't [`Self::os`].
+    pub compat: bool,
 }
 
 /// The two input entities behind a remote NAS daemon's storage edit form.
@@ -282,6 +316,7 @@ impl Gaggle {
         let set_seed_cache = num(cx, window, fmt_size_mib(s.seed_cache_bytes), integer.clone());
         let set_relay = text(cx, window, s.public_relay.clone().unwrap_or_default());
         let set_rendezvous = text(cx, window, s.rendezvous_url.clone().unwrap_or_default());
+        let set_compat = text(cx, window, s.compat_command.clone().unwrap_or_default());
         let accel_cache = num(cx, window, "256".into(), integer);
         let accel_link = text(cx, window, String::new());
         let accel_dir = text(cx, window, String::new());
@@ -380,6 +415,7 @@ impl Gaggle {
             set_seed_cache,
             set_relay,
             set_rendezvous,
+            set_compat,
             accel_cache,
             accel_link,
             accel_dir,
@@ -388,7 +424,123 @@ impl Gaggle {
             remote_url,
             remote_add_inputs,
             remote_storage_inputs,
+            pending_share: None,
+            share_meta_draft: None,
         }
+    }
+
+    /// Turn a [`Self::pending_share`] into an open [`ShareMetaDraft`], pre-filled
+    /// from the folder's existing `.gaggle-meta.toml` if it has one. Runs from
+    /// [`Render::render`] because building `InputState`s needs a `&mut Window`.
+    fn sync_share_meta_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((dir, private)) = self.pending_share.take() else { return };
+        let existing = std::fs::read_to_string(dir.join(".gaggle-meta.toml"))
+            .ok()
+            .and_then(|t| ShareMeta::from_toml_str(&t).ok())
+            .unwrap_or_default();
+        let text = |window: &mut Window, cx: &mut Context<Self>, v: &str| {
+            let v = v.to_string();
+            cx.new(|cx| InputState::new(window, cx).default_value(v))
+        };
+        let launches = existing
+            .launch
+            .iter()
+            .map(|l| LaunchDraft {
+                label: text(window, cx, &l.label),
+                path: text(window, cx, &l.path),
+                args: text(window, cx, &l.args.join(" ")),
+                os: l.os,
+                compat: l.compat,
+            })
+            .collect();
+        self.share_meta_draft = Some(ShareMetaDraft {
+            name: text(window, cx, existing.name.as_deref().unwrap_or_default()),
+            version: text(window, cx, existing.version.as_deref().unwrap_or_default()),
+            description: text(window, cx, existing.description.as_deref().unwrap_or_default()),
+            launches,
+            dir,
+            private,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn add_launch_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.share_meta_draft.as_mut() else { return };
+        let mk = |window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| InputState::new(window, cx).default_value(String::new()))
+        };
+        draft.launches.push(LaunchDraft {
+            label: mk(window, cx),
+            path: mk(window, cx),
+            args: mk(window, cx),
+            os: TargetOs::host(),
+            compat: false,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn remove_launch_row(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(draft) = self.share_meta_draft.as_mut()
+            && i < draft.launches.len()
+        {
+            draft.launches.remove(i);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_launch_os(&mut self, i: usize, os: TargetOs, cx: &mut Context<Self>) {
+        if let Some(l) = self.share_meta_draft.as_mut().and_then(|d| d.launches.get_mut(i)) {
+            l.os = os;
+            // The Wine/Proton toggle only applies to a Windows target.
+            if !os.supports_compat() {
+                l.compat = false;
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_launch_compat(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(l) = self.share_meta_draft.as_mut().and_then(|d| d.launches.get_mut(i)) {
+            l.compat = !l.compat;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn cancel_share_meta(&mut self, cx: &mut Context<Self>) {
+        self.share_meta_draft = None;
+        cx.notify();
+    }
+
+    /// Build a [`ShareMeta`] from the open draft and create the share.
+    pub(crate) fn confirm_share_meta(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.share_meta_draft.take() else { return };
+        let val = |e: &Entity<InputState>| e.read(cx).value().trim().to_string();
+        let launch: Vec<LaunchTarget> = draft
+            .launches
+            .iter()
+            .map(|l| LaunchTarget {
+                label: val(&l.label),
+                os: l.os,
+                path: val(&l.path),
+                args: val(&l.args).split_whitespace().map(str::to_string).collect(),
+                workdir: String::new(),
+                compat: l.compat,
+            })
+            .collect();
+        let meta = ShareMeta {
+            name: Some(val(&draft.name)).filter(|s| !s.is_empty()),
+            version: Some(val(&draft.version)).filter(|s| !s.is_empty()),
+            description: Some(val(&draft.description)).filter(|s| !s.is_empty()),
+            launch,
+        };
+        self.app.add_share_with_meta(draft.dir, draft.private, Some(meta));
+        self.set_notice("Snapshotting folder…", cx);
+        cx.notify();
+    }
+
+    pub(crate) fn run_target(&mut self, id: TransferId, index: usize, cx: &mut Context<Self>) {
+        self.app.run_target(id, index);
+        self.set_notice("Launching…", cx);
     }
 
     /// Ensure `remote_add_inputs` has exactly one entity per currently-known
@@ -619,7 +771,6 @@ impl Gaggle {
     }
 
     pub(crate) fn pick_folder(&mut self, private: bool, cx: &mut Context<Self>) {
-        let app = self.app.clone();
         let recv = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -630,13 +781,12 @@ impl Gaggle {
             if let Ok(Ok(Some(paths))) = recv.await
                 && let Some(dir) = paths.into_iter().next()
             {
-                if private {
-                    app.add_private_share(dir);
-                } else {
-                    app.add_local_share(dir);
-                }
+                // Defer to `render`, which has the `&mut Window` needed to build
+                // the metadata form's inputs.
                 let _ = this.update(cx, |this: &mut Gaggle, cx| {
-                    this.set_notice("Snapshotting folder…", cx);
+                    this.pending_share = Some((dir, private));
+                    this.tab = Tab::Shares;
+                    cx.notify();
                 });
             }
         })
@@ -925,6 +1075,7 @@ impl Gaggle {
         let seed_cache = parse_size_mib(&self.set_seed_cache.read(cx).value());
         let relay = self.set_relay.read(cx).value().trim().to_string();
         let rendezvous = self.set_rendezvous.read(cx).value().trim().to_string();
+        let compat = self.set_compat.read(cx).value().trim().to_string();
 
         let mut next = self.state.settings.clone();
         if !dir.trim().is_empty() {
@@ -938,6 +1089,7 @@ impl Gaggle {
         next.seed_cache_bytes = seed_cache.unwrap_or(self.state.settings.seed_cache_bytes);
         next.public_relay = if relay.is_empty() { None } else { Some(relay) };
         next.rendezvous_url = if rendezvous.is_empty() { None } else { Some(rendezvous) };
+        next.compat_command = if compat.is_empty() { None } else { Some(compat) };
         self.app.update_settings(next);
         self.set_notice("Settings saved", cx);
     }
@@ -1302,6 +1454,7 @@ impl Render for Gaggle {
         }
         let t = theme::active();
         self.sync_remote_inputs(window, cx);
+        self.sync_share_meta_draft(window, cx);
 
         // The `window_border` frame is drawn by the wrapping `gpui_component::Root`.
         div()
@@ -1337,5 +1490,6 @@ impl Render for Gaggle {
             .child(ui::chrome::status_bar(self))
             .children(ui::views::confirm_modal(self, cx))
             .children(ui::views::subscribe_modal(self, cx))
+            .children(ui::views::share_meta_modal(self, cx))
     }
 }

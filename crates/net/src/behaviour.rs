@@ -24,6 +24,7 @@ use std::time::Duration;
 use libp2p::identity::Keypair;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::NetworkBehaviour;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{
     StreamProtocol, connection_limits, dcutr, identify, kad, mdns, relay, request_response, upnp,
 };
@@ -123,7 +124,13 @@ pub(crate) struct PeerBehaviour {
     pub chunk_exchange: request_response::Behaviour<GaggleCodec>,
     pub kademlia: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
-    pub mdns: mdns::tokio::Behaviour,
+    /// LAN peer discovery. Disabled (`Toggle::from(None)`) for an always-on
+    /// accelerator: it is reached via the tracker / rendezvous / DHT / relay,
+    /// never needs same-LAN discovery, and on a server with a WireGuard /
+    /// Tailscale / other multicast-refusing interface libp2p-mdns otherwise
+    /// logs a steady stream of `error`s ("error sending packet on iface
+    /// address … Required key not available" — `ENOKEY`).
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub upnp: upnp::tokio::Behaviour,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
@@ -132,17 +139,24 @@ pub(crate) struct PeerBehaviour {
 impl PeerBehaviour {
     /// `relay_client` is handed in by `SwarmBuilder::with_relay_client`, which
     /// also wires the matching circuit transport.
-    pub fn new(
+    /// `enable_mdns` is `false` for an accelerator's nodes (see the `mdns` field).
+    pub fn new_with(
         key: &Keypair,
         relay_client: relay::client::Behaviour,
+        enable_mdns: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let peer = key.public().to_peer_id();
+        let mdns = if enable_mdns {
+            Toggle::from(Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer)?))
+        } else {
+            Toggle::from(None)
+        };
         Ok(Self {
             connection_limits: connection_limits(16),
             chunk_exchange: chunk_exchange(),
             kademlia: kademlia(peer, kad::Config::new(KAD_PROTOCOL)),
             identify: identify(key),
-            mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer)?,
+            mdns,
             upnp: upnp::tokio::Behaviour::default(),
             relay_client,
             dcutr: dcutr::Behaviour::new(peer),

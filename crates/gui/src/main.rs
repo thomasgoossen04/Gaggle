@@ -34,9 +34,14 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    Application, TitlebarOptions, WindowBackgroundAppearance, WindowDecorations, WindowOptions,
-    point, px, size,
+    Application, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBackgroundAppearance,
+    WindowDecorations, WindowOptions, actions, point, px, size,
 };
+
+// A unit action so there's something for the macOS app menu's Quit item and
+// Cmd-Q / Ctrl-Q to invoke. Without an explicit menu + keybinding a gpui app
+// has no way to quit on macOS: Cmd-Q does nothing and the app menu is empty.
+actions!(gaggle, [Quit]);
 
 fn config_path() -> Option<PathBuf> {
     // `~/.config` (or `$XDG_CONFIG_HOME`) on Linux, `~/Library/Application
@@ -77,6 +82,28 @@ fn main() -> anyhow::Result<()> {
         // persisted setting; `Gaggle::render` keeps it current thereafter.
         let mode = theme::activate(app.snapshot().settings.theme, cx.window_appearance());
         theme::apply_mode(mode, None, cx);
+
+        // Make the app quittable. On macOS this is what puts a working "Quit
+        // Gaggle" in the app menu and binds Cmd-Q; without it neither does
+        // anything and the process can't be closed from the keyboard or menu.
+        // Ctrl-Q covers the Linux/Windows habit. `on_window_closed` makes the
+        // last window's close button terminate the process too (the tokio
+        // runtime is deliberately leaked, so nothing else would).
+        cx.on_action(|_: &Quit, cx: &mut gpui::App| cx.quit());
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("ctrl-q", Quit, None),
+        ]);
+        cx.set_menus(vec![Menu {
+            name: "Gaggle".into(),
+            items: vec![MenuItem::action("Quit Gaggle", Quit)],
+        }]);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
         let app = app.clone();
         let opts = WindowOptions {

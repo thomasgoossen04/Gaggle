@@ -211,8 +211,11 @@ pub async fn nas_serve(
     link: &ShareLink,
 ) -> anyhow::Result<(Node, ShareMeta, usize)> {
     let info = share_meta(&manifest, &chunk_lists, link);
-    let node = Node::spawn_serving_with_identity(Catalog::new(manifest, chunk_lists, disk), identity)
-        .await?;
+    let node = Node::spawn_serving_with_identity_accelerator(
+        Catalog::new(manifest, chunk_lists, disk),
+        identity,
+    )
+    .await?;
     if let Some(invite) = &link.invite {
         node.restrict_to_invite_holders(invite.share).await?;
     }
@@ -265,7 +268,7 @@ pub async fn nas_seed_start(
     let store = SharedChunkStore::new(disk);
 
     let meta = share_meta(&manifest, &chunk_lists, link);
-    let serving = Node::spawn_serving_with_identity(
+    let serving = Node::spawn_serving_with_identity_accelerator(
         Catalog::new(manifest, chunk_lists, store.clone()),
         identity,
     )
@@ -332,7 +335,7 @@ pub async fn nas_add_share_with_progress<P>(
 where
     P: FnMut(SwarmProgress),
 {
-    let scratch = Node::spawn().await?;
+    let scratch = Node::spawn_accelerator().await?;
     let start = match nas_seed_start(&scratch, dir_root, identity, link, compress, max_bytes).await {
         Ok(s) => s,
         Err(e) => {

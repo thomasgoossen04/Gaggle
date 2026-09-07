@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app_state::{
-    AcceleratorRequest, AcceleratorRole, App, AppEvent, AppState, Multiaddr, PreviewStatus, Scope,
-    Settings, ShareLink, SubscribeRequest, TransferStatus,
+    AcceleratorRequest, AcceleratorRole, App, AppEvent, AppState, LaunchTarget, Multiaddr,
+    PreviewStatus, Scope, Settings, ShareLink, ShareMeta, SubscribeRequest, TargetOs,
+    TransferStatus,
 };
 use net::RelayNode;
 use tempfile::TempDir;
@@ -564,10 +565,7 @@ async fn a_download_is_restored_after_a_restart() {
     let seed = seeded.seeds().next().unwrap();
     let (addr, manifest_id) = (seed.share_addr.clone().unwrap(), seed.manifest_id);
 
-    // A completed download restores the same way a seed does — a fresh row
-    // reappears and finishes, without ever calling `subscribe` again. Two real
-    // transfers happen here (the original, then the restored one), so this
-    // gets a generous budget for a heavily loaded `cargo test --workspace` run.
+    // Download it once, with a real config path so it persists.
     let out = TempDir::new().unwrap();
     let dl_cfg = TempDir::new().unwrap();
     let dl_path = dl_cfg.path().join("settings.json");
@@ -587,12 +585,23 @@ async fn a_download_is_restored_after_a_restart() {
         .await;
     }
 
+    // Restart with the origin GONE: a finished download is restored by
+    // re-indexing its local output tree, not by re-running the swarm download,
+    // so it must come straight back `Complete` (with its byte totals filled in)
+    // and resume seeding — no origin required, no flash of an empty progress bar.
+    drop(seeder);
     let releech = App::new(Some(dl_path)).await.unwrap();
-    let restored = wait_for(&releech, 120, |s| {
-        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    let restored = wait_for(&releech, 60, |s| {
+        s.downloads().next().is_some_and(|r| {
+            r.status == TransferStatus::Complete && r.total_bytes > 0 && r.seeding
+        })
     })
     .await;
-    assert_eq!(restored.downloads().next().unwrap().manifest_id, manifest_id);
+    let row = restored.downloads().next().unwrap();
+    assert_eq!(row.manifest_id, manifest_id);
+    assert_eq!(row.done_bytes, row.total_bytes, "a restored finished download is fully done");
+    // The restored tree still matches the original folder byte-for-byte.
+    dir_matches(folder.path(), &out.path().join("modpack"));
 }
 
 #[tokio::test]
@@ -1654,4 +1663,87 @@ async fn verify_and_repair_fixes_a_corrupted_file() {
     let final_row = repaired.get(id).unwrap();
     assert_eq!(final_row.status, TransferStatus::Complete);
     assert!(!final_row.verifying);
+}
+
+/// A share's `.gaggle-meta.toml` is written into the folder on create, rides the
+/// normal transfer, lands in the downloader's copy, and both ends surface it as
+/// `TransferRow::meta` + `run_targets`.
+#[tokio::test]
+async fn share_metadata_travels_and_drives_run_targets() {
+    let folder = sample_folder();
+    let seeder = App::new(None).await.unwrap();
+    seeder.add_share_with_meta(
+        folder.path(),
+        false,
+        Some(ShareMeta {
+            name: Some("Cool Pack".into()),
+            version: Some("3.2".into()),
+            description: Some("a shared modpack".into()),
+            launch: vec![
+                LaunchTarget {
+                    label: "Play".into(),
+                    os: TargetOs::Any,
+                    path: "readme.txt".into(),
+                    args: vec![],
+                    workdir: String::new(),
+                    compat: false,
+                },
+                LaunchTarget {
+                    label: "Windows tool".into(),
+                    os: TargetOs::Windows,
+                    path: "cfg/game.ini".into(),
+                    args: vec![],
+                    workdir: String::new(),
+                    compat: true,
+                },
+            ],
+        }),
+    );
+
+    let seeded = wait_for(&seeder, 20, |s| {
+        s.seeds().next().is_some_and(|r| r.status == TransferStatus::Complete && r.share_addr.is_some())
+    })
+    .await;
+    let seed = seeded.seeds().next().unwrap();
+    assert!(folder.path().join(".gaggle-meta.toml").is_file(), "meta file written into the folder");
+    let sm = seed.meta.clone().expect("seed row carries the metadata");
+    assert_eq!(sm.version.as_deref(), Some("3.2"));
+    assert_eq!(seed.run_targets.len(), 2);
+    assert_eq!(seed.run_targets[0].label, "Play");
+    assert!(seed.run_targets[0].runnable && !seed.run_targets[0].via_compat);
+    // A Windows entry with `compat` set: on a non-Windows CI host it's a
+    // run-through-Proton target; on Windows it's just native.
+    if cfg!(target_os = "windows") {
+        assert!(seed.run_targets[1].runnable && !seed.run_targets[1].via_compat);
+    } else {
+        assert!(seed.run_targets[1].runnable && seed.run_targets[1].via_compat);
+    }
+
+    let manifest_id = seed.manifest_id;
+    let addr = seed.share_addr.clone().unwrap();
+
+    let out = TempDir::new().unwrap();
+    let leech = app_downloading_into(out.path()).await;
+    leech.subscribe(SubscribeRequest {
+        name: "modpack".into(),
+        manifest_id,
+        sources: vec![addr],
+        credential: None,
+        select: None,
+        dest: None,
+    });
+
+    let done = wait_for(&leech, 60, |s| {
+        s.downloads().next().is_some_and(|r| r.status == TransferStatus::Complete)
+    })
+    .await;
+    let row = done.downloads().next().unwrap();
+    let output = row.output_dir.clone().unwrap();
+    assert!(output.join(".gaggle-meta.toml").is_file(), "meta lands in the downloaded tree");
+    let lm = row.meta.clone().expect("download row carries the metadata");
+    assert_eq!(lm.version.as_deref(), Some("3.2"));
+    assert_eq!(lm.description.as_deref(), Some("a shared modpack"));
+    assert_eq!(row.run_targets.len(), 2);
+    assert_eq!(row.run_targets[0].label, "Play");
+    dir_matches(folder.path(), &output);
 }

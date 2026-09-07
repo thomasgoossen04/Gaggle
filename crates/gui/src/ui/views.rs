@@ -7,15 +7,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use app_state::{
     AccelShareRow, AcceleratorRole, AcceleratorState, DiscoveredShare, LauncherChannel, LogLevel,
-    PreviewStatus, RemoteAccelState, SourceStats, SpeedSample, Theme, TransferKind, TransferRow,
-    TransferStatus,
+    PreviewStatus, RemoteAccelState, RunTarget, SourceStats, SpeedSample, TargetOs, Theme,
+    TransferKind, TransferRow, TransferStatus,
 };
 use gpui::prelude::*;
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, Hsla, KeyDownEvent, MouseButton, SharedString,
     deferred, div, hsla, px, relative, uniform_list,
 };
-use gpui_component::chart::LineChart;
+use gpui_component::chart::BarChart;
 
 use crate::app::{ConfirmKind, EasedCurve, Gaggle, StatsSource, Tab};
 use crate::theme;
@@ -79,6 +79,9 @@ fn share_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl 
                 )
                 .child(status_pill(row.status)),
         )
+        .when_some(meta_line(row), |el, s| {
+            el.child(div().text_xs().font_family(theme::MONO).text_color(t.muted).child(s))
+        })
         .when(row.status == TransferStatus::Scanning, |el| {
             el.child(progress_bar(row.progress()))
         })
@@ -99,10 +102,21 @@ fn share_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> impl 
                 }),
         )
         .child(div().text_xs().font_family(theme::MONO).text_color(t.info).child(addr))
+        .when_some(row.run_error.clone(), |el, e| {
+            el.child(
+                div()
+                    .text_xs()
+                    .font_family(theme::MONO)
+                    .text_color(t.bad)
+                    .child(format!("!! run: {e}")),
+            )
+        })
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .gap_2()
+                .children(run_buttons(id, &row.run_targets, cx))
                 .child(btn(("copy", id as usize), "Copy link").on_click(cx.listener({
                     let row = row.clone();
                     move |this, _: &ClickEvent, _, cx| this.copy_link(&row, cx)
@@ -586,6 +600,9 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
                 )
                 .child(status_pill(row.status)),
         )
+        .when_some(meta_line(row), |el, s| {
+            el.child(div().text_xs().font_family(theme::MONO).text_color(t.muted).child(s))
+        })
         .when_some(
             (row.status == TransferStatus::Connecting || row.verifying)
                 .then(|| row.detail.clone())
@@ -621,11 +638,21 @@ fn transfer_row(app: &Gaggle, row: &TransferRow, cx: &mut Context<Gaggle>) -> im
             };
             el.child(div().text_xs().font_family(theme::MONO).text_color(color).child(text))
         })
+        .when_some(row.run_error.clone(), |el, e| {
+            el.child(
+                div()
+                    .text_xs()
+                    .font_family(theme::MONO)
+                    .text_color(t.bad)
+                    .child(format!("!! run: {e}")),
+            )
+        })
         .child(
             div()
                 .flex()
                 .flex_wrap()
                 .gap_2()
+                .children(run_buttons(id, &row.run_targets, cx))
                 .when(can_pause, |el| {
                     el.child(btn(("pause", id as usize), "Pause").on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| {
@@ -1589,6 +1616,11 @@ pub fn settings(app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
                 .child(field("Storage cap GiB", &app.set_store))
                 .child(field("Seed RAM MiB", &app.set_seed_cache))
                 .child(field("Auto-check min", &app.set_resync))
+                .child(field("Wine/Proton command", &app.set_compat))
+                .child(hint(
+                    "Used by a share's Run button to launch a Windows executable on Linux/macOS. \
+                     Blank = `wine`; point it at a Proton / proton-ge wrapper if you have one.",
+                ))
                 .child(
                     div().mt_1().flex().child(
                         primary_btn("apply-settings", "Save settings").on_click(cx.listener(
@@ -2001,6 +2033,217 @@ pub fn subscribe_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElem
     Some(deferred(overlay).into_any_element())
 }
 
+/// Truncate a label to `n` chars with an ellipsis.
+fn ellip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>())
+    }
+}
+
+/// A one-line summary of a share's `.gaggle-meta.toml` (version + description),
+/// or `None` when it carries neither.
+fn meta_line(row: &TransferRow) -> Option<String> {
+    let m = row.meta.as_ref()?;
+    let mut parts = Vec::new();
+    if let Some(v) = m.version.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("ver {v}"));
+    }
+    if let Some(d) = m.description.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(ellip(d, 90));
+    }
+    (!parts.is_empty()).then(|| parts.join("  ·  "))
+}
+
+/// The "▶ Run" buttons for a row's launch entries — one per
+/// [`RunTarget`](app_state::RunTarget). Clickable even when not runnable on this
+/// host; the manager reports a clear error into `run_error` in that case.
+fn run_buttons<'a>(
+    id: app_state::TransferId,
+    targets: &'a [RunTarget],
+    cx: &mut Context<Gaggle>,
+) -> impl Iterator<Item = impl IntoElement> + 'a {
+    let listeners: Vec<_> = targets
+        .iter()
+        .map(|rt| {
+            let idx = rt.index;
+            cx.listener(move |this: &mut Gaggle, _: &ClickEvent, _, cx| {
+                this.run_target(id, idx, cx)
+            })
+        })
+        .collect();
+    targets.iter().zip(listeners).map(move |(rt, on_click)| {
+        let mut label = format!("▶ {}", ellip(&rt.label, 22));
+        if rt.via_compat {
+            label.push_str(" (Proton)");
+        }
+        if !rt.runnable {
+            label.push_str(" — n/a");
+        }
+        primary_btn(("run", id as usize * 64 + rt.index), &label).on_click(on_click)
+    })
+}
+
+/// The Shares-tab "describe this folder" form — display metadata plus repeatable
+/// launch entries, written into the folder as `.gaggle-meta.toml` when the share
+/// is created. Rendered on top of everything via `deferred`, like
+/// [`confirm_modal`].
+pub fn share_meta_modal(app: &Gaggle, cx: &mut Context<Gaggle>) -> Option<AnyElement> {
+    let draft = app.share_meta_draft.as_ref()?;
+    let t = theme::active();
+    let folder = draft
+        .dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| draft.dir.display().to_string());
+
+    let mut launches = div().flex().flex_col().gap_2();
+    if draft.launches.is_empty() {
+        launches = launches.child(hint(
+            "No launch entries — add one to give this share a “Run” button (a game .exe, \
+             a server start.sh, …).",
+        ));
+    }
+    for (i, l) in draft.launches.iter().enumerate() {
+        launches = launches.child(launch_draft_row(app, i, l, cx));
+    }
+
+    let card = div()
+        .id("share-meta-card")
+        .flex()
+        .flex_col()
+        .gap_3()
+        .p_4()
+        .w(px(600.0))
+        .max_w(relative(0.94))
+        .max_h(relative(0.92))
+        .overflow_y_scroll()
+        .bg(t.panel)
+        .border_1()
+        .border_color(t.accent)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(section_title(&format!("Share “{folder}”")))
+        .child(hint(
+            "Optional. Saved into the folder as .gaggle-meta.toml and transferred with it, \
+             so everyone who downloads the share gets the same metadata and Run entries.",
+        ))
+        .child(field("Display name", &draft.name))
+        .child(field("Version", &draft.version))
+        .child(field("Description", &draft.description))
+        .child(section_title("Launch entries"))
+        .child(launches)
+        .child(
+            btn("meta-add-launch", "+ Add launch entry").on_click(cx.listener(
+                |this, _: &ClickEvent, window, cx| this.add_launch_row(window, cx),
+            )),
+        )
+        .child(
+            div()
+                .flex()
+                .w_full()
+                .gap_2()
+                .justify_end()
+                .child(btn("meta-cancel", "Cancel").on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_share_meta(cx)),
+                ))
+                .child(
+                    primary_btn(
+                        "meta-go",
+                        if draft.private { "Create private share" } else { "Create share" },
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.confirm_share_meta(cx))),
+                ),
+        );
+
+    let overlay = div()
+        .id("share-meta-overlay")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(hsla(0.0, 0.0, 0.0, 0.55))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.cancel_share_meta(cx)),
+        )
+        .child(card);
+
+    Some(deferred(overlay).into_any_element())
+}
+
+fn launch_draft_row(
+    _app: &Gaggle,
+    i: usize,
+    l: &crate::app::LaunchDraft,
+    cx: &mut Context<Gaggle>,
+) -> AnyElement {
+    let t = theme::active();
+    // The Wine/Proton toggle only makes sense for a Windows target (that's what
+    // Wine/Proton run) — not for a macOS or Linux target on a foreign host.
+    let compat_applicable = l.os.supports_compat();
+
+    let os_chips = div().flex().gap_1().children(TargetOs::ALL.into_iter().enumerate().map(
+        |(j, os)| {
+            let sel = os == l.os;
+            div()
+                .id(("meta-os", i * 8 + j))
+                .px_2()
+                .py(px(1.0))
+                .text_xs()
+                .font_family(theme::MONO)
+                .border_1()
+                .border_color(if sel { t.accent } else { t.line })
+                .text_color(if sel { t.accent } else { t.muted })
+                .cursor_pointer()
+                .child(os.label().to_uppercase())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.set_launch_os(i, os, cx)
+                }))
+        },
+    ));
+
+    let mut controls = div().flex().items_center().gap_2();
+    if compat_applicable {
+        controls = controls.child(
+            div()
+                .id(("meta-compat", i))
+                .flex()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_launch_compat(i, cx)),
+                )
+                .child(checkmark(if l.compat { Tri::On } else { Tri::Off }))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family(theme::MONO)
+                        .text_color(t.muted)
+                        .child("VIA WINE/PROTON"),
+                ),
+        );
+    }
+    controls = controls.child(danger_btn(("meta-rm-launch", i), "Remove").on_click(
+        cx.listener(move |this, _: &ClickEvent, _, cx| this.remove_launch_row(i, cx)),
+    ));
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_2()
+        .border_1()
+        .border_color(t.line)
+        .child(field("Label", &l.label))
+        .child(field("Executable (relative)", &l.path))
+        .child(field("Arguments", &l.args))
+        .child(div().flex().items_center().justify_between().gap_2().child(os_chips).child(controls))
+        .into_any_element()
+}
+
 /// Dispatch to the body for `tab`.
 pub fn body(tab: Tab, app: &Gaggle, cx: &mut Context<Gaggle>) -> AnyElement {
     match tab {
@@ -2215,12 +2458,11 @@ fn stats_source_dropdown(app: &Gaggle, remotes: &[String], cx: &mut Context<Gagg
     wrap.into_any_element()
 }
 
-/// Points the throughput graphs interpolate their raw ~2 s samples onto. Fixed
+/// Bars the throughput graphs bucket their raw ~2 s samples into. Fixed
 /// (bar a tiny-window clamp) regardless of the selected span so the categorical
-/// x-axis never folds repeated labels together, and dense enough that the
-/// 200 ms redraw shows a smoothly advancing curve rather than a step per
-/// sample.
-const SMOOTH_POINTS: usize = 90;
+/// x-axis never folds repeated labels together, and chunky enough to read as a
+/// Steam-style download histogram rather than a comb of hairlines.
+const SMOOTH_POINTS: usize = 60;
 
 /// The graphs render their right ("now") edge this far behind true wall-clock
 /// time. Readings land only ~every 2 s, so anchoring the curve exactly at `now`
@@ -2239,12 +2481,12 @@ const SMOOTH_DELAY: Duration = Duration::from_secs(3);
 /// lands. Small enough that the line still tracks a real trend within a second.
 const EASE_TAU: f64 = 0.45;
 
-/// One titled line chart of `value(sample)` over `window`, plus now/peak
+/// One titled bar chart of `value(sample)` over `window`, plus now/peak
 /// readouts. The raw samples are monotone-cubic resampled against a live,
 /// slightly-retarded `now` ([`SMOOTH_DELAY`]) each redraw, then the resulting
-/// curve is eased frame-to-frame against the last one drawn (kept in `ease`,
-/// keyed by `key`, time constant [`EASE_TAU`]) so the line glides and morphs
-/// gently instead of snapping to each new resample.
+/// bar heights are eased frame-to-frame against the last set drawn (kept in
+/// `ease`, keyed by `key`, time constant [`EASE_TAU`]) so the bars grow and
+/// shrink gently instead of snapping to each new resample.
 #[allow(clippy::too_many_arguments)]
 fn speed_chart_card(
     title: &str,
@@ -2315,10 +2557,10 @@ fn speed_chart_card(
         .map(|(&(ago, _), &v)| (SharedString::from(fmt_ago(ago)), v.max(0.0)))
         .collect();
     let tick_margin = (points.len() / 6).max(1);
-    let chart = LineChart::new(points)
+    let chart = BarChart::new(points)
         .x(|p: &(SharedString, f64)| p.0.clone())
         .y(|p: &(SharedString, f64)| p.1)
-        .stroke(color)
+        .fill(move |_: &(SharedString, f64)| color)
         .tick_margin(tick_margin);
 
     card()

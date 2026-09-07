@@ -135,17 +135,15 @@ codesign --verify --deep --strict --verbose=2 "$APP" || true
 
 # --- notarize (non-fatal: an un-notarized signed build still installs) --------
 STAPLED=0
+NOTARY_ARGS=()
 if [ "$NOTARIZE" = "1" ]; then
   echo "==> Notarizing"
   API_KEY_P8="${STAGE}/AuthKey.p8"
   echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$API_KEY_P8"
+  NOTARY_ARGS=(--key "$API_KEY_P8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait)
   NOTARIZE_ZIP="${STAGE}/notarize.zip"
   ditto -c -k --keepParent "$APP" "$NOTARIZE_ZIP"
-  if xcrun notarytool submit "$NOTARIZE_ZIP" \
-        --key "$API_KEY_P8" \
-        --key-id "$APPLE_API_KEY_ID" \
-        --issuer "$APPLE_API_ISSUER_ID" \
-        --wait \
+  if xcrun notarytool submit "$NOTARIZE_ZIP" "${NOTARY_ARGS[@]}" \
      && xcrun stapler staple "$APP"; then
     STAPLED=1
     echo "==> Stapled"
@@ -170,7 +168,17 @@ ln -s /Applications "${DMG_ROOT}/Applications"
 rm -f "$DMG"
 hdiutil create -volname "Gaggle" -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG"
 if [ "$STAPLED" = "1" ]; then
-  xcrun stapler staple "$DMG" || echo "!! stapling the .dmg failed (non-fatal)" >&2
+  # The .dmg needs its own notarization ticket before it can be stapled —
+  # notarizing the .app (via notarize.zip) doesn't register one for the disk
+  # image. Submit the .dmg itself, then staple. Non-fatal: the .app inside is
+  # already notarized+stapled, so a drag-installed copy passes Gatekeeper
+  # regardless.
+  if xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" \
+     && xcrun stapler staple "$DMG"; then
+    echo "==> Stapled the .dmg"
+  else
+    echo "!! notarizing/stapling the .dmg failed (non-fatal)" >&2
+  fi
 fi
 shasum -a 256 "$DMG" | awk '{print $1}' > "${DMG}.sha256"
 

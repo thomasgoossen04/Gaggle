@@ -8,6 +8,8 @@ serde.workspace = true
 serde_json.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
+# A share's optional `.gaggle-meta.toml` (display name / version / launch entries).
+toml.workspace = true
 # `rayon` feature: `Hasher::update_rayon` tree-hashes a large buffer across the
 # global rayon pool — used by `Hash::of` for chunk-sized inputs.
 blake3 = { version = "1.8", features = ["rayon"] }

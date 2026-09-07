@@ -29,6 +29,7 @@ pub mod identity;
 pub mod invite;
 pub mod manifest;
 pub mod merkle;
+pub mod meta;
 pub mod snapshot;
 pub mod store;
 
@@ -41,6 +42,7 @@ pub use identity::{ShareKeypair, SharePublicKey, Signature};
 pub use invite::{Capability, Invite, Scope, SignedCapability};
 pub use manifest::{FileEntry, Manifest, ManifestDiff};
 pub use merkle::{MerkleProof, MerkleTree, Side, merkle_root};
+pub use meta::{LaunchTarget, META_FILENAME, ShareMeta, TargetOs};
 pub use snapshot::{
     IndexedSnapshot, ScanProgress, Snapshot, SyncOutcome, index_dir, index_dir_with_progress,
     snapshot_dir, sync_share, write_files, write_share,

@@ -15,9 +15,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use control_plane::{AdminClient, PeerInfo, RendezvousClient, TrackerClient};
 use gaggle_core::{
-    AgentId, AgentKeypair, ChunkList, ChunkStore, DiskChunkStore, Hash, Manifest, MemoryChunkStore,
-    ScanProgress, SharedChunkStore, SignedCapability, SourceChunkStore, SyncOutcome,
-    index_dir_with_progress, snapshot_dir, sync_share, write_files, write_share,
+    AgentId, AgentKeypair, ChunkList, ChunkStore, DiskChunkStore, Hash, IndexedSnapshot, LaunchTarget,
+    Manifest, MemoryChunkStore, ScanProgress, ShareMeta, SharedChunkStore, SignedCapability,
+    SourceChunkStore, SyncOutcome, index_dir_with_progress, snapshot_dir, sync_share, write_files,
+    write_share,
 };
 use net::accel::{NasSeedStart, nas_seed_finish, nas_seed_start, relay_add_share};
 use net::{
@@ -29,7 +30,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::persist::{PersistedSeed, PersistedState};
+use crate::persist::{PersistedSeed, PersistedState, PersistedSub};
 use crate::settings::{PersistedAccelRole, PersistedAccelerator, Settings};
 use crate::state::{
     AccelShareRow, AccelStatsRow, AcceleratorRole, AcceleratorState, AppState, BenchmarkResult,
@@ -140,7 +141,10 @@ pub enum AcceleratorRequest {
 }
 
 enum Command {
-    AddLocalShare { dir: PathBuf, private: bool },
+    AddLocalShare { dir: PathBuf, private: bool, meta: Option<ShareMeta> },
+    /// Launch entry `index` of a share's `.gaggle-meta.toml` (a completed
+    /// download's output tree, or a local seed's source folder).
+    RunTarget { id: TransferId, index: usize },
     Subscribe(SubscribeRequest),
     /// Fetch a remote share's manifest so the GUI can show a file/destination
     /// picker before committing to the download.
@@ -200,6 +204,7 @@ enum Command {
         files: usize,
         bytes: u64,
         file_paths: Vec<String>,
+        meta: Option<ShareMeta>,
     },
     WorkerFailed { id: TransferId, error: String },
     /// A local folder scan ([`add_share`](Manager::add_share) /
@@ -216,6 +221,19 @@ enum Command {
     /// A completed download's files have been indexed and a serving node is up
     /// — this peer is now seeding them back to the swarm.
     CompletedSeedReady { id: TransferId, node: Arc<Node>, addrs: Vec<Multiaddr> },
+    /// A finished download from a previous session was re-indexed offline on
+    /// restore: rebuild its [`SubEntry`] and (unless paused) re-seed it, with
+    /// no re-download.
+    CompletedSubRestored {
+        id: TransferId,
+        request: Box<SubscribeRequest>,
+        output_dir: PathBuf,
+        snap: Box<IndexedSnapshot>,
+    },
+    /// Re-indexing a restored finished download failed (its files are gone or
+    /// unreadable) — drop the placeholder row and fall back to a real
+    /// re-download.
+    CompletedSubRestoreFailed { id: TransferId, request: Box<SubscribeRequest>, error: String },
     UpdateSeen { id: TransferId, version: u64 },
     ResyncProgress { id: TransferId, p: SwarmProgress },
     ResyncDone { id: TransferId, outcome: Box<ResyncOutcome> },
@@ -281,6 +299,8 @@ struct ShareInfo {
     file_paths: Vec<String>,
     /// `Some` for a private (invite-only) share — the per-share signing seed.
     share_seed: Option<[u8; 32]>,
+    /// The folder's `.gaggle-meta.toml`, if any (read back after indexing).
+    meta: Option<ShareMeta>,
 }
 
 struct DownloadOutcome {
@@ -436,13 +456,36 @@ impl App {
 
     /// Snapshot `dir` and start seeding it publicly.
     pub fn add_local_share(&self, dir: impl Into<PathBuf>) {
-        self.send(Command::AddLocalShare { dir: dir.into(), private: false });
+        self.send(Command::AddLocalShare { dir: dir.into(), private: false, meta: None });
     }
 
     /// Snapshot `dir` and start seeding it as an invite-only share. Hand out
     /// access with [`mint_invite`](Self::mint_invite).
     pub fn add_private_share(&self, dir: impl Into<PathBuf>) {
-        self.send(Command::AddLocalShare { dir: dir.into(), private: true });
+        self.send(Command::AddLocalShare { dir: dir.into(), private: true, meta: None });
+    }
+
+    /// Snapshot `dir` and start seeding it, first writing `meta` into the folder
+    /// as `.gaggle-meta.toml` (skipped when `meta` is `None` or empty). The
+    /// metadata rides the normal content-addressed transfer, so it lands in
+    /// every downloader's copy of the folder and drives their "Run" control.
+    pub fn add_share_with_meta(
+        &self,
+        dir: impl Into<PathBuf>,
+        private: bool,
+        meta: Option<ShareMeta>,
+    ) {
+        self.send(Command::AddLocalShare { dir: dir.into(), private, meta });
+    }
+
+    /// Launch entry `index` of share `id`'s `.gaggle-meta.toml`. The executable
+    /// is resolved against the share folder (a completed download's output tree,
+    /// or a local seed's source folder) and spawned detached; a Windows entry on
+    /// a non-Windows host goes through the configured compatibility layer
+    /// ([`Settings::compat_command`](crate::Settings::compat_command)). A
+    /// failure lands in [`TransferRow::run_error`](crate::TransferRow::run_error).
+    pub fn run_target(&self, id: TransferId, index: usize) {
+        self.send(Command::RunTarget { id, index });
     }
 
     /// Re-read a seeded folder from disk, bump its manifest version, and re-serve
@@ -675,6 +718,8 @@ struct SeedEntry {
     addrs: Vec<Multiaddr>,
     /// `Some` for a private share — the per-share Ed25519 seed.
     share_seed: Option<[u8; 32]>,
+    /// The folder's `.gaggle-meta.toml`, if any — re-read on rescan.
+    meta: Option<ShareMeta>,
 }
 
 /// A completed subscription, retained so it can be re-synced later.
@@ -684,6 +729,8 @@ struct SubEntry {
     manifest: Manifest,
     chunk_lists: BTreeMap<String, ChunkList>,
     version: u64,
+    /// The downloaded tree's `.gaggle-meta.toml`, if any — re-read on resync.
+    meta: Option<ShareMeta>,
     /// Set once this peer is seeding the downloaded files back to the swarm —
     /// the serving node. `None` when seeding is off (globally or paused for
     /// this transfer).
@@ -1181,7 +1228,8 @@ impl Manager {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::AddLocalShare { dir, private } => self.add_share(dir, private),
+            Command::AddLocalShare { dir, private, meta } => self.add_share(dir, private, meta),
+            Command::RunTarget { id, index } => self.run_target(id, index),
             Command::Subscribe(req) => self.subscribe(req),
             Command::PreviewShare(req) => self.preview_share(*req),
             Command::ClearPreview => {
@@ -1342,6 +1390,7 @@ impl Manager {
                         manifest_id: info.manifest_id,
                         addrs: addrs.clone(),
                         share_seed: info.share_seed,
+                        meta: info.meta.clone(),
                     },
                 );
                 if let Some(row) = self.state.transfers.get_mut(&id) {
@@ -1358,16 +1407,18 @@ impl Manager {
                     row.share_addr = addrs.first().cloned();
                     row.share_addrs = addrs;
                     row.error = relay_warning;
+                    apply_share_meta(row, info.meta);
                 }
                 self.recount();
                 self.persist_shares();
                 self.publish();
                 let _ = self.events.send(AppEvent::TransferCompleted(id));
             }
-            Command::RescanDone { id, manifest_id, version, files, bytes, file_paths } => {
+            Command::RescanDone { id, manifest_id, version, files, bytes, file_paths, meta } => {
                 if let Some(seed) = self.seeds.get_mut(&id) {
                     seed.version = version;
                     seed.manifest_id = manifest_id;
+                    seed.meta = meta.clone();
                 }
                 if let Some(row) = self.state.transfers.get_mut(&id) {
                     row.manifest_id = manifest_id;
@@ -1378,6 +1429,7 @@ impl Manager {
                     row.file_paths = Arc::new(file_paths);
                     row.status = TransferStatus::Complete;
                     row.error = None;
+                    apply_share_meta(row, meta);
                 }
                 self.persist_shares();
                 self.publish();
@@ -1449,6 +1501,7 @@ impl Manager {
             }
             Command::DownloadDone { id, outcome } => {
                 self.eta.remove(&id);
+                let meta = load_share_meta(&outcome.output_dir);
                 let request = self.downloads.remove(&id).map(|job| {
                     // Retire the seed-while-downloading node before its backing
                     // chunk files are cleared; the completed-seed path below
@@ -1469,6 +1522,7 @@ impl Manager {
                             chunk_lists: outcome.chunk_lists.clone(),
                             version: outcome.version,
                             seed: None,
+                            meta: meta.clone(),
                         },
                     );
                 }
@@ -1480,6 +1534,7 @@ impl Manager {
                     row.version = outcome.version;
                     row.speed_bps = 0;
                     row.eta_secs = None;
+                    apply_share_meta(row, meta);
                     row.output_dir = Some(outcome.output_dir);
                     // The partial seed (if any) is being retired; the
                     // completed-seed path re-sets these once its node is up.
@@ -1555,6 +1610,84 @@ impl Manager {
                     self.publish();
                 }
             }
+            Command::CompletedSubRestored { id, request, output_dir, snap } => {
+                // The row can be gone if the user removed it mid re-index.
+                if self.state.transfers.contains_key(&id) {
+                    let snap = *snap;
+                    let request = *request;
+                    let manifest_id = snap.manifest.id();
+                    let files = snap.manifest.files.len();
+                    let total_bytes = snap.manifest.total_size();
+                    let version = snap.manifest.version;
+                    let file_paths: Vec<String> =
+                        snap.manifest.files.iter().map(|f| f.path.clone()).collect();
+                    let share_pubkey =
+                        request.credential.as_ref().map(|c| c.capability.share);
+                    let meta = load_share_meta(&output_dir);
+
+                    self.subs.insert(
+                        id,
+                        SubEntry {
+                            request,
+                            output_dir: output_dir.clone(),
+                            manifest: snap.manifest.clone(),
+                            chunk_lists: snap.chunk_lists.clone(),
+                            version,
+                            seed: None,
+                            meta: meta.clone(),
+                        },
+                    );
+                    if let Some(row) = self.state.transfers.get_mut(&id) {
+                        row.status = TransferStatus::Complete;
+                        row.files = files;
+                        row.total_bytes = total_bytes;
+                        row.done_bytes = total_bytes;
+                        row.version = version;
+                        row.manifest_id = manifest_id;
+                        row.output_dir = Some(output_dir.clone());
+                        row.file_paths = Arc::new(file_paths);
+                        row.detail = None;
+                        apply_share_meta(row, meta);
+                    }
+                    self.recount();
+                    self.publish();
+                    let _ = self.events.send(AppEvent::TransferCompleted(id));
+
+                    // Re-seed straight from the index we just built — no second
+                    // scan — unless seeding is off or this one was paused.
+                    if self.state.settings.seed_after_download
+                        && !self.paused_seeds.contains(&manifest_id)
+                    {
+                        let tx = self.self_tx.clone();
+                        let cache_bytes = self.state.settings.seed_cache_bytes;
+                        let public_relay = self.state.settings.public_relay.clone();
+                        if let Some(row) = self.state.transfers.get_mut(&id) {
+                            row.seeding = false;
+                        }
+                        tokio::spawn(serve_completed_tree(
+                            tx,
+                            id,
+                            output_dir,
+                            snap,
+                            share_pubkey,
+                            cache_bytes,
+                            public_relay,
+                        ));
+                    }
+                    self.persist_shares();
+                }
+            }
+            Command::CompletedSubRestoreFailed { id, request, error } => {
+                tracing::warn!(
+                    id,
+                    error = %error,
+                    "restore: could not re-index a finished download — re-downloading it"
+                );
+                self.state.transfers.remove(&id);
+                self.subs.remove(&id);
+                self.recount();
+                self.subscribe(*request);
+            }
             Command::UpdateSeen { id, version } => {
                 if let Some(row) = self.state.transfers.get_mut(&id) {
                     if version == 0 {
@@ -1596,10 +1729,15 @@ impl Manager {
             Command::ResyncDone { id, outcome } => {
                 self.resync_samples.remove(&id);
                 self.eta.remove(&id);
+                // The delta may have added, changed or removed `.gaggle-meta.toml`.
+                let meta = self.subs.get(&id).map(|s| load_share_meta(&s.output_dir));
                 if let Some(sub) = self.subs.get_mut(&id) {
                     sub.manifest = outcome.manifest.clone();
                     sub.chunk_lists = outcome.chunk_lists.clone();
                     sub.version = outcome.manifest.version;
+                    if let Some(meta) = &meta {
+                        sub.meta = meta.clone();
+                    }
                 }
                 tracing::info!(
                     id,
@@ -1618,6 +1756,9 @@ impl Manager {
                     row.eta_secs = None;
                     row.update_available = None;
                     row.error = None;
+                    if let Some(meta) = meta {
+                        apply_share_meta(row, meta);
+                    }
                 }
                 self.recount();
                 self.publish();
@@ -2525,7 +2666,77 @@ impl Manager {
         });
     }
 
-    fn add_share(&mut self, dir: PathBuf, private: bool) {
+    /// Launch entry `index` of share `id`'s `.gaggle-meta.toml`.
+    fn run_target(&mut self, id: TransferId, index: usize) {
+        // The on-disk root: a completed download's output tree, or a local
+        // seed's source folder.
+        let root = self
+            .subs
+            .get(&id)
+            .map(|s| s.output_dir.clone())
+            .or_else(|| self.seeds.get(&id).map(|s| s.dir.clone()));
+        let Some(root) = root else {
+            self.set_run_error(id, "this transfer has no folder on disk yet".to_string());
+            return;
+        };
+        // Re-read from disk so a hand-edited meta file is honoured.
+        let Some(target) =
+            load_share_meta(&root).and_then(|m| m.launch.get(index).cloned())
+        else {
+            self.set_run_error(
+                id,
+                "that launch entry is no longer in .gaggle-meta.toml".to_string(),
+            );
+            return;
+        };
+        let compat = self.state.settings.compat_command();
+        match spawn_launch(&root, &target, &compat) {
+            Ok(()) => {
+                tracing::info!(id, label = %target.label, "launched share entry");
+                if let Some(row) = self.state.transfers.get_mut(&id) {
+                    row.run_error = None;
+                }
+                self.publish();
+            }
+            Err(e) => self.set_run_error(id, format!("{e:#}")),
+        }
+    }
+
+    fn set_run_error(&mut self, id: TransferId, msg: String) {
+        tracing::warn!(id, error = %msg, "launch failed");
+        if let Some(row) = self.state.transfers.get_mut(&id) {
+            row.run_error = Some(msg);
+        }
+        self.publish();
+    }
+
+    fn add_share(&mut self, dir: PathBuf, private: bool, meta: Option<ShareMeta>) {
+        // Write the metadata into the folder *before* the scan, so it is part of
+        // the snapshot and rides the normal transfer to every downloader. An
+        // empty value writes nothing; a folder that already has a
+        // `.gaggle-meta.toml` (e.g. re-sharing a downloaded folder) keeps its
+        // file when the caller passes `None`.
+        if let Some(meta) = meta {
+            let meta = meta.normalized();
+            let path = dir.join(gaggle_core::META_FILENAME);
+            if meta.is_empty() {
+                // The form was submitted with nothing filled in — clear any
+                // stale file so "no metadata" actually means it.
+                let _ = std::fs::remove_file(&path);
+            } else {
+                match meta.to_toml_string() {
+                    Ok(text) => {
+                        if let Err(e) = std::fs::write(&path, text) {
+                            tracing::warn!(
+                                path = %path.display(), error = %e,
+                                "could not write .gaggle-meta.toml — sharing without it"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "could not serialize share metadata"),
+                }
+            }
+        }
         let share_seed = private.then(|| ShareKeypair::generate().to_seed());
         self.start_seed(dir, share_seed, 1);
     }
@@ -2566,16 +2777,11 @@ impl Manager {
 
         tokio::spawn(async move {
             let scan_dir = output_dir.clone();
-            let scan_name = name.clone();
             let built = tokio::task::spawn_blocking(move || {
-                let idx =
-                    index_dir_with_progress(&scan_dir, scan_name, version, |_: ScanProgress| {})?;
-                let store =
-                    SourceChunkStore::new(&scan_dir, idx.locations.clone(), cache_bytes);
-                anyhow::Ok((idx, store))
+                index_dir_with_progress(&scan_dir, name, version, |_: ScanProgress| {})
             })
             .await;
-            let (snap, store) = match built {
+            let snap = match built {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     tracing::warn!(id, error = %format!("{e:#}"), "seed-after-download: index failed");
@@ -2586,39 +2792,7 @@ impl Manager {
                     return;
                 }
             };
-            let catalog = Catalog::new(snap.manifest, snap.chunk_lists, store);
-            let node = match Node::spawn_serving(catalog).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(id, error = %format!("{e:#}"), "seed-after-download: could not start serving");
-                    return;
-                }
-            };
-            if let Some(pubkey) = share_pubkey
-                && let Err(e) = node.restrict_to_invite_holders(pubkey).await
-            {
-                tracing::warn!(id, error = %format!("{e:#}"), "seed-after-download: could not restrict private share");
-                return;
-            }
-            let mut addrs = match node.reachable_addrs().await {
-                Ok(a) if !a.is_empty() => a,
-                _ => {
-                    tracing::warn!(id, "seed-after-download: no listen address");
-                    return;
-                }
-            };
-            if let Some(relay_addr) = &public_relay {
-                match reserve_relay(&node, relay_addr).await {
-                    Ok(circuit) => addrs.push(circuit),
-                    Err(e) => tracing::warn!(
-                        id,
-                        error = %format!("{e:#}"),
-                        "seed-after-download: relay reservation failed — LAN/VPN addresses only"
-                    ),
-                }
-            }
-            let _ = tx
-                .send(Command::CompletedSeedReady { id, node: Arc::new(node), addrs })
+            serve_completed_tree(tx, id, output_dir, snap, share_pubkey, cache_bytes, public_relay)
                 .await;
         });
     }
@@ -2669,6 +2843,7 @@ impl Manager {
                 files: snap.manifest.files.len(),
                 bytes: snap.manifest.total_size(),
                 version: snap.manifest.version,
+                meta: load_share_meta(&dir),
                 dir,
                 file_paths: snap.manifest.files.iter().map(|f| f.path.clone()).collect(),
                 share_seed,
@@ -2735,9 +2910,10 @@ impl Manager {
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
             let progress = scan_progress_sink(tx.clone(), id);
+            let scan_dir = dir.clone();
             let built = tokio::task::spawn_blocking(move || {
-                let idx = index_dir_with_progress(&dir, name, next_version, progress)?;
-                let store = SourceChunkStore::new(&dir, idx.locations.clone(), cache_bytes);
+                let idx = index_dir_with_progress(&scan_dir, name, next_version, progress)?;
+                let store = SourceChunkStore::new(&scan_dir, idx.locations.clone(), cache_bytes);
                 anyhow::Ok((idx, store))
             })
             .await;
@@ -2769,6 +2945,7 @@ impl Manager {
                     files,
                     bytes,
                     file_paths,
+                    meta: load_share_meta(&dir),
                 })
                 .await;
         });
@@ -3338,6 +3515,89 @@ impl Manager {
         for request in persisted.subscriptions {
             self.subscribe(request);
         }
+        for done in persisted.completed_subscriptions {
+            self.restore_completed_sub(done);
+        }
+    }
+
+    /// Bring a *finished* download back exactly as it was: an already-`Complete`
+    /// transfer that re-serves its output tree, with no re-download. A single
+    /// off-thread re-index of the local files (no network) rebuilds the
+    /// manifest + chunk lists the seed / verify / resync paths need; the pinned
+    /// `version` makes that reproduce the origin's manifest id.
+    ///
+    /// The old path re-issued the whole [`SubscribeRequest`], so on every
+    /// restart a done-and-seeding share flashed back to "Connecting" with an
+    /// empty progress bar while the swarm rediscovered it already had every
+    /// chunk — and went to `Failed` outright if the origin was offline.
+    fn restore_completed_sub(&mut self, done: PersistedSub) {
+        let PersistedSub { request, output_dir, name, version } = done;
+        // Old records (pre-`name`) fall back to the link name — the common case
+        // where the origin did derive its manifest name from its folder.
+        let manifest_name =
+            if name.is_empty() { request.name.clone() } else { name };
+
+        // Files deleted out from under us: nothing to restore as complete, so
+        // fall back to a normal re-subscribe that can re-fetch them.
+        if !output_dir.is_dir() {
+            tracing::info!(
+                name = %request.name,
+                dir = %output_dir.display(),
+                "restore: a finished download's files are gone — re-subscribing"
+            );
+            self.subscribe(request);
+            return;
+        }
+
+        let id = self.alloc_id();
+        let mut row = new_row(id, request.name.clone(), TransferKind::Downloading);
+        row.manifest_id = request.manifest_id;
+        row.selected_files = request.select.as_ref().map(|s| s.len());
+        row.status = TransferStatus::Complete;
+        row.version = version;
+        row.private = request.credential.is_some();
+        row.output_dir = Some(output_dir.clone());
+        row.detail = Some("re-checking downloaded files…".into());
+        self.insert_row(row);
+
+        let tx = self.self_tx.clone();
+        let scan_dir = output_dir.clone();
+        tokio::spawn(async move {
+            let built = tokio::task::spawn_blocking(move || {
+                index_dir_with_progress(&scan_dir, manifest_name, version, |_: ScanProgress| {})
+            })
+            .await;
+            match built {
+                Ok(Ok(snap)) => {
+                    let _ = tx
+                        .send(Command::CompletedSubRestored {
+                            id,
+                            request: Box::new(request),
+                            output_dir,
+                            snap: Box::new(snap),
+                        })
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = tx
+                        .send(Command::CompletedSubRestoreFailed {
+                            id,
+                            request: Box::new(request),
+                            error: format!("{e:#}"),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Command::CompletedSubRestoreFailed {
+                            id,
+                            request: Box::new(request),
+                            error: format!("re-index task panicked: {e}"),
+                        })
+                        .await;
+                }
+            }
+        });
     }
 
     /// Restart the local accelerator [`Settings::accelerator`] describes —
@@ -3383,11 +3643,19 @@ impl Manager {
                 .values()
                 .map(|s| PersistedSeed { dir: s.dir.clone(), share_seed: s.share_seed, version: s.version })
                 .collect(),
-            subscriptions: self
-                .downloads
+            // Unfinished downloads re-subscribe and resume from their partial
+            // chunks; finished ones ride `completed_subscriptions` so they come
+            // back `Complete` + seeding without a re-download.
+            subscriptions: self.downloads.values().map(|j| j.request.clone()).collect(),
+            completed_subscriptions: self
+                .subs
                 .values()
-                .map(|j| j.request.clone())
-                .chain(self.subs.values().map(|s| s.request.clone()))
+                .map(|s| PersistedSub {
+                    request: s.request.clone(),
+                    output_dir: s.output_dir.clone(),
+                    name: s.manifest.name.clone(),
+                    version: s.version,
+                })
                 .collect(),
             paused_seeds: self.paused_seeds.iter().map(|h| h.to_hex()).collect(),
         };
@@ -3436,11 +3704,196 @@ fn new_row(id: TransferId, name: String, kind: TransferKind) -> TransferRow {
         selected_files: None,
         verifying: false,
         verify_result: None,
+        meta: None,
+        run_targets: Vec::new(),
+        run_error: None,
+    }
+}
+
+/// Read a share folder's `.gaggle-meta.toml`, if present and non-empty. A
+/// malformed file is logged and treated as absent — it must never block a
+/// transfer.
+fn load_share_meta(dir: &std::path::Path) -> Option<gaggle_core::ShareMeta> {
+    let path = dir.join(gaggle_core::META_FILENAME);
+    let text = std::fs::read_to_string(&path).ok()?;
+    match gaggle_core::ShareMeta::from_toml_str(&text) {
+        Ok(m) if !m.is_empty() => Some(m),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "ignoring malformed .gaggle-meta.toml");
+            None
+        }
+    }
+}
+
+/// Build the GUI-facing launch entries for a row from its metadata.
+fn run_targets_of(meta: &gaggle_core::ShareMeta) -> Vec<crate::state::RunTarget> {
+    meta.launch
+        .iter()
+        .enumerate()
+        .map(|(index, l)| crate::state::RunTarget {
+            index,
+            label: if l.label.is_empty() { l.path.clone() } else { l.label.clone() },
+            os: l.os.label().to_string(),
+            // "Runs through Wine/Proton" — a launchable, non-native target (only
+            // ever a Windows one on a non-Windows host).
+            via_compat: l.launchable_on_host() && !l.os.runs_native(),
+            runnable: l.launchable_on_host(),
+        })
+        .collect()
+}
+
+/// Populate a row's `meta` / `run_targets` from a share folder on disk. Called
+/// wherever a share's files first land (a completed download, a local seed, a
+/// rescan / resync).
+fn apply_share_meta(row: &mut TransferRow, meta: Option<gaggle_core::ShareMeta>) {
+    row.run_targets = meta.as_ref().map(run_targets_of).unwrap_or_default();
+    row.meta = meta;
+}
+
+/// Spawn a share's launch entry as a detached child process. Returns an error —
+/// with no child spawned — when the executable is missing, targets an OS this
+/// host cannot run, or the OS refuses to start it.
+///
+/// A native entry is run directly (`.sh` via `sh`, `.bat`/`.cmd` via `cmd /c`).
+/// A Windows entry on a non-Windows host with [`LaunchTarget::compat`] set is
+/// handed to `compat_command` (Wine / Proton wrapper). The child is fully
+/// detached (its own stdio nulled); it is not killed when Gaggle exits.
+fn spawn_launch(
+    root: &std::path::Path,
+    target: &LaunchTarget,
+    compat_command: &str,
+) -> anyhow::Result<()> {
+    use std::process::{Command as PCommand, Stdio};
+
+    let rel = target
+        .checked_path()
+        .map_err(|e| anyhow::anyhow!("unsafe executable path {:?}: {e}", target.path))?;
+    let exe = root.join(rel);
+    anyhow::ensure!(exe.is_file(), "executable not found in the share: {rel}");
+
+    let workdir = match target
+        .checked_workdir()
+        .map_err(|e| anyhow::anyhow!("unsafe working directory {:?}: {e}", target.workdir))?
+    {
+        Some(w) => root.join(w),
+        None => root.to_path_buf(),
+    };
+
+    let host_is_windows = gaggle_core::TargetOs::host() == gaggle_core::TargetOs::Windows;
+    let ext = exe
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+
+    let via_compat = !target.os.runs_native();
+    let mut cmd = if !via_compat {
+        #[cfg(unix)]
+        ensure_executable(&exe);
+        if host_is_windows && matches!(ext.as_str(), "bat" | "cmd") {
+            let mut c = PCommand::new("cmd");
+            c.arg("/c").arg(&exe);
+            c
+        } else if !host_is_windows && ext == "sh" {
+            let mut c = PCommand::new("sh");
+            c.arg(&exe);
+            c
+        } else {
+            PCommand::new(&exe)
+        }
+    } else if target.compat && target.os == gaggle_core::TargetOs::Windows && !host_is_windows {
+        let mut c = PCommand::new(compat_command);
+        c.arg(&exe);
+        c
+    } else {
+        anyhow::bail!("this entry targets {} — can't run it on this system", target.os.label());
+    };
+
+    cmd.args(&target.args)
+        .current_dir(&workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    cmd.spawn().map_err(|e| {
+        if via_compat {
+            anyhow::anyhow!("could not start '{compat_command}' (is Wine/Proton installed?): {e}")
+        } else {
+            anyhow::anyhow!("could not start {}: {e}", exe.display())
+        }
+    })?;
+    Ok(())
+}
+
+/// Best-effort: add the executable bit to a native launch target on unix — a
+/// file that arrived over the wire keeps its mode, and a downloaded game binary
+/// is routinely non-`+x`.
+#[cfg(unix)]
+fn ensure_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(md) = std::fs::metadata(path) {
+        let mode = md.permissions().mode();
+        if mode & 0o111 == 0 {
+            let _ =
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o111));
+        }
     }
 }
 
 async fn fail(tx: &mpsc::Sender<Command>, id: TransferId, error: String) {
     let _ = tx.send(Command::WorkerFailed { id, error }).await;
+}
+
+/// Stand up the serving node for a completed download from an already-built
+/// index of its output tree, then report it with [`Command::CompletedSeedReady`].
+/// Shared by [`Manager::start_completed_seed`] (which indexes the freshly
+/// written tree) and the restore path (which reuses the index it did to rebuild
+/// the [`SubEntry`]), so a restored finished download is scanned exactly once.
+/// A failure is logged, never surfaced as a transfer error — the download
+/// itself already succeeded.
+async fn serve_completed_tree(
+    tx: mpsc::Sender<Command>,
+    id: TransferId,
+    output_dir: PathBuf,
+    snap: IndexedSnapshot,
+    share_pubkey: Option<SharePublicKey>,
+    cache_bytes: u64,
+    public_relay: Option<String>,
+) {
+    let store = SourceChunkStore::new(&output_dir, snap.locations, cache_bytes);
+    let catalog = Catalog::new(snap.manifest, snap.chunk_lists, store);
+    let node = match Node::spawn_serving(catalog).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(id, error = %format!("{e:#}"), "seed-after-download: could not start serving");
+            return;
+        }
+    };
+    if let Some(pubkey) = share_pubkey
+        && let Err(e) = node.restrict_to_invite_holders(pubkey).await
+    {
+        tracing::warn!(id, error = %format!("{e:#}"), "seed-after-download: could not restrict private share");
+        return;
+    }
+    let mut addrs = match node.reachable_addrs().await {
+        Ok(a) if !a.is_empty() => a,
+        _ => {
+            tracing::warn!(id, "seed-after-download: no listen address");
+            return;
+        }
+    };
+    if let Some(relay_addr) = &public_relay {
+        match reserve_relay(&node, relay_addr).await {
+            Ok(circuit) => addrs.push(circuit),
+            Err(e) => tracing::warn!(
+                id,
+                error = %format!("{e:#}"),
+                "seed-after-download: relay reservation failed — LAN/VPN addresses only"
+            ),
+        }
+    }
+    let _ = tx.send(Command::CompletedSeedReady { id, node: Arc::new(node), addrs }).await;
 }
 
 /// The GUI's in-process NAS accelerator always stores its replica
@@ -4448,7 +4901,7 @@ async fn start_relay_accel(
     let relay = Arc::new(
         RelayNode::spawn_with(RelayConfig { cache_capacity_bytes: cache_bytes }).await?,
     );
-    let meta = Arc::new(Node::spawn().await?);
+    let meta = Arc::new(Node::spawn_accelerator().await?);
     let peer_id = relay.peer_id();
 
     let mut rows = Vec::new();
@@ -4506,7 +4959,7 @@ async fn start_nas_accel(
     // One long-lived pulling node, reused for every share's replication and
     // every retry — spawning a fresh swarm (with its UPnP probe) per add was a
     // recurring few-second cost.
-    let scratch = Arc::new(Node::spawn().await?);
+    let scratch = Arc::new(Node::spawn_accelerator().await?);
 
     // Build the handle immediately with a placeholder row per share; the actual
     // replicate-and-seed work is kicked off (concurrently) by

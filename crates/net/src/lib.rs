@@ -94,6 +94,22 @@ pub fn addr_is_loopback(addr: &Multiaddr) -> bool {
     })
 }
 
+/// `true` if `addr` is link-local (`169.254.0.0/16` or `fe80::/10`) or carries
+/// an `/ip6zone/<iface>` scope. Such an address only means anything on the L2
+/// segment / host it was minted on: handed to a remote peer through a tracker
+/// or rendezvous exchange it is a guaranteed-dead dial, and a `dcutr` / QUIC
+/// attempt on it just adds another "Multiaddr is not supported" line to the
+/// aggregated failure a subscriber sees. Strip it from anything advertised
+/// off-box, alongside [`addr_is_loopback`] / [`addr_is_unspecified`].
+pub fn addr_is_link_local(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_link_local(),
+        libp2p::multiaddr::Protocol::Ip6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
+        libp2p::multiaddr::Protocol::Ip6zone(_) => true,
+        _ => false,
+    })
+}
+
 fn addr_rank(addr: &Multiaddr) -> u8 {
     addr.iter()
         .find_map(|p| match p {
@@ -152,12 +168,19 @@ fn tuned_quic(mut cfg: libp2p::quic::Config) -> libp2p::quic::Config {
     cfg
 }
 
-pub(crate) fn build_peer_swarm_with(keypair: Keypair) -> anyhow::Result<Swarm<PeerBehaviour>> {
+/// Build a peer swarm. `enable_mdns: false` is for an accelerator's nodes —
+/// see [`PeerBehaviour`]'s `mdns` field.
+pub(crate) fn build_peer_swarm_with_opts(
+    keypair: Keypair,
+    enable_mdns: bool,
+) -> anyhow::Result<Swarm<PeerBehaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_quic_config(tuned_quic)
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
-        .with_behaviour(PeerBehaviour::new)?
+        .with_behaviour(|key, relay_client| {
+            PeerBehaviour::new_with(key, relay_client, enable_mdns)
+        })?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
     Ok(swarm)
@@ -299,5 +322,22 @@ mod tests {
         assert!(!addr_is_loopback(&wildcard4));
         assert!(!addr_is_loopback(&lan));
         assert!(!addr_is_loopback(&circuit));
+    }
+
+    #[test]
+    fn classifies_link_local_addrs() {
+        let ll4: Multiaddr = "/ip4/169.254.3.4/udp/4001/quic-v1".parse().unwrap();
+        let ll6: Multiaddr = "/ip6/fe80::1/udp/4001/quic-v1".parse().unwrap();
+        let zoned: Multiaddr = "/ip6zone/en0/ip6/fe80::1/udp/4001/quic-v1".parse().unwrap();
+        let lan: Multiaddr = "/ip4/192.168.1.23/udp/4001/quic-v1".parse().unwrap();
+        let global6: Multiaddr = "/ip6/2606:4700::1/udp/4001/quic-v1".parse().unwrap();
+        let loopback4: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+
+        assert!(addr_is_link_local(&ll4));
+        assert!(addr_is_link_local(&ll6));
+        assert!(addr_is_link_local(&zoned));
+        assert!(!addr_is_link_local(&lan));
+        assert!(!addr_is_link_local(&global6));
+        assert!(!addr_is_link_local(&loopback4));
     }
 }

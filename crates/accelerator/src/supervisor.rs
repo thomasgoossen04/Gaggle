@@ -180,7 +180,7 @@ impl Supervisor {
                 for addr in &listen_addrs {
                     tracing::info!(%addr, "relay listening");
                 }
-                Backend::Relay { relay, meta_node: Node::spawn().await?, listen_addrs }
+                Backend::Relay { relay, meta_node: Node::spawn_accelerator().await?, listen_addrs }
             }
             Role::Nas => {
                 let dir_root = config.resolved_replica_dir(&home);
