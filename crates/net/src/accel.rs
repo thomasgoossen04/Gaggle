@@ -88,6 +88,12 @@ fn replica_swarm_config(link: &ShareLink) -> SwarmConfig {
         manifest_id: Some(link.manifest_id),
         allowed_paths,
         narrow_manifest: false,
+        // A replica usually pulls from a single upstream (the origin) over a
+        // fast link. The default per-peer cap of 4 leaves a LAN/gigabit path
+        // idle between round trips — now that landed chunks are written
+        // off-thread, keep many more chunk requests in flight so the pipe stays
+        // full. Peak in-flight bytes stay bounded (this × sources × chunk size).
+        per_peer_parallelism: 16,
         ..SwarmConfig::default()
     }
 }

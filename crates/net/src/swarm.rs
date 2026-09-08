@@ -245,6 +245,7 @@ where
     let bytes_total: u64 = needed.iter().map(|h| u64::from(chunk_len[h])).sum();
 
     if needed.is_empty() {
+        store.flush();
         return Ok(SwarmDownload {
             share: DownloadedShare { manifest, chunk_lists },
             chunks_per_source: HashMap::new(),
@@ -376,6 +377,11 @@ where
             }
         }
     }
+
+    // Chunks are written to the store off-thread (see `DiskChunkStore`); make
+    // sure they are all durably persisted before we report the download done,
+    // so a resume after a crash doesn't have to re-fetch accepted chunks.
+    store.flush();
 
     Ok(SwarmDownload {
         share: DownloadedShare { manifest, chunk_lists },

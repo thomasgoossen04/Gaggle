@@ -23,7 +23,17 @@ is implemented and tested. `gaggle-core` ships four `ChunkStore`s: `MemoryChunkS
 `DiskChunkStore` (durable, one sharded file per chunk — the NAS replica;
 `open_with_opts(dir, compress)` stores each chunk zstd-compressed when that
 shrinks it, as `<hex>.zst`, so a store is self-describing per chunk and raw +
-compressed chunks coexist with no migration), and
+compressed chunks coexist with no migration. `put` is **non-blocking**: it
+stages the chunk in RAM and a `disk-chunk-writer` thread does the zstd encode +
+one-file-per-chunk write off the caller's thread, so a bulk filler — the swarm
+download loop — keeps fetching/verifying while storage catches up instead of
+stalling one chunk at a time. `contains`/`get` see a staged chunk immediately
+(`get` serves it from the staging bytes); the queue is bounded
+(`DISK_WRITE_QUEUE_DEPTH`, 128) so a slow disk applies backpressure via an
+inline-write fallback rather than growing RAM. `ChunkStore::flush` (a new
+defaulted trait method; a no-op elsewhere) drains the queue — `snapshot_dir`,
+`fetch_share`, `fetch_share_from_swarm*` all call it before returning, and
+`Drop` drains too, so "the download reported done" still means "durable"), and
 `SourceChunkStore` (streaming seed — no bytes retained: it reads each requested chunk
 from the original files on disk, verifies it, and holds it in a bounded `LruChunkCache`).
 `snapshot::index_dir` is `snapshot_dir` without the `store.put`: it returns the same
@@ -719,7 +729,11 @@ untouched; `only` entries the manifest doesn't list are ignored). `store.rs` uni
 source file that changed after the scan; and `DiskChunkStore` zstd compression —
 a compressible chunk is stored `.zst` (footprint shrinks) while an incompressible
 one falls back to raw, and a raw store reopened with compression on keeps reading
-old chunks while writing new ones compressed; and `SharedChunkStore` — a clone sees
+old chunks while writing new ones compressed; and its **async writes** — a `put`
+is visible (`contains`/`get`/`len`) and still dedups before the background write
+lands, `flush` / `Drop` make it durable, and a batch several times
+`DISK_WRITE_QUEUE_DEPTH` (exercising the inline-write fallback) all persists and
+reopens byte-exact; and `SharedChunkStore` — a clone sees
 a write through the other handle, and `into_inner` only yields once every clone is
 dropped.
 
@@ -978,7 +992,10 @@ reads. Module layout and how the pieces chain:
   hot cache), `DiskChunkStore` (durable, sharded one-file-per-chunk, `try_get` /
   `try_put` for explicit `io::Result` — NAS replica; `open_with_opts(_, true)`
   stores each chunk zstd-compressed as `<hex>.zst` when it shrinks, self-describing
-  per chunk so raw + compressed mix freely), and `SourceChunkStore` (a
+  per chunk so raw + compressed mix freely. `put` is async — RAM-staged then
+  written by a background thread, drained by `ChunkStore::flush` / `Drop`; bounded
+  queue with an inline-write fallback for backpressure. `try_put` still writes
+  synchronously), and `SourceChunkStore` (a
   `root` + a `Hash -> ChunkLocation` index + a bounded `LruChunkCache`; `get` reads
   the range from the source file, re-hashes it — a since-changed file yields `None` —
   and caches it; `put` is a no-op — the streaming seed). Dedup is just content

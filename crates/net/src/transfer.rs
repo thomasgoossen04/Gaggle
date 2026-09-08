@@ -107,5 +107,9 @@ where
         }
     }
 
+    // `put` may persist off-thread; make every accepted chunk durable before
+    // the caller treats the download as complete.
+    store.flush();
+
     Ok(DownloadedShare { manifest, chunk_lists })
 }

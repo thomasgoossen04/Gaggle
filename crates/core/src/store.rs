@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hash::Hash;
@@ -37,7 +37,18 @@ pub trait ChunkStore {
     /// Insert a chunk. Returns `true` if it was newly stored, `false` if an
     /// identical chunk was already present. Implementations may assume
     /// `hash == blake3(data)`.
+    ///
+    /// A store may accept the chunk and persist it in the background (see
+    /// [`DiskChunkStore`]); [`contains`](Self::contains) / [`get`](Self::get)
+    /// still report it immediately, but a caller that needs the bytes *durable*
+    /// (a download that will be resumed after a crash, a test that inspects the
+    /// filesystem) must call [`flush`](Self::flush) first.
     fn put(&mut self, hash: Hash, data: Vec<u8>) -> bool;
+
+    /// Block until every chunk handed to [`put`](Self::put) is durably stored.
+    /// A no-op for stores that write synchronously; [`DiskChunkStore`] drains
+    /// its background write queue.
+    fn flush(&mut self) {}
 
     fn len(&self) -> usize;
 
@@ -310,15 +321,141 @@ pub const DISK_ZSTD_LEVEL: i32 = 3;
 /// surfaces as `None` / `false` and bumps [`io_errors`](Self::io_errors); the
 /// [`try_get`](Self::try_get) / [`try_put`](Self::try_put) methods expose the
 /// underlying [`io::Result`] for callers that need it.
+///
+/// [`put`](ChunkStore::put) does **not** block on the disk: it stages the chunk
+/// in memory and a background thread compresses and writes it, so a bulk filler
+/// (the swarm download loop) keeps fetching and verifying while storage catches
+/// up instead of stalling one chunk at a time on `zstd` + a scattered
+/// one-file-per-chunk write. [`contains`](ChunkStore::contains) /
+/// [`get`](ChunkStore::get) see a staged chunk immediately; a caller that needs
+/// the bytes durable calls [`flush`](ChunkStore::flush) (or drops the store,
+/// which drains the queue). The queue is bounded
+/// ([`DISK_WRITE_QUEUE_DEPTH`]) — once it fills, `put` writes inline, so a slow
+/// disk still applies backpressure rather than growing memory without bound.
 #[derive(Debug)]
 pub struct DiskChunkStore {
     root: PathBuf,
-    /// hash → is this chunk stored zstd-compressed (a `.zst` file)?
-    index: HashMap<Hash, bool>,
     /// Whether *new* chunks are written compressed (when that shrinks them).
     compress: bool,
-    tmp_counter: AtomicU64,
-    io_errors: AtomicU64,
+    tmp_counter: Arc<AtomicU64>,
+    io_errors: Arc<AtomicU64>,
+    /// Chunk index + pending-write count, shared with the writer thread.
+    inner: Arc<DiskInner>,
+    /// Background writer. `Some` for the whole normal lifetime; taken only while
+    /// [`Drop`] tears it down.
+    writer: Option<DiskWriter>,
+}
+
+/// One chunk's state in a [`DiskChunkStore`].
+#[derive(Debug)]
+enum DiskSlot {
+    /// Accepted by [`put`](ChunkStore::put); bytes held in memory, not yet
+    /// written. Reads are served from here until the write lands.
+    Pending(Arc<Vec<u8>>),
+    /// On disk — `true` if stored zstd-compressed (a `.zst` file).
+    OnDisk { compressed: bool },
+}
+
+#[derive(Debug, Default)]
+struct DiskIndex {
+    slots: HashMap<Hash, DiskSlot>,
+    /// Count of `DiskSlot::Pending` entries, so a `flush` wakeup is O(1).
+    pending: usize,
+}
+
+#[derive(Debug)]
+struct DiskInner {
+    index: Mutex<DiskIndex>,
+    /// Notified whenever `pending` returns to 0.
+    drained: Condvar,
+}
+
+#[derive(Debug)]
+struct DiskWriter {
+    tx: std::sync::mpsc::SyncSender<DiskJob>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+struct DiskJob {
+    hash: Hash,
+    data: Arc<Vec<u8>>,
+}
+
+/// How many accepted-but-unwritten chunks a [`DiskChunkStore`] buffers before
+/// [`put`](ChunkStore::put) falls back to writing inline on the caller's
+/// thread. Large enough that a healthy disk keeps the queue near-empty and the
+/// caller never blocks on storage; small enough that buffered memory stays
+/// bounded to roughly this many chunk payloads.
+pub const DISK_WRITE_QUEUE_DEPTH: usize = 128;
+
+fn lock_index(inner: &DiskInner) -> std::sync::MutexGuard<'_, DiskIndex> {
+    inner.index.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Compress (when `compress` and it shrinks the chunk), write to a temp file in
+/// the hash's shard dir, then atomically rename into place. Returns whether the
+/// stored form ended up compressed.
+fn write_chunk_file(
+    root: &Path,
+    compress: bool,
+    tmp_counter: &AtomicU64,
+    hash: &Hash,
+    data: &[u8],
+) -> io::Result<bool> {
+    let (payload, compressed): (Cow<[u8]>, bool) = if compress {
+        match zstd::encode_all(data, DISK_ZSTD_LEVEL) {
+            Ok(z) if z.len() < data.len() => (Cow::Owned(z), true),
+            _ => (Cow::Borrowed(data), false),
+        }
+    } else {
+        (Cow::Borrowed(data), false)
+    };
+    let hex = hash.to_hex();
+    let shard = root.join(&hex[..2]);
+    std::fs::create_dir_all(&shard)?;
+    let final_path =
+        if compressed { shard.join(format!("{hex}.zst")) } else { shard.join(&hex) };
+    let n = tmp_counter.fetch_add(1, Ordering::Relaxed);
+    let tmp = shard.join(format!(".{hex}.{n}.tmp"));
+    std::fs::write(&tmp, &payload)?;
+    match std::fs::rename(&tmp, &final_path) {
+        Ok(()) => Ok(compressed),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// The writer thread: drain jobs, write each chunk file, and flip its slot from
+/// `Pending` to `OnDisk` (or drop the slot and bump `io_errors` on failure, so
+/// the chunk can be re-fetched). Exits once the sender — and so the owning
+/// `DiskChunkStore` — is gone.
+fn disk_writer_loop(
+    rx: &std::sync::mpsc::Receiver<DiskJob>,
+    root: &Path,
+    compress: bool,
+    tmp_counter: &AtomicU64,
+    io_errors: &AtomicU64,
+    inner: &DiskInner,
+) {
+    while let Ok(job) = rx.recv() {
+        let outcome = write_chunk_file(root, compress, tmp_counter, &job.hash, &job.data);
+        let mut idx = lock_index(inner);
+        match outcome {
+            Ok(compressed) => {
+                idx.slots.insert(job.hash, DiskSlot::OnDisk { compressed });
+            }
+            Err(_) => {
+                io_errors.fetch_add(1, Ordering::Relaxed);
+                idx.slots.remove(&job.hash);
+            }
+        }
+        idx.pending -= 1;
+        if idx.pending == 0 {
+            inner.drained.notify_all();
+        }
+    }
 }
 
 impl DiskChunkStore {
@@ -334,7 +471,7 @@ impl DiskChunkStore {
     pub fn open_with_opts(dir: impl AsRef<Path>, compress: bool) -> io::Result<Self> {
         let root = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        let mut index = HashMap::new();
+        let mut slots = HashMap::new();
         for shard in std::fs::read_dir(&root)? {
             let shard = shard?;
             if !shard.file_type()?.is_dir() {
@@ -348,16 +485,39 @@ impl DiskChunkStore {
                     None => (name, false),
                 };
                 if let Ok(hash) = Hash::from_hex(stem) {
-                    index.insert(hash, compressed);
+                    slots.insert(hash, DiskSlot::OnDisk { compressed });
                 }
             }
         }
+
+        let inner = Arc::new(DiskInner {
+            index: Mutex::new(DiskIndex { slots, pending: 0 }),
+            drained: Condvar::new(),
+        });
+        let tmp_counter = Arc::new(AtomicU64::new(0));
+        let io_errors = Arc::new(AtomicU64::new(0));
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DiskJob>(DISK_WRITE_QUEUE_DEPTH);
+        let handle = {
+            let inner = Arc::clone(&inner);
+            let io_errors = Arc::clone(&io_errors);
+            let tmp_counter = Arc::clone(&tmp_counter);
+            let root = root.clone();
+            std::thread::Builder::new()
+                .name("disk-chunk-writer".into())
+                .spawn(move || {
+                    disk_writer_loop(&rx, &root, compress, &tmp_counter, &io_errors, &inner)
+                })
+                .expect("spawning the disk-chunk-writer thread")
+        };
+
         Ok(Self {
             root,
-            index,
             compress,
-            tmp_counter: AtomicU64::new(0),
-            io_errors: AtomicU64::new(0),
+            tmp_counter,
+            io_errors,
+            inner,
+            writer: Some(DiskWriter { tx, handle }),
         })
     }
 
@@ -366,13 +526,25 @@ impl DiskChunkStore {
         self.io_errors.load(Ordering::Relaxed)
     }
 
+    /// Block until the background writer has persisted every accepted chunk.
+    pub fn wait_for_writes(&self) {
+        let mut idx = lock_index(&self.inner);
+        while idx.pending > 0 {
+            idx = self.inner.drained.wait(idx).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     /// Total bytes of chunk files on disk (a directory walk; not cached). With
     /// compression on this is the *compressed* footprint — the point of the
-    /// feature.
+    /// feature. Waits for any queued writes first.
     pub fn size_on_disk(&self) -> io::Result<u64> {
+        self.wait_for_writes();
+        let idx = lock_index(&self.inner);
         let mut total = 0;
-        for (hash, &compressed) in &self.index {
-            total += std::fs::metadata(self.path_for_form(hash, compressed))?.len();
+        for (hash, slot) in &idx.slots {
+            if let DiskSlot::OnDisk { compressed } = *slot {
+                total += std::fs::metadata(self.path_for_form(hash, compressed))?.len();
+            }
         }
         Ok(total)
     }
@@ -389,10 +561,16 @@ impl DiskChunkStore {
         if compressed { p.with_extension("zst") } else { p }
     }
 
-    /// Read a chunk, distinguishing "absent" (`Ok(None)`) from an I/O error.
+    /// Read a chunk, distinguishing "absent" (`Ok(None)`) from an I/O error. A
+    /// still-queued chunk is served from its in-memory staging bytes.
     pub fn try_get(&self, hash: &Hash) -> io::Result<Option<Vec<u8>>> {
-        let Some(&compressed) = self.index.get(hash) else {
-            return Ok(None);
+        let compressed = {
+            let idx = lock_index(&self.inner);
+            match idx.slots.get(hash) {
+                None => return Ok(None),
+                Some(DiskSlot::Pending(bytes)) => return Ok(Some(bytes.as_ref().clone())),
+                Some(DiskSlot::OnDisk { compressed }) => *compressed,
+            }
         };
         let bytes = match std::fs::read(self.path_for_form(hash, compressed)) {
             Ok(b) => b,
@@ -406,44 +584,60 @@ impl DiskChunkStore {
         }
     }
 
-    /// Write a chunk (atomically: temp file + rename). `Ok(false)` means it was
-    /// already present. Compressed with zstd when the store was opened with
-    /// compression on *and* that shrinks the chunk.
+    /// Write a chunk synchronously (temp file + rename), bypassing the
+    /// background queue. `Ok(false)` means it was already present. For bulk
+    /// writes prefer [`ChunkStore::put`]; this is for callers that need the
+    /// [`io::Result`].
     pub fn try_put(&mut self, hash: Hash, data: &[u8]) -> io::Result<bool> {
         debug_assert_eq!(Hash::of(data), hash, "try_put() called with a mismatched hash");
-        if self.index.contains_key(&hash) {
+        if lock_index(&self.inner).slots.contains_key(&hash) {
             return Ok(false);
         }
-        let (payload, compressed): (Cow<[u8]>, bool) = if self.compress {
-            match zstd::encode_all(data, DISK_ZSTD_LEVEL) {
-                Ok(z) if z.len() < data.len() => (Cow::Owned(z), true),
-                _ => (Cow::Borrowed(data), false),
+        let compressed =
+            write_chunk_file(&self.root, self.compress, &self.tmp_counter, &hash, data)?;
+        lock_index(&self.inner).slots.insert(hash, DiskSlot::OnDisk { compressed });
+        Ok(true)
+    }
+
+    /// How many stored chunks are held zstd-compressed on disk. Waits for any
+    /// queued writes first.
+    pub fn compressed_chunks(&self) -> usize {
+        self.wait_for_writes();
+        lock_index(&self.inner)
+            .slots
+            .values()
+            .filter(|s| matches!(s, DiskSlot::OnDisk { compressed: true }))
+            .count()
+    }
+
+    /// Finish a chunk the queue could not take (full, or the writer is gone):
+    /// write it on the caller's thread and resolve its slot.
+    fn put_inline(&self, hash: Hash, data: &[u8]) -> bool {
+        let outcome =
+            write_chunk_file(&self.root, self.compress, &self.tmp_counter, &hash, data);
+        let mut idx = lock_index(&self.inner);
+        idx.pending -= 1;
+        let stored = match outcome {
+            Ok(compressed) => {
+                idx.slots.insert(hash, DiskSlot::OnDisk { compressed });
+                true
             }
-        } else {
-            (Cow::Borrowed(data), false)
+            Err(_) => {
+                self.io_errors.fetch_add(1, Ordering::Relaxed);
+                idx.slots.remove(&hash);
+                false
+            }
         };
-        let final_path = self.path_for_form(&hash, compressed);
-        let shard = final_path.parent().expect("path_for always has a shard parent");
-        std::fs::create_dir_all(shard)?;
-        let n = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
-        let tmp = shard.join(format!(".{}.{n}.tmp", hash.to_hex()));
-        std::fs::write(&tmp, &payload)?;
-        match std::fs::rename(&tmp, &final_path) {
-            Ok(()) => {
-                self.index.insert(hash, compressed);
-                Ok(true)
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
+        if idx.pending == 0 {
+            self.inner.drained.notify_all();
         }
+        stored
     }
 }
 
 impl ChunkStore for DiskChunkStore {
     fn contains(&self, hash: &Hash) -> bool {
-        self.index.contains_key(hash)
+        lock_index(&self.inner).slots.contains_key(hash)
     }
 
     fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
@@ -457,24 +651,48 @@ impl ChunkStore for DiskChunkStore {
     }
 
     fn put(&mut self, hash: Hash, data: Vec<u8>) -> bool {
-        match self.try_put(hash, &data) {
-            Ok(newly) => newly,
-            Err(_) => {
-                self.io_errors.fetch_add(1, Ordering::Relaxed);
-                false
+        debug_assert_eq!(Hash::of(&data), hash, "put() called with a mismatched hash");
+        let data = Arc::new(data);
+        {
+            let mut idx = lock_index(&self.inner);
+            if idx.slots.contains_key(&hash) {
+                return false;
             }
+            idx.slots.insert(hash, DiskSlot::Pending(Arc::clone(&data)));
+            idx.pending += 1;
+        }
+        // Hand off to the writer thread. Fall back to an inline write only when
+        // the queue is saturated (fetching outrunning the disk — backpressure is
+        // wanted) or the writer is gone; never block the caller otherwise.
+        let job = DiskJob { hash, data: Arc::clone(&data) };
+        match self.writer.as_ref().map(|w| w.tx.try_send(job)) {
+            Some(Ok(())) => true,
+            Some(Err(std::sync::mpsc::TrySendError::Full(job)))
+            | Some(Err(std::sync::mpsc::TrySendError::Disconnected(job))) => {
+                self.put_inline(job.hash, &job.data)
+            }
+            None => self.put_inline(hash, &data),
         }
     }
 
+    fn flush(&mut self) {
+        self.wait_for_writes();
+    }
+
     fn len(&self) -> usize {
-        self.index.len()
+        lock_index(&self.inner).slots.len()
     }
 }
 
-impl DiskChunkStore {
-    /// How many stored chunks are held zstd-compressed on disk.
-    pub fn compressed_chunks(&self) -> usize {
-        self.index.values().filter(|&&c| c).count()
+impl Drop for DiskChunkStore {
+    fn drop(&mut self) {
+        // Drop the sender so the writer's `recv` ends, then let it finish
+        // everything already accepted — a store dropped without an explicit
+        // `flush` still persists every chunk `put` returned `true` for.
+        if let Some(DiskWriter { tx, handle }) = self.writer.take() {
+            drop(tx);
+            let _ = handle.join();
+        }
     }
 }
 
@@ -526,6 +744,10 @@ impl<S: ChunkStore> ChunkStore for SharedChunkStore<S> {
 
     fn put(&mut self, hash: Hash, data: Vec<u8>) -> bool {
         self.inner.write().unwrap_or_else(|e| e.into_inner()).put(hash, data)
+    }
+
+    fn flush(&mut self) {
+        self.inner.write().unwrap_or_else(|e| e.into_inner()).flush();
     }
 
     fn len(&self) -> usize {
@@ -803,9 +1025,57 @@ mod tests {
         let mut store = DiskChunkStore::open(dir.path()).unwrap();
         let (h, d) = chunk(b"shard me");
         store.put(h, d).then_some(()).unwrap();
+        store.flush(); // put is async; the file lands after the queue drains
 
         let shard = dir.path().join(&h.to_hex()[..2]);
         assert!(shard.join(h.to_hex()).is_file(), "chunk lands in its prefix shard");
+    }
+
+    #[test]
+    fn disk_store_put_is_async_but_readable_and_flushes_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, d) = chunk(&[3u8; 20_000]);
+
+        {
+            let mut store = DiskChunkStore::open(dir.path()).unwrap();
+            assert!(store.put(h, d.clone()));
+            // Visible immediately, even before the background write lands.
+            assert!(store.contains(&h));
+            assert_eq!(store.len(), 1);
+            assert_eq!(store.get(&h), Some(d.clone()));
+            assert!(!store.put(h, d.clone()), "still dedups while pending");
+
+            store.flush();
+            assert_eq!(store.io_errors(), 0);
+        }
+
+        // Drop drained the queue; reopening sees the chunk on disk.
+        let reopened = DiskChunkStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.get(&h), Some(d));
+    }
+
+    #[test]
+    fn disk_store_many_async_puts_all_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        // Comfortably more than DISK_WRITE_QUEUE_DEPTH so the inline fallback
+        // path is exercised too.
+        let chunks: Vec<(Hash, Vec<u8>)> =
+            (0..(DISK_WRITE_QUEUE_DEPTH as u32 * 3)).map(|i| chunk(&i.to_le_bytes())).collect();
+        {
+            let mut store = DiskChunkStore::open(dir.path()).unwrap();
+            for (h, d) in &chunks {
+                store.put(*h, d.clone());
+            }
+            store.flush();
+            assert_eq!(store.len(), chunks.len());
+            assert_eq!(store.io_errors(), 0);
+        }
+        let reopened = DiskChunkStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.len(), chunks.len());
+        for (h, d) in &chunks {
+            assert_eq!(reopened.get(h).as_ref(), Some(d));
+        }
     }
 
     #[test]

@@ -74,7 +74,7 @@ pub fn snapshot_dir(
     version: u64,
     store: &mut dyn ChunkStore,
 ) -> Result<Snapshot> {
-    scan_tree(
+    let snapshot = scan_tree(
         root,
         name,
         version,
@@ -82,7 +82,11 @@ pub fn snapshot_dir(
             store.put(cwd.chunk.hash, cwd.data);
         },
         |_| {},
-    )
+    )?;
+    // `put` may persist off-thread (see `DiskChunkStore`); the snapshot is only
+    // complete once every chunk is durably stored.
+    store.flush();
+    Ok(snapshot)
 }
 
 /// Like [`snapshot_dir`] but instead of storing chunk bytes it records a
