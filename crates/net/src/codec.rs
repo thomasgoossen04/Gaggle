@@ -10,6 +10,7 @@
 //! chunk's plaintext.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use gaggle_core::Hash;
@@ -40,6 +41,35 @@ mod tag {
     pub const RES_UNAUTHORIZED: u8 = 6;
 }
 
+/// Process-wide running totals of chunk-payload bytes as they are handed to /
+/// received from [`crate::wire_crypto`] (`.0`, plaintext) versus the sealed,
+/// possibly lz4-compressed frame that actually crosses the wire (`.1`), summed
+/// over every codec on every node in this process and over both directions
+/// (serving *and* downloading).
+///
+/// This feeds a coarse compression-ratio **estimate** only — it deliberately
+/// ignores QUIC/TLS and request-response framing overhead and blends every
+/// share together, so it is not a true wire-byte meter. `app-state` diffs
+/// successive reads of [`wire_seal_totals`] into a ratio and scales its
+/// plaintext-derived speed readouts by it, so the Stats graph / per-row speed
+/// track what the link actually carried rather than the uncompressed content
+/// rate. Progress bars and ETAs stay on plaintext bytes (they measure content,
+/// and the manifest totals are plaintext).
+static SEAL_PLAINTEXT: AtomicU64 = AtomicU64::new(0);
+static SEAL_WIRE: AtomicU64 = AtomicU64::new(0);
+
+fn record_seal(plaintext: usize, wire: usize) {
+    SEAL_PLAINTEXT.fetch_add(plaintext as u64, Ordering::Relaxed);
+    SEAL_WIRE.fetch_add(wire as u64, Ordering::Relaxed);
+}
+
+/// `(plaintext_bytes, wire_bytes)` sealed/opened by every chunk codec in this
+/// process since start. See [`SEAL_PLAINTEXT`]. Monotonic; callers diff two
+/// reads for a windowed compression ratio.
+pub fn wire_seal_totals() -> (u64, u64) {
+    (SEAL_PLAINTEXT.load(Ordering::Relaxed), SEAL_WIRE.load(Ordering::Relaxed))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GaggleCodec;
 
@@ -68,7 +98,13 @@ impl request_response::Codec for GaggleCodec {
         // already bounded the size. Non-chunk replies are tiny — decode inline.
         if frame.first() == Some(&tag::RES_CHUNK) {
             return tokio::task::spawn_blocking(move || {
-                crate::wire_crypto::open(&frame[1..]).map(Response::Chunk).map_err(bad)
+                let wire = frame.len();
+                crate::wire_crypto::open(&frame[1..])
+                    .map(|plain| {
+                        record_seal(plain.len(), wire);
+                        Response::Chunk(plain)
+                    })
+                    .map_err(bad)
             })
             .await
             .map_err(|e| bad(format!("chunk-open task failed: {e}")))?;
@@ -105,6 +141,7 @@ impl request_response::Codec for GaggleCodec {
         let body = match res {
             Response::Chunk(data) => tokio::task::spawn_blocking(move || {
                 let sealed = crate::wire_crypto::seal(&data);
+                record_seal(data.len(), sealed.len() + 1);
                 let mut v = Vec::with_capacity(1 + sealed.len());
                 v.push(tag::RES_CHUNK);
                 v.extend_from_slice(&sealed);

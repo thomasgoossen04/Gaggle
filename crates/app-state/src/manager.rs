@@ -24,7 +24,7 @@ use net::accel::{NasSeedStart, nas_seed_finish, nas_seed_start, relay_add_share}
 use net::{
     CacheStats, Capability, Catalog, Invite, Keypair, Multiaddr, Node, PeerId, RelayConfig,
     RelayNode, Scope, ShareKeypair, ShareLink, SharePublicKey, SwarmConfig, SwarmProgress,
-    peer_id_of,
+    peer_id_of, wire_seal_totals,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -431,6 +431,8 @@ impl App {
                 .unwrap_or_else(Instant::now),
             local_history: SpeedHistory::default(),
             up_total_prev: None,
+            seal_prev: None,
+            wire_ratio: 1.0,
             remote_histories: HashMap::new(),
             remote_up_prev: HashMap::new(),
         };
@@ -813,6 +815,14 @@ struct Manager {
     /// Previous `(when, cumulative-served-bytes)` reading, for diffing into an
     /// upload rate on the next [`ServedTotalSample`](Command::ServedTotalSample).
     up_total_prev: Option<(Instant, u64)>,
+    /// Previous `net::wire_seal_totals()` reading, diffed each stats tick into
+    /// [`wire_ratio`](crate::stats::wire_ratio).
+    seal_prev: Option<(u64, u64)>,
+    /// Smoothed estimate of how much of the plaintext byte rate actually reached
+    /// the wire after lz4 chunk compression (`1.0` = incompressible / unknown).
+    /// Scales the plaintext-derived download/upload speed readouts; progress and
+    /// ETA stay on plaintext bytes.
+    wire_ratio: f64,
     /// Per-remote served-throughput history, keyed by accelerator label.
     remote_histories: HashMap<String, SpeedHistory>,
     /// Per-remote previous `(when, bytes_served_total)` reading.
@@ -1475,7 +1485,11 @@ impl Manager {
                 let now = Instant::now();
                 let done = base_bytes + p.bytes_done;
                 if let Some(job) = self.downloads.get_mut(&id) {
-                    let speed = sample_speed(&mut job.last_sample, now, done);
+                    // Speed readouts track wire bytes: scale the plaintext-derived
+                    // rate by the codec's running compression estimate. Progress
+                    // (`done`/`total`) stays on plaintext — it measures content.
+                    let speed = sample_speed(&mut job.last_sample, now, done)
+                        .map(|s| (s as f64 * self.wire_ratio) as u64);
                     let total = base_bytes + p.bytes_total;
                     let est = self.eta.entry(id).or_default();
                     est.record(now, done);
@@ -1702,7 +1716,8 @@ impl Manager {
             Command::ResyncProgress { id, p } => {
                 let now = Instant::now();
                 if let Some(slot) = self.resync_samples.get_mut(&id) {
-                    let speed = sample_speed(slot, now, p.bytes_done);
+                    let speed = sample_speed(slot, now, p.bytes_done)
+                        .map(|s| (s as f64 * self.wire_ratio) as u64);
                     let total = p.bytes_total.max(1);
                     let est = self.eta.entry(id).or_default();
                     est.record(now, p.bytes_done);
@@ -2050,11 +2065,23 @@ impl Manager {
             Command::RepollRemote(label) => self.spawn_remote_status(label),
             Command::ServedTotalSample(total) => {
                 let now = Instant::now();
+                // Refresh the wire-compression estimate from the codec's running
+                // totals, easing toward it so one lumpy interval can't jerk the
+                // graph. `down_bps` below is a sum of the per-row `speed_bps`,
+                // which the progress path has already scaled by this ratio;
+                // `up_bps` is still raw plaintext here, so scale it now.
+                let seal_now = wire_seal_totals();
+                if let Some(prev) = self.seal_prev {
+                    let r = crate::stats::wire_ratio(prev, seal_now);
+                    self.wire_ratio = self.wire_ratio * 0.5 + r * 0.5;
+                }
+                self.seal_prev = Some(seal_now);
                 let up_bps = self
                     .up_total_prev
                     .and_then(|prev| rate_from_cumulative(prev, now, total))
                     .unwrap_or(0);
                 self.up_total_prev = Some((now, total));
+                let up_bps = (up_bps as f64 * self.wire_ratio) as u64;
                 self.local_history.push(SpeedSample {
                     at: SystemTime::now(),
                     down_bps: self.aggregate_download_bps(),

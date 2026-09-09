@@ -91,7 +91,10 @@ Milestones 2–7 (`net` + `control-plane` + `accelerator`) are implemented and t
   chunk `seal` / `open` on `tokio::task::spawn_blocking`, not inline on the libp2p
   swarm task — that per-chunk CPU pass would otherwise serialize every peer a node
   serves (and every landing chunk a node downloads) onto the one core the swarm
-  event loop runs on; the tiny non-chunk frames still encode inline.
+  event loop runs on; the tiny non-chunk frames still encode inline. Each
+  `seal` / `open` also bumps a process-wide `(plaintext, wire)` byte pair
+  (`net::wire_seal_totals()`) that `app-state` diffs into a compression-ratio
+  estimate for its speed readouts (see "Throughput history" below).
 - **`Node`** — a standard peer: the chunk protocol wired together with a **Kademlia**
   DHT (`ShareKey` = `Manifest::id`; `provide` / `find_providers`), **identify**, **mDNS**,
   **UPnP**, a **relay client** and **dcutr**. mDNS (`libp2p::mdns::tokio`, deliberately
@@ -468,6 +471,21 @@ share, and can be driven remotely:
   in-process NAS node + a running `RelayNode` (gathered off-thread, fed back as
   `Command::ServedTotalSample`). Each remote's `Command::RemoteStatusRefresh` carries
   `DaemonStatus.bytes_served_total`, diffed per label into an `up_bps`-only history.
+  Every byte counter in the transfer path (`swarm` `bytes_done`, `Catalog`/relay
+  `bytes_served`, hence `speed_bps` and both `SpeedSample` rates) is **plaintext
+  content bytes** — `codec.rs` lz4-compresses chunk payloads *below* that layer,
+  so a plaintext-derived rate overstates real link throughput for compressible
+  shares. `codec.rs` keeps process-wide `(plaintext, wire)` seal counters
+  (`net::wire_seal_totals()`, summed over both directions and every node);
+  `Manager` diffs them each stats tick through `stats::wire_ratio` (pure,
+  unit-tested; `1.0` until an interval carries ≥256 KiB, clamped `[0.02, 1.0]`),
+  EMA-smooths it into `Manager::wire_ratio`, and scales the plaintext download
+  rate (in the `DownloadProgress` / `ResyncProgress` handlers, before the
+  `speed_bps` EMA) and the plaintext upload rate (in `ServedTotalSample`) by it —
+  a coarse *estimate* only (ignores QUIC/TLS + request-response framing, blends
+  all shares, remote-accelerator rows are left unadjusted since the ratio is the
+  local codec's). Progress bars and ETAs deliberately stay on plaintext bytes —
+  they measure content and the manifest totals are plaintext.
   All of it is exposed always-on (not gated on the GUI) via
   `AppState.stats: StatsSnapshot { local: Vec<SpeedSample>, accelerators: Vec<AccelStatsRow
   { label, history }> }`. `stats::rate_from_cumulative` is the pure diff helper (unit-tested).
@@ -669,7 +687,8 @@ tree, and both the seed and the download row surface `meta` +
 launch-path validation, `normalized`, and `launchable_on_host`.
 `app-state` unit tests cover `Settings`
 persistence, `ShareLink` round trips, name sanitizing, and `stats::{SpeedHistory,
-rate_from_cumulative, resample, EtaEstimator}` (capping, windowing, counter/clock resets; and that
+rate_from_cumulative, resample, wire_ratio, EtaEstimator}` (capping, windowing, counter/clock resets;
+`wire_ratio` estimates a compressible interval, guards a sub-threshold or rewound sample; and that
 `resample` holds a fixed point count, stays within the sample range, and advances the
 curve when only `now` moves; and that `EtaEstimator` barely moves under a ±25 %
 per-reading rate swing, withholds an estimate until it has a few seconds of history,

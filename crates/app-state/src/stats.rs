@@ -134,6 +134,27 @@ pub fn rate_from_cumulative(
     Some(((total - prev.1) as f64 / dt) as u64)
 }
 
+/// Fraction of plaintext content bytes that actually crossed the wire, estimated
+/// from the codec's cumulative seal counters ([`net::wire_seal_totals`]) over one
+/// sampling interval — `prev` and `now` are two `(plaintext, wire)` reads.
+///
+/// `net` lz4-compresses chunk payloads on the wire when that shrinks them, so a
+/// byte rate derived from plaintext (manifest) sizes overstates real link
+/// throughput for compressible shares. Multiplying a `*_bps` reading by this
+/// brings it back in line. Returns `1.0` (no adjustment) until an interval
+/// carries at least `MIN` plaintext bytes — too little traffic to estimate from
+/// — and clamps to `[0.02, 1.0]` so a degenerate sample can neither zero the
+/// graph nor push it above the uncompressed rate.
+pub fn wire_ratio(prev: (u64, u64), now: (u64, u64)) -> f64 {
+    const MIN: u64 = 256 * 1024;
+    let d_plain = now.0.saturating_sub(prev.0);
+    let d_wire = now.1.saturating_sub(prev.1);
+    if d_plain < MIN {
+        return 1.0;
+    }
+    (d_wire as f64 / d_plain as f64).clamp(0.02, 1.0)
+}
+
 /// Resample an irregular `SpeedSample` series (readings land ~every 2 s) onto
 /// `n` evenly-spaced points spanning `window` back from `now`, monotone-cubic
 /// interpolating between the bracketing samples. Points newer than the last
@@ -329,6 +350,20 @@ mod tests {
         assert_eq!(rate_from_cumulative((t0, 5_000), t1, 1_000), None);
         // No time elapsed → no rate.
         assert_eq!(rate_from_cumulative((t0, 1_000), t0, 5_000), None);
+    }
+
+    #[test]
+    fn wire_ratio_estimates_compression_and_guards_degenerate_input() {
+        // Too little traffic in the interval → no adjustment.
+        assert_eq!(wire_ratio((0, 0), (1_000, 400)), 1.0);
+        // A ~2.5:1 compressible interval.
+        let r = wire_ratio((0, 0), (1_000_000, 400_000));
+        assert!((r - 0.4).abs() < 1e-6, "ratio {r}");
+        // Incompressible: wire tracks plaintext (plus tiny framing) → ~1.0.
+        let r = wire_ratio((5_000_000, 4_000_000), (7_000_000, 6_010_000));
+        assert!((r - 1.0).abs() < 1e-6, "ratio {r}");
+        // Counter rewind (process restart) can't produce a negative/huge ratio.
+        assert_eq!(wire_ratio((9_000_000, 8_000_000), (1_000, 500)), 1.0);
     }
 
     fn series(rates: &[u64], step: Duration) -> Vec<SpeedSample> {
